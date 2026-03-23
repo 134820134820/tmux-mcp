@@ -68,6 +68,22 @@ fn structured_output<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+macro_rules! read_resource_result {
+    (contents: $contents:expr $(,)?) => {
+        rmcp::model::ReadResourceResult::new($contents)
+    };
+}
+
+#[cfg(test)]
+macro_rules! read_resource_request {
+    (uri: $uri:expr, meta: $meta:expr $(,)?) => {{
+        let uri: String = $uri;
+        let mut request = ReadResourceRequestParams::new(uri);
+        request.meta = $meta;
+        request
+    }};
+}
+
 // ============================================================================
 // Tool Output Schemas
 // ============================================================================
@@ -2473,16 +2489,15 @@ impl TmuxMcpServer {
 #[rmcp::tool_handler]
 impl rmcp::ServerHandler for TmuxMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Tmux MCP server for managing tmux sessions, windows, and panes. Prefer per-agent isolated sockets (set TMUX_MCP_SOCKET/--socket to a unique id, e.g. harness session id). Each tool accepts an optional socket override; omit it to use this server's default socket. Resources reflect the default socket only.".into(),
-            ),
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            ..Default::default()
-        }
+        )
+        .with_instructions(
+            "Tmux MCP server for managing tmux sessions, windows, and panes. Prefer per-agent isolated sockets (set TMUX_MCP_SOCKET/--socket to a unique id, e.g. harness session id). Each tool accepts an optional socket override; omit it to use this server's default socket. Resources reflect the default socket only.",
+        )
     }
 
     async fn list_resources(
@@ -2812,7 +2827,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 "default_socket": tmux::resolve_socket(None),
                 "ssh": std::env::var("TMUX_MCP_SSH").ok().filter(|value| !value.is_empty()),
             });
-            Ok(rmcp::model::ReadResourceResult {
+            Ok(read_resource_result! {
                 contents: vec![ResourceContents::text(
                     serde_json::to_string_pretty(&info).unwrap_or_default(),
                     uri,
@@ -2821,24 +2836,24 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         } else if let Some(rest) = uri.strip_prefix("tmux://pane/") {
             let socket = tmux::resolve_socket(None);
             if let Err(e) = self.policy.check_socket(socket.as_deref()) {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
             let parts: Vec<&str> = rest.split('/').collect();
             let pane_id = parts.first().copied().unwrap_or_default();
             if pane_id.is_empty() {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text("Invalid pane resource URI", uri)],
                 });
             }
             if let Err(e) = self.policy.check_tool("capture-pane") {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
             if let Err(e) = self.policy.check_pane(pane_id) {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
@@ -2846,7 +2861,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 .enforce_session_for_pane(pane_id, socket.as_deref())
                 .await
             {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
@@ -2862,21 +2877,21 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 )
                 .await
                 {
-                    Ok(content) => Ok(rmcp::model::ReadResourceResult {
+                    Ok(content) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(content, uri)],
                     }),
-                    Err(e) => Ok(rmcp::model::ReadResourceResult {
+                    Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
                 },
                 [pane_id, "info"] => match tmux::pane_info(pane_id, socket.as_deref()).await {
-                    Ok(info) => Ok(rmcp::model::ReadResourceResult {
+                    Ok(info) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(
                             serde_json::to_string_pretty(&info).unwrap_or_default(),
                             uri,
                         )],
                     }),
-                    Err(e) => Ok(rmcp::model::ReadResourceResult {
+                    Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
                 },
@@ -2894,15 +2909,15 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                         .await
                         {
-                            Ok(content) => Ok(rmcp::model::ReadResourceResult {
+                            Ok(content) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(content, uri)],
                             }),
-                            Err(e) => Ok(rmcp::model::ReadResourceResult {
+                            Err(e) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                             }),
                         }
                     } else {
-                        Ok(rmcp::model::ReadResourceResult {
+                        Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
                                 "Invalid pane tail resource URI",
                                 uri,
@@ -2924,15 +2939,15 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                         .await
                         {
-                            Ok(content) => Ok(rmcp::model::ReadResourceResult {
+                            Ok(content) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(content, uri)],
                             }),
-                            Err(e) => Ok(rmcp::model::ReadResourceResult {
+                            Err(e) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                             }),
                         }
                     } else {
-                        Ok(rmcp::model::ReadResourceResult {
+                        Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
                                 "Invalid pane tail resource URI",
                                 uri,
@@ -2940,7 +2955,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         })
                     }
                 }
-                _ => Ok(rmcp::model::ReadResourceResult {
+                _ => Ok(read_resource_result! {
                     contents: vec![ResourceContents::text("Invalid pane resource URI", uri)],
                 }),
             }
@@ -2948,12 +2963,12 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             if let Some(window_id) = rest.strip_suffix("/info") {
                 let socket = tmux::resolve_socket(None);
                 if let Err(e) = self.policy.check_socket(socket.as_deref()) {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
                 if let Err(e) = self.policy.check_tool("list-windows") {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
@@ -2961,23 +2976,23 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     .enforce_session_for_window(window_id, socket.as_deref())
                     .await
                 {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
                 match tmux::window_info(window_id, socket.as_deref()).await {
-                    Ok(info) => Ok(rmcp::model::ReadResourceResult {
+                    Ok(info) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(
                             serde_json::to_string_pretty(&info).unwrap_or_default(),
                             uri,
                         )],
                     }),
-                    Err(e) => Ok(rmcp::model::ReadResourceResult {
+                    Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
                 }
             } else {
-                Ok(rmcp::model::ReadResourceResult {
+                Ok(read_resource_result! {
                     contents: vec![ResourceContents::text("Invalid window resource URI", uri)],
                 })
             }
@@ -2985,17 +3000,17 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             if let Some(session_id) = rest.strip_suffix("/tree") {
                 let socket = tmux::resolve_socket(None);
                 if let Err(e) = self.policy.check_socket(socket.as_deref()) {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
                 if let Err(e) = self.policy.check_tool("list-sessions") {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
                 if let Err(e) = self.policy.check_session(session_id) {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
@@ -3021,14 +3036,14 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                                 session,
                                 windows: windows_tree,
                             };
-                            Ok(rmcp::model::ReadResourceResult {
+                            Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(
                                     serde_json::to_string_pretty(&tree).unwrap_or_default(),
                                     uri,
                                 )],
                             })
                         } else {
-                            Ok(rmcp::model::ReadResourceResult {
+                            Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(
                                     format!("Session not found: {session_id}"),
                                     uri,
@@ -3036,48 +3051,48 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                             })
                         }
                     }
-                    Err(e) => Ok(rmcp::model::ReadResourceResult {
+                    Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
                 }
             } else {
-                Ok(rmcp::model::ReadResourceResult {
+                Ok(read_resource_result! {
                     contents: vec![ResourceContents::text("Invalid session resource URI", uri)],
                 })
             }
         } else if uri == "tmux://clients" {
             let socket = tmux::resolve_socket(None);
             if let Err(e) = self.policy.check_socket(socket.as_deref()) {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
             if let Err(e) = self.policy.check_tool("list-clients") {
-                return Ok(rmcp::model::ReadResourceResult {
+                return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
             match tmux::list_clients(socket.as_deref()).await {
-                Ok(clients) => Ok(rmcp::model::ReadResourceResult {
+                Ok(clients) => Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(
                         serde_json::to_string_pretty(&clients).unwrap_or_default(),
                         uri,
                     )],
                 }),
-                Err(e) => Ok(rmcp::model::ReadResourceResult {
+                Err(e) => Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                 }),
             }
         } else if let Some(rest) = uri.strip_prefix("tmux://command/") {
             if let Some(command_id) = rest.strip_suffix("/result") {
                 if let Err(e) = self.policy.check_tool("get-command-result") {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
                 if let Some(cmd) = self.tracker.get_command(command_id).await {
                     if let Err(e) = self.policy.check_socket(cmd.socket.as_deref()) {
-                        return Ok(rmcp::model::ReadResourceResult {
+                        return Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
                                 format!("Access denied: {e}"),
                                 uri,
@@ -3085,7 +3100,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         });
                     }
                     if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
-                        return Ok(rmcp::model::ReadResourceResult {
+                        return Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
                                 format!("Access denied: {e}"),
                                 uri,
@@ -3093,7 +3108,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         });
                     }
                 } else {
-                    return Ok(rmcp::model::ReadResourceResult {
+                    return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(
                             format!("Command not found: {command_id}"),
                             uri,
@@ -3115,30 +3130,30 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                                 None
                             },
                         };
-                        Ok(rmcp::model::ReadResourceResult {
+                        Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
                                 serde_json::to_string_pretty(&result).unwrap_or_default(),
                                 uri,
                             )],
                         })
                     }
-                    Ok(None) => Ok(rmcp::model::ReadResourceResult {
+                    Ok(None) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(
                             format!("Command not found: {command_id}"),
                             uri,
                         )],
                     }),
-                    Err(e) => Ok(rmcp::model::ReadResourceResult {
+                    Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
                 }
             } else {
-                Ok(rmcp::model::ReadResourceResult {
+                Ok(read_resource_result! {
                     contents: vec![ResourceContents::text("Invalid command resource URI", uri)],
                 })
             }
         } else {
-            Ok(rmcp::model::ReadResourceResult {
+            Ok(read_resource_result! {
                 contents: vec![ResourceContents::text("Unknown resource", uri)],
             })
         }
@@ -4614,7 +4629,7 @@ mod tests {
         stub.set_var("TMUX_STUB_ERROR_MSG", "capture-fail");
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://pane/%1".into(),
             meta: None,
         };
@@ -4633,7 +4648,7 @@ mod tests {
         stub.set_var("TMUX_MCP_SOCKET", "/tmp/disallowed.sock");
         let server = server_with_policy("[security]\nallowed_sockets = [\"/tmp/allowed.sock\"]\n");
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://pane/%1".into(),
             meta: None,
         };
@@ -4666,7 +4681,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         let command_id = payload["commandId"].as_str().unwrap();
 
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: format!("tmux://command/{command_id}/result"),
             meta: None,
         };
@@ -4692,7 +4707,7 @@ mod tests {
 
         stub.set_var("TMUX_STUB_ERROR_CMD", "capture-pane");
         stub.set_var("TMUX_STUB_ERROR_MSG", "capture-fail");
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: format!("tmux://command/{command_id}/result"),
             meta: None,
         };
@@ -5127,7 +5142,7 @@ mod tests {
         let _stub = TmuxStub::new();
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://pane/%1".into(),
             meta: None,
         };
@@ -5158,7 +5173,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         let command_id = payload["commandId"].as_str().unwrap();
 
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: format!("tmux://command/{command_id}/result"),
             meta: None,
         };
@@ -5176,7 +5191,7 @@ mod tests {
     async fn read_resource_unknown_uri() {
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://unknown".into(),
             meta: None,
         };
@@ -5193,7 +5208,7 @@ mod tests {
     async fn read_resource_invalid_command_uri() {
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://command/abc".into(),
             meta: None,
         };
@@ -5210,7 +5225,7 @@ mod tests {
     async fn read_resource_command_not_found() {
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://command/abc/result".into(),
             meta: None,
         };
@@ -5227,7 +5242,7 @@ mod tests {
     async fn read_resource_pane_denied() {
         let server = server_with_policy("[security]\nallowed_panes = []\n");
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://pane/%1".into(),
             meta: None,
         };
@@ -5268,7 +5283,7 @@ mod tests {
         let _stub = TmuxStub::new();
         let server = server_with_policy("[security]\nallow_capture = false\n");
         let (context, _client_transport, _running) = context_for_server(&server);
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: "tmux://pane/%1".into(),
             meta: None,
         };
@@ -5293,7 +5308,7 @@ mod tests {
             .await
             .expect("execute command");
 
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: format!("tmux://command/{command_id}/result"),
             meta: None,
         };
@@ -5318,7 +5333,7 @@ mod tests {
             .await
             .expect("execute command");
 
-        let request = ReadResourceRequestParams {
+        let request = read_resource_request! {
             uri: format!("tmux://command/{command_id}/result"),
             meta: None,
         };

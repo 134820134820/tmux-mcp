@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-23
+### Changed
+- Upgraded `rmcp` from `0.14` to `1.2`.
+- Migrated server metadata and read-resource handling to the `rmcp` 1.x constructor-based model API.
+- Refreshed compatible dependency versions in `Cargo.lock`, including `tokio`, `clap`, `uuid`, `tempfile`, `tracing-subscriber`, `schemars`, `regex`, and `toml` 0.9.x.
+
 ## [0.1.3] - 2026-02-04
 ### Added
 - Enforced session allowlist checks across pane/window tools and resources.
