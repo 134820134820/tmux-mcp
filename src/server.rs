@@ -32,7 +32,7 @@ pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
     search: SearchConfig,
-    tool_router: ToolRouter<Self>,
+    _tool_router: ToolRouter<Self>,
     session_cache: Arc<tokio::sync::RwLock<SessionScopeCache>>,
 }
 
@@ -644,7 +644,7 @@ impl TmuxMcpServer {
             tracker: Arc::new(tracker),
             policy: Arc::new(policy),
             search,
-            tool_router: Self::tool_router(),
+            _tool_router: Self::tool_router(),
             session_cache: Arc::new(tokio::sync::RwLock::new(SessionScopeCache::new())),
         }
     }
@@ -3220,13 +3220,7 @@ mod tests {
     ) {
         let (server_transport, client_transport) = duplex(1024);
         let running = service::serve_directly(server.clone(), server_transport, None);
-        let context = RequestContext {
-            peer: running.peer().clone(),
-            ct: Default::default(),
-            id: NumberOrString::Number(1),
-            meta: Default::default(),
-            extensions: Default::default(),
-        };
+        let context = RequestContext::new(NumberOrString::Number(1), running.peer().clone());
         (context, client_transport, running)
     }
 

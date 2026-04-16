@@ -89,7 +89,21 @@ case "$cmd" in
     fi
     ;;
   display-message)
-    printf '%b' "${TMUX_STUB_CURRENT_SESSION_OUTPUT:-%1\talpha\t1\t2}"
+    format=""
+    for arg in "$@"; do
+      format="$arg"
+    done
+    case "$format" in
+      *#{window_layout}*)
+        printf '%b' "${TMUX_STUB_WINDOW_INFO_OUTPUT:-@1\tfirst\t%1\t1\tlayout\t2\t80\t24\t0\t%1}"
+        ;;
+      *#{pane_current_path}*)
+        printf '%b' "${TMUX_STUB_PANE_INFO_OUTPUT:-%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0}"
+        ;;
+      *)
+        printf '%b' "${TMUX_STUB_CURRENT_SESSION_OUTPUT:-%1\talpha\t1\t2}"
+        ;;
+    esac
     ;;
   new-session)
     printf '%b' "${TMUX_STUB_NEW_SESSION_OUTPUT:-%9\tnew-session\t0\t1}"

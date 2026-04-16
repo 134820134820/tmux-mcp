@@ -179,10 +179,22 @@ async fn execute_tmux_with_socket_bytes(
     stdin: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let output = run_tmux_with_socket(args, socket, stdin).await?;
-    if output.status.success() {
-        Ok(output.stdout)
+    let std::process::Output {
+        status,
+        stdout,
+        stderr,
+    } = output;
+    if status.success() {
+        // tmux 3.6a can emit some `-P` output on stderr, so keep it if stdout is empty.
+        if !stdout.is_empty() {
+            Ok(stdout)
+        } else if !stderr.is_empty() {
+            Ok(stderr)
+        } else {
+            Ok(stdout)
+        }
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
         Err(Error::Tmux { message: stderr })
     }
 }
@@ -1704,19 +1716,18 @@ pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session>
     )
     .await?;
 
-    let parts: Vec<&str> = output.split('\t').collect();
-    if parts.len() >= 4 {
-        Ok(Session {
-            id: parts[0].to_string(),
-            name: parts[1].to_string(),
-            attached: parts[2] == "1",
-            windows: parts[3].parse().unwrap_or(1),
-        })
-    } else {
-        Err(Error::Tmux {
-            message: format!("failed to parse new session output: {output}"),
-        })
+    if let Some(session) = parse_sessions(&output).into_iter().next() {
+        return Ok(session);
     }
+
+    // Fall back to the server state when tmux omits `new-session` output.
+    if let Some(session) = find_session_by_name(name, socket).await? {
+        return Ok(session);
+    }
+
+    Err(Error::Tmux {
+        message: format!("failed to parse new session output: {output}"),
+    })
 }
 
 /// Create a new window in a session.
@@ -1737,19 +1748,22 @@ pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -
     )
     .await?;
 
-    let parts: Vec<&str> = output.split('\t').collect();
-    if parts.len() >= 3 {
-        Ok(Window {
-            id: parts[0].to_string(),
-            name: parts[1].to_string(),
-            active: parts[2] == "1",
-            session_id: session_id.to_string(),
-        })
-    } else {
-        Err(Error::Tmux {
-            message: format!("failed to parse new window output: {output}"),
-        })
+    if let Some(window) = parse_windows(&output, session_id).into_iter().next() {
+        return Ok(window);
     }
+
+    // Fall back to the session state when tmux omits `new-window` output.
+    if let Some(window) = list_windows(session_id, socket)
+        .await?
+        .into_iter()
+        .find(|window| window.name == name)
+    {
+        return Ok(window);
+    }
+
+    Err(Error::Tmux {
+        message: format!("failed to parse new window output: {output}"),
+    })
 }
 
 /// Split a pane.
@@ -1759,6 +1773,13 @@ pub async fn split_pane(
     size: Option<u32>,
     socket: Option<&str>,
 ) -> Result<Pane> {
+    let source_pane = pane_info(pane_id, socket).await?;
+    let existing_panes: BTreeSet<String> = list_panes(&source_pane.window_id, socket)
+        .await?
+        .into_iter()
+        .map(|pane| pane.id)
+        .collect();
+
     let dir_flag = match direction {
         Some("horizontal") | Some("h") => "-h",
         _ => "-v",
@@ -1778,19 +1799,34 @@ pub async fn split_pane(
 
     let output = execute_tmux_with_socket(&args, socket).await?;
 
-    let parts: Vec<&str> = output.split('\t').collect();
-    if parts.len() >= 4 {
-        Ok(Pane {
-            id: parts[0].to_string(),
-            title: parts[1].to_string(),
-            active: parts[2] == "1",
-            window_id: parts[3].to_string(),
-        })
-    } else {
-        Err(Error::Tmux {
-            message: format!("failed to parse new pane output: {output}"),
-        })
+    if let Some(pane) = parse_panes(&output, &source_pane.window_id)
+        .into_iter()
+        .next()
+    {
+        return Ok(pane);
     }
+
+    // If tmux suppresses `split-window` output, identify the new pane from the window state.
+    let panes = list_panes(&source_pane.window_id, socket).await?;
+    if let Some(pane) = panes
+        .iter()
+        .find(|pane| !existing_panes.contains(&pane.id))
+        .cloned()
+    {
+        return Ok(pane);
+    }
+
+    if let Some(pane) = panes
+        .iter()
+        .find(|pane| pane.active && pane.id != pane_id)
+        .cloned()
+    {
+        return Ok(pane);
+    }
+
+    Err(Error::Tmux {
+        message: format!("failed to parse new pane output: {output}"),
+    })
 }
 
 /// Kill a session.
@@ -1954,6 +1990,13 @@ pub async fn join_pane(
 
 /// Break a pane out into its own window.
 pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>) -> Result<Window> {
+    let source_pane = pane_info(pane_id, socket).await?;
+    let existing_windows: BTreeSet<String> = list_windows(&source_pane.session_id, socket)
+        .await?
+        .into_iter()
+        .map(|window| window.id)
+        .collect();
+
     let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}\t#{session_id}";
     let mut args = vec!["break-pane", "-P", "-F", format, "-s", pane_id];
     if let Some(name) = name {
@@ -1961,19 +2004,33 @@ pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>)
         args.push(name);
     }
     let output = execute_tmux_with_socket(&args, socket).await?;
-    let parts: Vec<&str> = output.split('\t').collect();
-    if parts.len() >= 4 {
-        Ok(Window {
-            id: parts[0].to_string(),
-            name: parts[1].to_string(),
-            active: parts[2] == "1",
-            session_id: parts[3].to_string(),
-        })
-    } else {
-        Err(Error::Tmux {
-            message: format!("failed to parse break-pane output: {output}"),
-        })
+
+    if let Some(window) = parse_windows(&output, &source_pane.session_id)
+        .into_iter()
+        .next()
+    {
+        return Ok(window);
     }
+
+    // If tmux suppresses `break-pane` output, identify the new window from the session state.
+    let windows = list_windows(&source_pane.session_id, socket).await?;
+    if let Some(window) = windows
+        .iter()
+        .find(|window| !existing_windows.contains(&window.id))
+        .cloned()
+    {
+        return Ok(window);
+    }
+
+    if let Some(name) = name {
+        if let Some(window) = windows.iter().find(|window| window.name == name).cloned() {
+            return Ok(window);
+        }
+    }
+
+    Err(Error::Tmux {
+        message: format!("failed to parse break-pane output: {output}"),
+    })
 }
 
 /// Swap two panes.
@@ -2300,6 +2357,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_session_recovers_from_missing_output() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_NEW_SESSION_OUTPUT", "bad-output");
+        stub.set_var(
+            "TMUX_STUB_LIST_SESSIONS",
+            "%1\talpha\t1\t2\n%2\tfallback-session\t0\t1",
+        );
+
+        let session = create_session("fallback-session", None)
+            .await
+            .expect("create session");
+        assert_eq!(session.id, "%2");
+        assert_eq!(session.name, "fallback-session");
+    }
+
+    #[tokio::test]
     async fn create_session_handles_bad_output() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_NEW_SESSION_OUTPUT", "bad-output");
@@ -2321,6 +2394,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_window_recovers_from_missing_output() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_NEW_WINDOW_OUTPUT", "bad-output");
+        stub.set_var(
+            "TMUX_STUB_LIST_WINDOWS",
+            "@1\tfirst\t1\n@2\tfallback-window\t0",
+        );
+
+        let window = create_window("%1", "fallback-window", None)
+            .await
+            .expect("create window");
+        assert_eq!(window.id, "@2");
+        assert_eq!(window.name, "fallback-window");
+    }
+
+    #[tokio::test]
     async fn create_window_handles_bad_output() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_NEW_WINDOW_OUTPUT", "bad-output");
@@ -2339,6 +2428,19 @@ mod tests {
             .await
             .expect("split pane");
         assert_eq!(pane.id, "%3");
+    }
+
+    #[tokio::test]
+    async fn split_pane_recovers_from_missing_output() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_SPLIT_WINDOW_OUTPUT", "bad-output");
+        stub.set_var("TMUX_STUB_LIST_PANES", "%1\tpane-one\t0\n%2\tpane-two\t1");
+
+        let pane = split_pane("%1", Some("horizontal"), Some(50), None)
+            .await
+            .expect("split pane");
+        assert_eq!(pane.id, "%2");
+        assert!(pane.active);
     }
 
     #[tokio::test]
@@ -2364,6 +2466,19 @@ mod tests {
         assert_eq!(window.id, "@9");
         assert_eq!(window.name, "broken");
         assert_eq!(window.session_id, "%1");
+    }
+
+    #[tokio::test]
+    async fn break_pane_recovers_from_missing_output() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_BREAK_PANE_OUTPUT", "bad-output");
+        stub.set_var("TMUX_STUB_LIST_WINDOWS", "@1\tfirst\t1\n@2\tbreakout\t0");
+
+        let window = break_pane("%1", Some("breakout"), None)
+            .await
+            .expect("break pane");
+        assert_eq!(window.id, "@2");
+        assert_eq!(window.name, "breakout");
     }
 
     #[tokio::test]
