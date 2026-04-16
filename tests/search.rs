@@ -12,7 +12,7 @@ use tmux_mcp_rs::types::SearchMode;
 const FIXTURE_PATH: &str = "tests/fixtures/old-man-and-the-sea.txt";
 
 fn load_fixture() -> String {
-    let fixture = Path::new(FIXTURE_PATH);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
     fs::read_to_string(fixture).expect("read fixture")
 }
 
