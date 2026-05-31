@@ -237,7 +237,7 @@ impl CommandTracker {
                 false,
                 None,
                 None,
-                false,
+                true,
                 execution.socket.as_deref().or(socket_override),
             )
             .await?;
@@ -258,6 +258,20 @@ impl CommandTracker {
                 break;
             }
 
+            // No DONE marker yet. If the START marker is visible, the command is
+            // still running: DONE is echoed after START, so it lands within the
+            // same (or a smaller) window once printed. Widening the capture
+            // cannot surface a marker that does not exist yet, so leave the
+            // command Pending and let the caller poll again. Caching a terminal
+            // Error here would make it sticky via the early-return above and the
+            // command could never reach Completed.
+            if captured_output.contains(&get_start_marker(&execution.id)) {
+                break;
+            }
+
+            // START is absent: it may have scrolled out of the captured window.
+            // Widen and retry; only when even the largest window lacks it do we
+            // treat tracking as genuinely expired.
             if capture_lines >= max_lines {
                 execution.status = CommandStatus::Error;
                 execution.output =
@@ -695,6 +709,59 @@ mod tests {
             command.output.as_deref(),
             Some("tracking expired; markers not found in pane history")
         );
+    }
+
+    #[tokio::test]
+    async fn check_status_stays_pending_while_command_still_running() {
+        // Regression: a command whose START marker is visible but whose DONE
+        // marker has not been printed yet (still running) must NOT be cached as
+        // a terminal Error. Otherwise the early-return path makes the bogus
+        // Error sticky and the command can never reach Completed on later polls.
+        let mut stub = TmuxStub::new();
+        let id = "running-cmd".to_string();
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            format!("prompt\nTMUX_MCP_START_{id}\nstill working...\n", id = id),
+        );
+
+        let tracking = TrackingConfig {
+            capture_initial_lines: 1,
+            capture_max_lines: 2,
+            capture_backoff_factor: 2,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let execution = CommandExecution {
+            id: id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "sleep 1".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: Instant::now(),
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.clone(), execution);
+        }
+
+        // First poll: START seen, DONE absent -> still Pending, not Error.
+        let first = tracker
+            .check_status(&id, None)
+            .await
+            .expect("check status")
+            .expect("command");
+        assert_eq!(first.status, CommandStatus::Pending);
+        assert!(first.output.is_none());
+
+        // The map entry must remain Pending so a later poll can still complete.
+        let stored = tracker.get_command(&id).await.expect("stored command");
+        assert_eq!(stored.status, CommandStatus::Pending);
     }
 
     #[tokio::test]
