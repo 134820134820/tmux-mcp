@@ -32,7 +32,7 @@ pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
     search: SearchConfig,
-    _tool_router: ToolRouter<Self>,
+    router: ToolRouter<Self>,
     session_cache: Arc<tokio::sync::RwLock<SessionScopeCache>>,
 }
 
@@ -586,6 +586,7 @@ pub struct SubsearchBufferInput {
 }
 
 /// Input parameters for the send-keys tool.
+#[cfg(feature = "interactive")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendKeysInput {
     /// ID of the tmux pane
@@ -605,6 +606,7 @@ pub struct SendKeysInput {
 }
 
 /// Input parameters for the send-hex tool.
+#[cfg(feature = "interactive")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendHexInput {
     /// ID of the tmux pane
@@ -652,11 +654,17 @@ impl TmuxMcpServer {
         policy: SecurityPolicy,
         search: SearchConfig,
     ) -> Self {
+        #[allow(unused_mut)]
+        let mut router = Self::tool_router();
+        #[cfg(feature = "interactive")]
+        router.merge(Self::interactive_tool_router());
+        #[cfg(feature = "special-keys")]
+        router.merge(Self::special_keys_tool_router());
         Self {
             tracker: Arc::new(tracker),
             policy: Arc::new(policy),
             search,
-            _tool_router: Self::tool_router(),
+            router,
             session_cache: Arc::new(tokio::sync::RwLock::new(SessionScopeCache::new())),
         }
     }
@@ -1571,13 +1579,11 @@ impl TmuxMcpServer {
                         input.0.command_id
                     ))]));
                 }
-                (None, Some(recorded)) => {
-                    if socket.as_deref() != Some(recorded) {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Socket does not match recorded socket for command {}",
-                            input.0.command_id
-                        ))]));
-                    }
+                (None, Some(recorded)) if socket.as_deref() != Some(recorded) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Socket does not match recorded socket for command {}",
+                        input.0.command_id
+                    ))]));
                 }
                 _ => {}
             }
@@ -2158,7 +2164,11 @@ impl TmuxMcpServer {
             ))])),
         }
     }
+}
 
+#[cfg(feature = "interactive")]
+#[tool_router(router = interactive_tool_router)]
+impl TmuxMcpServer {
     // Dedicated terminal interaction tools
     #[tool(
         name = "send-keys",
@@ -2260,9 +2270,6 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        // Validate/normalize before the command_filter check so the decoded bytes
-        // are what we screen. Raw hex can encode keystrokes a denylist blocks, so
-        // run the same check_command gate send-keys uses (on the decoded string).
         let tokens = match tmux::parse_hex_tokens(&input.0.hex) {
             Ok(t) => t,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
@@ -2271,8 +2278,21 @@ impl TmuxMcpServer {
             .iter()
             .map(|t| u8::from_str_radix(t, 16).expect("normalized hex"))
             .collect();
-        let decoded_str = String::from_utf8_lossy(&decoded);
-        if let Err(e) = self.policy.check_command(&decoded_str) {
+        // Reject erase/kill line-editing controls: they could rewrite the pending
+        // line to slip a denied command past the (best-effort) filter below. Use
+        // send-backspace for those keys instead.
+        if let Some(&b) = decoded
+            .iter()
+            .find(|&&b| matches!(b, 0x08 | 0x15 | 0x17 | 0x7f))
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "send-hex rejects line-editing control byte {b:#04x}; use send-backspace instead"
+            ))]));
+        }
+        if let Err(e) = self
+            .policy
+            .check_command(&String::from_utf8_lossy(&decoded))
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::send_keys_hex(&input.0.pane_id, &input.0.hex, socket.as_deref()).await {
@@ -2285,7 +2305,11 @@ impl TmuxMcpServer {
             ))])),
         }
     }
+}
 
+#[cfg(feature = "special-keys")]
+#[tool_router(router = special_keys_tool_router)]
+impl TmuxMcpServer {
     #[tool(
         name = "send-cancel",
         description = "Send Ctrl+C to interrupt the current process in a pane. Use to stop a stuck command or to abort a prompt during interactive workflows.",
@@ -2507,6 +2531,7 @@ impl TmuxMcpServer {
     }
 }
 
+#[cfg(feature = "special-keys")]
 impl TmuxMcpServer {
     async fn send_special_key(
         &self,
@@ -2546,7 +2571,7 @@ impl TmuxMcpServer {
 // ServerHandler Implementation
 // ============================================================================
 
-#[rmcp::tool_handler]
+#[rmcp::tool_handler(router = self.router)]
 impl rmcp::ServerHandler for TmuxMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -3596,6 +3621,7 @@ mod tests {
         assert!(first_text(&result).contains("raw mode"));
     }
 
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn send_keys_denied_by_policy() {
         let server = server_with_policy("[security]\nallow_send_keys = false\n");
@@ -3614,6 +3640,7 @@ mod tests {
         assert!(first_text(&result).contains("send-keys"));
     }
 
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn send_hex_denied_by_policy() {
         let server = server_with_policy("[security]\nallow_send_keys = false\n");
@@ -3629,6 +3656,7 @@ mod tests {
         assert!(first_text(&result).contains("send-hex"));
     }
 
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn send_hex_rejects_invalid_token() {
         let server = server_with_policy("[security]\nenabled = false\n");
@@ -3644,6 +3672,24 @@ mod tests {
         assert!(first_text(&result).contains("invalid hex"));
     }
 
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn send_hex_rejects_line_editing_controls() {
+        let server = server_with_policy("[security]\nenabled = false\n");
+        // "rx\bm -rf /\r": a backspace would rewrite this into "rm -rf /".
+        let input = Parameters(SendHexInput {
+            pane_id: "%1".into(),
+            hex: "72 78 08 6d 20 2d 72 66 20 2f 0d".into(),
+            socket: None,
+        });
+
+        let result = server.send_hex(input).await.expect("send hex");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("line-editing control byte"));
+    }
+
+    #[cfg(feature = "special-keys")]
     #[tokio::test]
     async fn send_cancel_denied_by_policy() {
         let server = server_with_policy("[security]\nallow_send_keys = false\n");
@@ -4112,6 +4158,7 @@ mod tests {
         assert!(first_text(&result).contains("Error splitting pane"));
     }
 
+    #[cfg(all(feature = "interactive", feature = "special-keys"))]
     #[tokio::test]
     async fn pane_denied_across_tools() {
         let server = server_with_policy("[security]\nallowed_panes = []\n");
@@ -4534,6 +4581,7 @@ mod tests {
         assert!(first_text(&result).contains("Error moving window"));
     }
 
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn send_keys_non_literal_command_denied() {
         let server = server_with_policy(
@@ -4554,6 +4602,7 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn send_keys_tmux_errors() {
         let mut stub = TmuxStub::new();
@@ -4601,6 +4650,7 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
+    #[cfg(feature = "special-keys")]
     #[tokio::test]
     async fn send_special_key_tmux_error() {
         let mut stub = TmuxStub::new();
@@ -5023,6 +5073,7 @@ mod tests {
         assert!(first_text(&result).contains("moved"));
     }
 
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn send_keys_variants_happy_path() {
         let _stub = TmuxStub::new();
@@ -5062,6 +5113,7 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
     }
 
+    #[cfg(feature = "special-keys")]
     #[tokio::test]
     async fn send_special_keys_happy_path() {
         let _stub = TmuxStub::new();
