@@ -11,14 +11,19 @@ use tmux_mcp_rs::types::SearchMode;
 
 const FIXTURE_PATH: &str = "tests/fixtures/old-man-and-the-sea.txt";
 
-fn load_fixture() -> String {
+/// Load the fixture text, or `None` if it is not present.
+///
+/// The fixture (`old-man-and-the-sea.txt`) is gitignored to avoid committing
+/// copyrighted text, so it is absent on a fresh clone. Tests that depend on it
+/// skip gracefully instead of failing when it is missing.
+fn load_fixture() -> Option<String> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
-    fs::read_to_string(fixture).expect("read fixture")
+    fs::read_to_string(fixture).ok()
 }
 
 #[cfg(not(target_os = "linux"))]
 #[fixture]
-fn oms_text() -> String {
+fn oms_text() -> Option<String> {
     load_fixture()
 }
 
@@ -30,7 +35,11 @@ fn search_tests_skipped_on_linux() {
 
 #[cfg(not(target_os = "linux"))]
 #[rstest]
-fn literal_probe_then_subsearch(oms_text: String) {
+fn literal_probe_then_subsearch(oms_text: Option<String>) {
+    let Some(oms_text) = oms_text else {
+        eprintln!("skipping: fixture {FIXTURE_PATH} not present");
+        return;
+    };
     let result = search_text(
         "fixture",
         &oms_text,
@@ -77,7 +86,11 @@ fn literal_probe_then_subsearch(oms_text: String) {
 
 #[cfg(not(target_os = "linux"))]
 #[rstest]
-fn regex_probe_then_refine(oms_text: String) {
+fn regex_probe_then_refine(oms_text: Option<String>) {
+    let Some(oms_text) = oms_text else {
+        eprintln!("skipping: fixture {FIXTURE_PATH} not present");
+        return;
+    };
     let result = search_text(
         "fixture",
         &oms_text,
@@ -123,7 +136,11 @@ fn regex_probe_then_refine(oms_text: String) {
 #[rstest]
 #[case("old man")]
 #[case("the boy")]
-fn literal_multiword_queries(oms_text: String, #[case] query: &str) {
+fn literal_multiword_queries(oms_text: Option<String>, #[case] query: &str) {
+    let Some(oms_text) = oms_text else {
+        eprintln!("skipping: fixture {FIXTURE_PATH} not present");
+        return;
+    };
     let result = search_text(
         "fixture",
         &oms_text,
@@ -147,7 +164,11 @@ fn literal_multiword_queries(oms_text: String, #[case] query: &str) {
 
 #[cfg(all(not(target_os = "linux"), feature = "fuzzy"))]
 #[rstest]
-fn fuzzy_probe_then_confirm(oms_text: String) {
+fn fuzzy_probe_then_confirm(oms_text: Option<String>) {
+    let Some(oms_text) = oms_text else {
+        eprintln!("skipping: fixture {FIXTURE_PATH} not present");
+        return;
+    };
     let result = search_text(
         "fixture",
         &oms_text,
