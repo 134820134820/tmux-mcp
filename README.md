@@ -222,6 +222,7 @@ streaming_threshold_bytes = 262144
 
 ### Key Sending
 - **send-keys** - Send arbitrary keys to a pane (interactive only)
+- **send-hex** - Send raw bytes as whitespace-separated hex tokens (e.g. CSI-u `1b 5b 31 33 3b 32 75` = Shift+Enter) for escape sequences key names cannot express
 - **send-cancel** - Send Ctrl+C
 - **send-eof** - Send Ctrl+D (EOF)
 - **send-escape** - Send Escape key
@@ -382,6 +383,8 @@ By default, the security policy is permissive to avoid breaking agent workflows:
 **Denylist behavior:** when `command_filter.mode = "denylist"`, any regex in
 `security.command_filter.patterns` that matches a command string will block that
 command. This applies to `execute-command` and non-literal `send-keys` only.
+For `send-hex`, the hex bytes are decoded to a UTF-8 string and screened by the
+same denylist before being sent.
 
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.

@@ -604,6 +604,18 @@ pub struct SendKeysInput {
     pub socket: Option<String>,
 }
 
+/// Input parameters for the send-hex tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendHexInput {
+    /// ID of the tmux pane
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Whitespace-separated hex byte tokens (00-ff), e.g. "1b 5b 31 33 3b 32 75" for Shift+Enter (CSI-u)
+    pub hex: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
 // ============================================================================
 // Tool Router Implementation
 // ============================================================================
@@ -2227,6 +2239,54 @@ impl TmuxMcpServer {
     }
 
     #[tool(
+        name = "send-hex",
+        description = "Send raw bytes to a pane as whitespace-separated hex tokens (00-ff) via tmux send-keys -H. Use for escape sequences key names cannot express, e.g. CSI-u: \"1b 5b 31 33 3b 32 75\" = Shift+Enter. For normal keys/text use send-keys instead.",
+        annotations(open_world_hint = true)
+    )]
+    async fn send_hex(&self, input: Parameters<SendHexInput>) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("send-hex") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        // Validate/normalize before the command_filter check so the decoded bytes
+        // are what we screen. Raw hex can encode keystrokes a denylist blocks, so
+        // run the same check_command gate send-keys uses (on the decoded string).
+        let tokens = match tmux::parse_hex_tokens(&input.0.hex) {
+            Ok(t) => t,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        let decoded: Vec<u8> = tokens
+            .iter()
+            .map(|t| u8::from_str_radix(t, 16).expect("normalized hex"))
+            .collect();
+        let decoded_str = String::from_utf8_lossy(&decoded);
+        if let Err(e) = self.policy.check_command(&decoded_str) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        match tmux::send_keys_hex(&input.0.pane_id, &input.0.hex, socket.as_deref()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Hex bytes sent to pane {}",
+                input.0.pane_id
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error sending hex: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
         name = "send-cancel",
         description = "Send Ctrl+C to interrupt the current process in a pane. Use to stop a stuck command or to abort a prompt during interactive workflows.",
         annotations(open_world_hint = true)
@@ -3552,6 +3612,36 @@ mod tests {
 
         assert_eq!(result.is_error, Some(true));
         assert!(first_text(&result).contains("send-keys"));
+    }
+
+    #[tokio::test]
+    async fn send_hex_denied_by_policy() {
+        let server = server_with_policy("[security]\nallow_send_keys = false\n");
+        let input = Parameters(SendHexInput {
+            pane_id: "%1".into(),
+            hex: "1b 5b 31 33 3b 32 75".into(),
+            socket: None,
+        });
+
+        let result = server.send_hex(input).await.expect("send hex");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("send-hex"));
+    }
+
+    #[tokio::test]
+    async fn send_hex_rejects_invalid_token() {
+        let server = server_with_policy("[security]\nenabled = false\n");
+        let input = Parameters(SendHexInput {
+            pane_id: "%1".into(),
+            hex: "1b zz".into(),
+            socket: None,
+        });
+
+        let result = server.send_hex(input).await.expect("send hex");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("invalid hex"));
     }
 
     #[tokio::test]
