@@ -1867,6 +1867,45 @@ pub async fn send_keys(
     Ok(())
 }
 
+/// Parse a whitespace-separated hex string into byte tokens, validating each.
+/// Returns the normalized two-digit lowercase tokens (e.g. "1b", "5b") or an error.
+pub fn parse_hex_tokens(hex: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    for raw in hex.split_whitespace() {
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.len() > 2 || u8::from_str_radix(raw, 16).is_err() {
+            return Err(Error::Tmux {
+                message: format!("invalid hex byte token: {raw:?} (expected 00-ff)"),
+            });
+        }
+        // Normalize to two-digit lowercase for tmux send-keys -H.
+        let byte = u8::from_str_radix(raw, 16).expect("validated above");
+        tokens.push(format!("{byte:02x}"));
+    }
+    if tokens.is_empty() {
+        return Err(Error::Tmux {
+            message: "no hex byte tokens provided".to_string(),
+        });
+    }
+    Ok(tokens)
+}
+
+/// Send raw bytes to a pane via tmux `send-keys -H` (hex mode).
+///
+/// Each token is one byte (00-ff). Use this for escape sequences that key names
+/// cannot express, e.g. CSI-u (`1b 5b 31 33 3b 32 75` = Shift+Enter).
+pub async fn send_keys_hex(pane_id: &str, hex: &str, socket: Option<&str>) -> Result<()> {
+    let tokens = parse_hex_tokens(hex)?;
+    let mut args: Vec<&str> = vec!["send-keys", "-t", pane_id, "-H"];
+    for token in &tokens {
+        args.push(token);
+    }
+    execute_tmux_with_socket(&args, socket).await?;
+    Ok(())
+}
+
 const MAX_LITERAL_CHUNK_BYTES: usize = 4000;
 
 fn chunk_literal_payload(keys: &str) -> Vec<String> {
@@ -2235,6 +2274,41 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].title, "bash");
         assert_eq!(result[1].title, "htop");
+    }
+
+    #[tokio::test]
+    async fn send_keys_hex_passes_byte_tokens() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        // CSI-u for Shift+Enter: ESC [ 1 3 ; 2 u
+        send_keys_hex("%1", "1b 5b 31 33 3b 32 75", None)
+            .await
+            .expect("send hex");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("-H"));
+        assert!(lines[0].contains("1b 5b 31 33 3b 32 75"));
+    }
+
+    #[test]
+    fn parse_hex_tokens_normalizes_and_validates() {
+        // Mixed case + single-digit normalize to two-digit lowercase.
+        assert_eq!(
+            parse_hex_tokens("1B 5b   7").expect("valid"),
+            vec!["1b", "5b", "07"]
+        );
+        // Invalid tokens rejected.
+        assert!(parse_hex_tokens("zz").is_err());
+        assert!(parse_hex_tokens("1ff").is_err());
+        assert!(parse_hex_tokens("   ").is_err());
     }
 
     #[rstest]
