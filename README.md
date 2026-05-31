@@ -147,6 +147,7 @@ capture_max_lines = 16000
 capture_backoff_factor = 2
 completed_retention_minutes = 240
 completed_max_entries = 1000
+tracking_deadline_seconds = 600
 
 [search]
 streaming_threshold_bytes = 262144
@@ -158,6 +159,7 @@ streaming_threshold_bytes = 262144
 - `capture_backoff_factor`: multiplier for each capture retry window.
 - `completed_retention_minutes`: age threshold for evicting completed command history.
 - `completed_max_entries`: max number of completed commands retained.
+- `tracking_deadline_seconds`: how long a command whose START marker has scrolled out of reach (very large output) stays Pending before being declared expired. The DONE marker still completes it at any time; this only bounds genuinely-lost tracking. Raise it for high-output commands that also run long.
 
 ### Search configuration (optional)
 - `streaming_threshold_bytes`: when a buffer exceeds this size, search streams a window via a temp file instead of loading the full buffer in memory.
