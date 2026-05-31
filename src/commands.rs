@@ -63,6 +63,8 @@ pub struct TrackingConfig {
     pub completed_retention_minutes: u64,
     #[serde(default = "default_completed_max_entries")]
     pub completed_max_entries: u32,
+    #[serde(default = "default_tracking_deadline_seconds")]
+    pub tracking_deadline_seconds: u64,
 }
 
 fn default_capture_initial_lines() -> u32 {
@@ -85,6 +87,15 @@ fn default_completed_max_entries() -> u32 {
     1000
 }
 
+/// How long a tracked command whose START marker is no longer reachable in the
+/// pane history (e.g. it scrolled past `capture_max_lines` under heavy output)
+/// stays Pending before being declared expired. Generous on purpose: while the
+/// anchor is lost we cannot tell "still running" from "gone", so we err toward
+/// waiting. Raise it for workloads that emit very large output over long runs.
+fn default_tracking_deadline_seconds() -> u64 {
+    600
+}
+
 impl Default for TrackingConfig {
     fn default() -> Self {
         Self {
@@ -93,6 +104,7 @@ impl Default for TrackingConfig {
             capture_backoff_factor: default_capture_backoff_factor(),
             completed_retention_minutes: default_completed_retention_minutes(),
             completed_max_entries: default_completed_max_entries(),
+            tracking_deadline_seconds: default_tracking_deadline_seconds(),
         }
     }
 }
@@ -269,21 +281,38 @@ impl CommandTracker {
                 break;
             }
 
-            // START is absent: it may have scrolled out of the captured window.
-            // Widen and retry; only when even the largest window lacks it do we
-            // treat tracking as genuinely expired.
-            if capture_lines >= max_lines {
-                execution.status = CommandStatus::Error;
-                execution.output =
-                    Some("tracking expired; markers not found in pane history".to_string());
-                execution.completed_at = Some(Instant::now());
+            // START is absent: it may simply have scrolled out of the captured
+            // window. Widen and retry first. If the window cannot grow any
+            // further (already at max_lines, or a degenerate backoff factor of 1
+            // that never advances) fall through to the expiry decision instead
+            // of re-capturing the same window forever.
+            let widened = (capture_lines.saturating_mul(backoff)).min(max_lines);
+            if widened > capture_lines {
+                capture_lines = widened;
+                continue;
+            }
 
-                let mut commands = self.active_commands.write().await;
-                commands.insert(command_id.to_string(), execution.clone());
+            // Even the widest window lacks the START marker. This is either a
+            // high-output command still running (its START scrolled past
+            // `capture_max_lines` and DONE is not printed yet) or genuinely lost
+            // tracking. Capture-line exhaustion is not a timeout, so fall back to
+            // a real time bound: stay Pending until the command has outlived the
+            // tracking deadline, only then declare it expired. This keeps a slow,
+            // verbose command recoverable (relax parse completes it once DONE
+            // appears) while still bounding genuinely-lost commands.
+            let deadline = Duration::from_secs(self.tracking.tracking_deadline_seconds);
+            if execution.started_at.elapsed() <= deadline {
                 break;
             }
 
-            capture_lines = (capture_lines.saturating_mul(backoff)).min(max_lines);
+            execution.status = CommandStatus::Error;
+            execution.output =
+                Some("tracking expired; markers not found in pane history".to_string());
+            execution.completed_at = Some(Instant::now());
+
+            let mut commands = self.active_commands.write().await;
+            commands.insert(command_id.to_string(), execution.clone());
+            break;
         }
 
         self.cleanup_completed().await;
@@ -369,12 +398,18 @@ pub fn get_end_marker(shell: &ShellType, command_id: &str) -> String {
 
 /// Parse captured output to extract command output and exit code.
 ///
-/// Looks for the last command-specific marker pair.
-/// Returns `None` if markers are not found or incomplete.
+/// The DONE marker carries the exit code and is authoritative for completion.
+/// The START marker only delimits where the command's output begins, so it is
+/// optional: if it scrolled out of the captured window under heavy output, we
+/// still complete the command from the DONE marker (the leading output is then
+/// best-effort, bounded by whatever remains in the window).
+/// Returns `None` if no DONE marker with a numeric exit code is present.
 fn parse_command_output(captured: &str, command_id: &str) -> Option<(String, i32)> {
     let start_marker = get_start_marker(command_id);
-    let start_idx = captured.rfind(&start_marker)?;
-    let after_start = &captured[start_idx + start_marker.len()..];
+    let after_start = match captured.rfind(&start_marker) {
+        Some(start_idx) => &captured[start_idx + start_marker.len()..],
+        None => captured,
+    };
 
     // Find the LAST match of the end marker (not the first)
     // This is important because the pane output may contain the typed command line
@@ -457,7 +492,16 @@ mod tests {
     )]
     #[case("no markers at all", None)]
     #[case("TMUX_MCP_START_cmd-1\nno end marker", None)]
-    #[case("TMUX_MCP_DONE_cmd-1_0\nno start marker", None)]
+    // START scrolled off but DONE is present: complete from DONE alone, with the
+    // leading output best-effort (here, nothing precedes the marker).
+    #[case(
+        "TMUX_MCP_DONE_cmd-1_0\nno start marker",
+        Some((String::new(), 0))
+    )]
+    #[case(
+        "earlier output lost\nfinal line\nTMUX_MCP_DONE_cmd-1_3",
+        Some(("earlier output lost\nfinal line".to_string(), 3))
+    )]
     fn test_parse_command_output(#[case] input: &str, #[case] expected: Option<(String, i32)>) {
         assert_eq!(parse_command_output(input, "cmd-1"), expected);
     }
@@ -676,10 +720,13 @@ mod tests {
         let id = "expired-cmd".to_string();
         stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "no markers here");
 
+        // deadline 0: any elapsed time past start counts as expired, so the
+        // markers-never-found path resolves to a terminal Error immediately.
         let tracking = TrackingConfig {
             capture_initial_lines: 1,
             capture_max_lines: 2,
             capture_backoff_factor: 2,
+            tracking_deadline_seconds: 0,
             ..TrackingConfig::default()
         };
         let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
@@ -709,6 +756,144 @@ mod tests {
             command.output.as_deref(),
             Some("tracking expired; markers not found in pane history")
         );
+    }
+
+    #[tokio::test]
+    async fn check_status_stays_pending_when_start_lost_within_deadline() {
+        // A high-output command can push its START marker past capture_max_lines
+        // while still running. With no marker reachable but the command well
+        // within its tracking deadline, check_status must stay Pending (not cache
+        // a terminal Error) so it can still complete once DONE finally appears.
+        let mut stub = TmuxStub::new();
+        let id = "lost-start-cmd".to_string();
+        stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "buried output, no markers");
+
+        let tracking = TrackingConfig {
+            capture_initial_lines: 1,
+            capture_max_lines: 2,
+            capture_backoff_factor: 2,
+            tracking_deadline_seconds: 600,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let execution = CommandExecution {
+            id: id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "seq 1 100000".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: Instant::now(),
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.clone(), execution);
+        }
+
+        let command = tracker
+            .check_status(&id, None)
+            .await
+            .expect("check status")
+            .expect("command");
+        assert_eq!(command.status, CommandStatus::Pending);
+        let stored = tracker.get_command(&id).await.expect("stored command");
+        assert_eq!(stored.status, CommandStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn check_status_completes_when_start_marker_scrolled_off() {
+        // The DONE marker is authoritative: even if START scrolled out of the
+        // captured window, a visible DONE with a numeric exit code completes the
+        // command (leading output is best-effort).
+        let mut stub = TmuxStub::new();
+        let id = "done-only-cmd".to_string();
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            format!(
+                "...truncated output...\nlast line\nTMUX_MCP_DONE_{id}_0\n",
+                id = id
+            ),
+        );
+
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let execution = CommandExecution {
+            id: id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "seq 1 100000".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: Instant::now(),
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.clone(), execution);
+        }
+
+        let command = tracker
+            .check_status(&id, None)
+            .await
+            .expect("check status")
+            .expect("command");
+        assert_eq!(command.status, CommandStatus::Completed);
+        assert_eq!(command.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn check_status_terminates_with_degenerate_backoff_factor() {
+        // Regression: capture_backoff_factor == 1 cannot widen the capture
+        // window, so the escalation step never advances. The loop must still
+        // terminate (fall through to the expiry decision) rather than spin
+        // forever re-capturing the same window. deadline 0 makes it resolve to a
+        // terminal Error immediately once it falls through; without the fix this
+        // test hangs.
+        let mut stub = TmuxStub::new();
+        let id = "degenerate-backoff-cmd".to_string();
+        stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "no markers here");
+
+        let tracking = TrackingConfig {
+            capture_initial_lines: 1,
+            capture_max_lines: 16,
+            capture_backoff_factor: 1,
+            tracking_deadline_seconds: 0,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let execution = CommandExecution {
+            id: id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "echo missing".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: Instant::now(),
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.clone(), execution);
+        }
+
+        let command = tracker
+            .check_status(&id, None)
+            .await
+            .expect("check status")
+            .expect("command");
+        assert_eq!(command.status, CommandStatus::Error);
     }
 
     #[tokio::test]
