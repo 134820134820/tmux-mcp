@@ -505,6 +505,12 @@ async fn test_workflow_metadata_and_zoom() {
         .expect("pane info");
     assert_eq!(pane_info.title, "meta-pane");
 
+    // Zoom is a no-op on a single-pane window (nothing to maximize), so the
+    // `zoomed` flag would never flip. Add a second pane first.
+    let extra_pane = tmux::split_pane(pane_id, Some("horizontal"), Some(50), socket_opt)
+        .await
+        .expect("split pane for zoom");
+
     tmux::zoom_pane(pane_id, socket_opt)
         .await
         .expect("zoom pane");
@@ -520,6 +526,10 @@ async fn test_workflow_metadata_and_zoom() {
         .await
         .expect("window info after unzoom");
     assert!(!window_info.zoomed);
+
+    tmux::kill_pane(&extra_pane.id, socket_opt)
+        .await
+        .expect("kill extra pane");
 
     tmux::resize_pane(pane_id, Some("right"), Some(1), None, None, socket_opt)
         .await
