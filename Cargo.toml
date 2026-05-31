@@ -1,6 +1,6 @@
 [package]
 name = "tmux-mcp-rs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Tmux MCP server in Rust"
 readme = "README.md"
@@ -21,10 +21,16 @@ name = "tmux-mcp-rs"
 path = "src/main.rs"
 
 [features]
-default = ["rayon", "rapidfuzz"]
+default = ["rayon", "rapidfuzz", "interactive", "special-keys"]
 rayon = ["dep:rayon"]
 rapidfuzz = ["dep:rapidfuzz"]
 fuzzy = ["rapidfuzz"]
+# Raw keystroke injection tools (send-keys, send-hex). Disable for a hardened
+# build where shell input must go through the filtered execute-command path.
+interactive = []
+# Special-key tools (send-enter, send-tab, arrows, etc.). Disable to remove
+# them from the binary entirely.
+special-keys = []
 
 [dependencies]
 rmcp = { version = "1.2", default-features = false, features = ["server", "transport-io", "macros", "base64"] }
