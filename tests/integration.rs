@@ -30,11 +30,51 @@ struct TmuxFixture {
     sessions_to_cleanup: Vec<String>,
 }
 
+/// Name of the throwaway session used only to boot the server with a known shell.
+const BOOT_SESSION: &str = "__tmux_mcp_boot";
+
 impl TmuxFixture {
     fn new() -> Self {
         let socket_dir = TempDir::new().expect("create tmux socket dir");
         let socket_path = socket_dir.path().join("tmux.sock");
         let socket_path = socket_path.to_string_lossy().to_string();
+
+        // Boot the tmux server with a deterministic, non-interactive shell.
+        //
+        // Tests construct `CommandTracker::new(ShellType::Bash)`, which assumes
+        // panes run bash. But `create_session` only does `new-session -d`, so
+        // panes inherit the developer's login shell. An interactive shell with an
+        // async prompt (e.g. zsh + powerlevel10k) can swallow the carriage return
+        // on long wrapped command lines, so the tracked command never executes and
+        // tracking times out. CI uses a plain bash login shell, so it never hit this.
+        //
+        // Force every pane on this isolated server to run `bash --norc --noprofile`
+        // via `default-command`, aligning the runtime with the declared shell type.
+        let config = socket_dir.path().join("tmux.conf");
+        std::fs::write(
+            &config,
+            "set-option -g default-command \"/bin/bash --norc --noprofile\"\n",
+        )
+        .expect("write tmux config");
+
+        let status = Command::new("tmux")
+            .args([
+                "-S",
+                &socket_path,
+                "-f",
+                config.to_str().expect("config path"),
+                "new-session",
+                "-d",
+                "-s",
+                BOOT_SESSION,
+            ])
+            .status()
+            .expect("boot tmux server");
+        assert!(
+            status.success(),
+            "failed to boot tmux server with bash shell"
+        );
+
         Self {
             _socket_dir: socket_dir,
             socket_path,
