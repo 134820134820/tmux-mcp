@@ -621,7 +621,7 @@ pub struct SendHexInput {
 }
 
 /// Input parameters for the paste-text tool.
-#[cfg(feature = "special-keys")]
+#[cfg(feature = "interactive")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PasteTextInput {
     /// ID of the tmux pane
@@ -2329,11 +2329,7 @@ impl TmuxMcpServer {
             ))])),
         }
     }
-}
 
-#[cfg(feature = "special-keys")]
-#[tool_router(router = special_keys_tool_router)]
-impl TmuxMcpServer {
     #[tool(
         name = "paste-text",
         description = "Paste multi-line UTF-8 text into a pane via tmux bracketed paste (staged in a throwaway buffer, pasted with paste-buffer -p -d). Embedded newlines stay literal and do NOT submit line-by-line when the receiving program supports bracketed paste (modern shells/REPLs/editors). Programs without bracketed-paste support fall back to a plain paste where newlines act as Enter. Use for injecting code blocks or multi-line input; for single keystrokes/chords use send-keys.",
@@ -2369,7 +2365,11 @@ impl TmuxMcpServer {
             ))])),
         }
     }
+}
 
+#[cfg(feature = "special-keys")]
+#[tool_router(router = special_keys_tool_router)]
+impl TmuxMcpServer {
     #[tool(
         name = "send-cancel",
         description = "Send Ctrl+C to interrupt the current process in a pane. Use to stop a stuck command or to abort a prompt during interactive workflows.",
@@ -5216,7 +5216,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "special-keys")]
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn paste_text_denied_by_policy() {
         let server = server_with_policy("[security]\nallow_send_keys = false\n");
@@ -5231,7 +5231,7 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
-    #[cfg(feature = "special-keys")]
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn paste_text_happy_path() {
         let _stub = TmuxStub::new();
@@ -5248,7 +5248,7 @@ mod tests {
         assert!(first_text(&result).contains("Pasted text"));
     }
 
-    #[cfg(feature = "special-keys")]
+    #[cfg(feature = "interactive")]
     #[tokio::test]
     async fn paste_text_uses_bracketed_paste_flags() {
         let mut stub = TmuxStub::new();
