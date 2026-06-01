@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-01
+### Added
+- Added `send-keys enter=true` for type-and-submit workflows.
+- Added the `paste-text` tool for bracketed multi-line paste into interactive panes.
+- Added CI coverage for tmux integration tests, including zsh bracketed-paste behavior.
+
+### Changed
+- Moved `paste-text` under the `interactive` feature gate with the other raw input tools.
+- Documented hardened builds, paste behavior, memory limits, and tmux tab-delimited parsing limitations.
+- Enforced the tmux 3.x startup requirement with a clearer version check.
+
+### Fixed
+- Passed leading-dash user values after `--` so tmux does not parse them as flags.
+- Switched split sizing to the tmux 3.x-compatible `-l <percent>%` form.
+- Bounded abandoned pending command tracking entries.
+- Cleaned up temporary paste buffers when paste delivery fails.
+- Rejected malformed `TMUX_MCP_SSH` values from the environment during startup.
+
+### Security
+- Quoted remote tmux commands for SSH execution so shell-sensitive socket and payload values preserve argv intent.
+- Applied command filters to each non-empty pasted or submitted line, closing anchored regex bypasses for multi-line input.
+
 ## [0.3.0] - 2026-05-31
 ### Added
 - Added the `send-hex` tool to send raw bytes via `tmux send-keys -H` (e.g. CSI-u sequences).
