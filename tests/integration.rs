@@ -236,6 +236,60 @@ async fn test_full_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_leading_dash_names_are_not_parsed_as_flags() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("dash-test");
+    let dashed_session = format!("-{session_name}");
+    fixture.track_session(&session_name);
+    fixture.track_session(&dashed_session);
+
+    use tmux_mcp_rs::tmux;
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let window = &windows[0];
+
+    // A window name starting with '-' must be passed after a '--' separator,
+    // otherwise tmux parses it as an unknown flag and the rename fails.
+    tmux::rename_window(&window.id, "-leading-dash", socket_opt)
+        .await
+        .expect("rename window to leading-dash name");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows after rename");
+    assert!(windows.iter().any(|w| w.name == "-leading-dash"));
+
+    // Same hazard for session names.
+    tmux::rename_session(&session.id, &dashed_session, socket_opt)
+        .await
+        .expect("rename session to leading-dash name");
+    let sessions = tmux::list_sessions(socket_opt)
+        .await
+        .expect("list sessions after rename");
+    assert!(sessions.iter().any(|s| s.name == dashed_session));
+
+    // A normal layout value must still work after the '--' separator.
+    tmux::select_layout(&window.id, "even-horizontal", socket_opt)
+        .await
+        .expect("select a valid layout");
+
+    tmux::kill_session(&session.id, socket_opt)
+        .await
+        .expect("kill session");
+}
+
+#[tokio::test]
 async fn test_execute_command_tracking() {
     if !should_run_integration_tests() {
         return;

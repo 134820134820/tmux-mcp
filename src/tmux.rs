@@ -612,13 +612,13 @@ fn read_window_from_file(path: &Path, start: u64, len: u64) -> Result<Vec<u8>> {
 
 /// Save a tmux buffer to a file path.
 pub async fn save_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["save-buffer", "-b", name, path], socket).await?;
+    execute_tmux_with_socket(&["save-buffer", "-b", name, "--", path], socket).await?;
     Ok(())
 }
 
 /// Load a tmux buffer from a file path.
 pub async fn load_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["load-buffer", "-b", name, path], socket).await?;
+    execute_tmux_with_socket(&["load-buffer", "-b", name, "--", path], socket).await?;
     Ok(())
 }
 
@@ -671,7 +671,7 @@ pub async fn append_buffer(name: &str, content: &str, socket: Option<&str>) -> R
             .map_err(|e| Error::Tmux {
                 message: format!("failed to append temp buffer: {e}"),
             })?;
-        execute_tmux_with_socket(&["load-buffer", "-b", name, &path], socket).await?;
+        execute_tmux_with_socket(&["load-buffer", "-b", name, "--", &path], socket).await?;
         Ok(())
     } else {
         let mut existing_bytes = show_buffer_bytes(Some(name), socket).await?;
@@ -1854,7 +1854,7 @@ pub async fn send_keys(
             execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", &chunk], socket).await?;
         }
     } else {
-        execute_tmux_with_socket(&["send-keys", "-t", pane_id, keys], socket).await?;
+        execute_tmux_with_socket(&["send-keys", "-t", pane_id, "--", keys], socket).await?;
     }
     Ok(())
 }
@@ -1930,7 +1930,7 @@ pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
 
 /// Rename a session.
 pub async fn rename_session(session_id: &str, name: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["rename-session", "-t", session_id, name], socket).await?;
+    execute_tmux_with_socket(&["rename-session", "-t", session_id, "--", name], socket).await?;
     Ok(())
 }
 
@@ -2001,7 +2001,7 @@ pub async fn zoom_pane(pane_id: &str, socket: Option<&str>) -> Result<()> {
 
 /// Select a window layout.
 pub async fn select_layout(window_id: &str, layout: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["select-layout", "-t", window_id, layout], socket).await?;
+    execute_tmux_with_socket(&["select-layout", "-t", window_id, "--", layout], socket).await?;
     Ok(())
 }
 
@@ -2095,7 +2095,7 @@ pub async fn set_synchronize_panes(
 
 /// Rename a window.
 pub async fn rename_window(window_id: &str, name: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["rename-window", "-t", window_id, name], socket).await?;
+    execute_tmux_with_socket(&["rename-window", "-t", window_id, "--", name], socket).await?;
     Ok(())
 }
 
