@@ -15,8 +15,8 @@ A Model Context Protocol (MCP) server for tmux, written in Rust. It lets AI assi
 
 Requires **tmux 3.x** installed and available on `PATH`. The server checks the
 version on startup and refuses to run against tmux 2.x, whose output formats and
-split flags differ. CI exercises the integration suite on tmux 3.4; development
-is on 3.6.
+split flags differ. CI runs integration tests against the tmux version provided
+by `ubuntu-latest`; development is on 3.6.
 
 > [!WARNING]
 > Using this MCP allows the agent to escape the sandbox and its security limitations. Here be dragons!
@@ -54,18 +54,19 @@ cargo build --release
 ```
 
 ### Hardened build (compile-time tool removal)
-The raw keystroke tools are gated behind Cargo features that are **enabled by
+The raw input tools are gated behind Cargo features that are **enabled by
 default**:
 
 - `interactive` — the `send-keys`, `send-hex`, and `paste-text` tools.
 - `special-keys` — the `send-enter`, `send-tab`, `send-escape`, arrow, page,
   home/end, `send-backspace`, `send-cancel`, and `send-eof` tools.
 
-Because these tools inject bytes straight into the PTY, the `command_filter`
-cannot reliably screen what they execute (a denied command can be typed
-character-by-character and then submitted with Enter). Disabling a feature
-removes those tools from the binary entirely — they are never registered, so an
-agent cannot call them and `list-tools` will not advertise them.
+Because these tools can inject bytes straight into the PTY, the
+`command_filter` is not a complete boundary for the feature set (for example, a
+denied command can be typed character-by-character and then submitted with
+Enter). Disabling a feature removes those tools from the binary entirely — they
+are never registered, so an agent cannot call them and `list-tools` will not
+advertise them.
 
 ```bash
 # Filtered-only build: execute-command is the sole shell-input path.
@@ -148,7 +149,7 @@ Add the Quick Start snippet to your MCP client config. Example below includes al
 | `--ssh <CONNECTION>` | Run tmux over SSH (options + destination, destination last) | None |
 | `--config <PATH>` | Path to TOML configuration file | None |
 
-Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). `TMUX_MCP_SSH` can set the SSH connection string.
+Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). `TMUX_MCP_SSH` can set the SSH connection string and is parsed with the same startup validation as `--ssh`.
 
 ### Sample Configuration (config.toml)
 
@@ -252,7 +253,7 @@ streaming_threshold_bytes = 262144
 - **subsearch-buffer** - Anchor-scoped follow-up search with structured metadata
 
 ### Key Sending
-- **send-keys** - Send keys to a pane (interactive only). `literal=true` types exact characters; `literal=false` interprets key names/chords (Enter, C-c, Up). `enter=true` presses Enter after the keys (per repeat) to type and submit in one call
+- **send-keys** - Send keys to a pane (interactive only). Use `literal=true` for exact text and `enter=true` to submit in one call
 - **paste-text** - Paste multi-line UTF-8 text via bracketed paste (`paste-buffer -p`); embedded newlines stay literal (no per-line submit) when the receiving program supports bracketed paste
 - **send-hex** - Send raw bytes as whitespace-separated hex tokens (e.g. CSI-u `1b 5b 31 33 3b 32 75` = Shift+Enter) for escape sequences key names cannot express
 - **send-cancel** - Send Ctrl+C
@@ -335,7 +336,7 @@ tmux-mcp-rs --ssh "user@host"
 
 For extra SSH options, put them before the host (e.g. `--ssh "-i ~/.ssh/key user@host"`) or use `~/.ssh/config`. The destination should be the last token in the `--ssh` string.
 
-The connection string is split with shell-word rules (quotes honored); an unbalanced quote is rejected at startup. On the remote, the server runs `ssh <args> tmux ...`, and the tmux version check applies to the remote tmux. SSH parsing is unit-tested; end-to-end remote behavior is verified manually, not in CI (no remote host in the test environment).
+The connection string is split with shell-word rules (quotes honored); an unbalanced quote is rejected at startup. On the remote, the server runs `ssh <args> <quoted tmux command>`, and the tmux version check applies to the remote tmux when it can be reached. SSH parsing and remote command quoting are unit-tested; end-to-end remote behavior is verified manually, not in CI (no remote host in the test environment).
 
 ### Remote + isolated (SSH + socket)
 
@@ -370,7 +371,7 @@ TMUX_MCP_SOCKET=/tmp/ai-agent.sock tmux-mcp-rs
 
 ## Workflow Patterns (CLI Agents)
 
-These patterns mirror how CLI agents like Codex can structure tmux work. Each is backed by an integration test in `tests/integration.rs` (run with `TMUX_MCP_INTEGRATION=1`).
+These patterns mirror how CLI agents like Codex can structure tmux work. Each core flow is backed by an integration test in `tests/integration.rs` (run with `TMUX_MCP_INTEGRATION=1`).
 
 - **ID-first targeting**: Use window/pane IDs for operations when names collide. Tools: list-windows/list-panes, rename-window. Test: `test_workflow_id_first_targeting`.
 - **Task-per-session layout**: Create a session per task, add windows for build/test/docs, and split panes for runners/logs. Tools: create-session, create-window, split-pane, rename-pane, list-windows, list-panes. Test: `test_workflow_task_per_session_layout`.
@@ -379,7 +380,7 @@ These patterns mirror how CLI agents like Codex can structure tmux work. Each is
 - **Interactive prompt automation**: Drive a blocking prompt (or simple TUI) by sending responses via keys, then capture the result. Tools: send-keys, capture-pane. Test: `test_workflow_interactive_prompt`.
 - **Interactive interrupts**: Cancel long-running commands and end stdin streams with EOF. Tools: send-cancel, send-eof, capture-pane. Test: `test_workflow_interactive_interrupts`.
 - **Synchronized panes broadcast**: Fan out a command to multiple panes at once using synchronize-panes. Tools: set-synchronize-panes, send-keys, capture-pane. Test: `test_workflow_synchronized_panes_broadcast`.
-- **Buffer handoff + probe**: Stash output in buffers, optionally search/subsearch for targeted slices, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer, search-buffer, subsearch-buffer. Test: `test_workflow_buffer_roundtrip` (core flow).
+- **Buffer handoff + probe**: Stash output in buffers, inspect it, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer. Test: `test_workflow_buffer_roundtrip` (core flow).
 - **Pane rearrangements**: Swap/break/join panes and apply layouts while preserving pane identities. Tools: split-pane, select-layout, swap-pane, break-pane, join-pane, list-panes, list-windows. Test: `test_workflow_pane_rearrangements`.
 - **Metadata + zoom**: Rename session/window/pane and inspect pane/window metadata; toggle zoom and resize. Tools: rename-session, rename-window, rename-pane, zoom-pane, resize-pane. Resources: `tmux://pane/{paneId}/info`, `tmux://window/{windowId}/info`. Test: `test_workflow_metadata_and_zoom`.
 - **Audit-ready context bundle**: Pair tracked command output with raw pane capture for traceability. Tools: execute-command, get-command-result, capture-pane. Test: `test_workflow_audit_context_bundle`.
@@ -416,16 +417,16 @@ By default, the security policy is permissive to avoid breaking agent workflows:
 
 **Denylist behavior:** when `command_filter.mode = "denylist"`, any regex in
 `security.command_filter.patterns` that matches a command string will block that
-command. This applies to `execute-command` and non-literal `send-keys` only.
-For `send-hex`, the decoded bytes are screened by the same denylist on a
+command. This applies to `execute-command`, non-literal `send-keys`, and
+`paste-text`; multi-line inputs are checked one non-empty line at a time so
+anchored patterns such as `^rm ` still apply after embedded newlines. For
+`send-hex`, decoded bytes are screened by the same command filter on a
 best-effort basis: erase/kill line-editing control bytes are rejected outright,
 but raw bytes can still encode actions a string-matching regex cannot fully
-anticipate, so do not rely on the denylist as a hard boundary for `send-hex`.
-Literal `send-keys` and `paste-text` are raw input gated by `allow_send_keys`
-only, not the command filter — their content is not screened, and newlines (a
-literal `\n`, or a bracketed paste into a program without bracketed-paste
-support) can still reach the shell and execute. Scope them with
-`allowed_panes`/`allowed_sessions`, or disable `allow_send_keys`.
+anticipate, so do not rely on the denylist as a hard boundary for raw input.
+Literal `send-keys` is gated by `allow_send_keys` only; its content is not
+screened. Scope raw input tools with `allowed_panes`/`allowed_sessions`, or
+disable `allow_send_keys`.
 
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
@@ -433,17 +434,19 @@ and `get-command-result` must use the same socket (explicitly or via defaults), 
 To harden a deployment, flip specific `allow_*` flags, add deny/allow patterns,
 or restrict sockets/sessions/panes explicitly. For the strongest guarantee that
 shell input cannot bypass the `command_filter`, compile without the raw
-keystroke tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
+input tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
 
 ## Notes and limitations
 
-- **Memory use is unbounded by design.** Paste buffers and command output live in
+- **Memory use is intentionally bounded only in some paths.** Paste buffers and
+  command output live in
   RAM (the buffer-explorer workflow deliberately keeps large data resident for
   fast search/slicing). `paste-text`, `set-buffer`/`append-buffer`, and a single
-  command's captured output are not size-capped, so very large content consumes
-  host memory accordingly. Search streams large buffers via a temp file once they
-  exceed `search.streaming_threshold_bytes`, but the buffers themselves are not
-  evicted by size. Keep this in mind when pasting or capturing huge payloads.
+  command's retained output can consume host memory accordingly. Tracked output
+  is line-capped by `capture_max_lines`, but retained strings and individual line
+  length are not byte-capped. Search streams large buffers via a temp file once
+  they exceed `search.streaming_threshold_bytes`, but the buffers themselves are
+  not evicted by size. Keep this in mind when pasting or capturing huge payloads.
 - **tmux output is parsed as tab-delimited fields.** Sessions, windows, panes,
   clients, and buffers are read from `\t`-separated `-F` format strings. A field
   value containing a literal tab (rare, but possible in a pane title or path) can

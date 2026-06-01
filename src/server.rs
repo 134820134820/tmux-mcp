@@ -596,7 +596,7 @@ pub struct SendKeysInput {
     pub keys: String,
     /// Send each character individually
     pub literal: Option<bool>,
-    /// Press Enter after the keys (per repeat). Lets you type and submit in one call.
+    /// Press Enter after each repeat.
     pub enter: Option<bool>,
     /// Number of times to repeat the keys
     pub repeat: Option<u32>,
@@ -627,7 +627,7 @@ pub struct PasteTextInput {
     /// ID of the tmux pane
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// UTF-8 text to paste. Embedded newlines stay literal (no per-line submit) when the program supports bracketed paste.
+    /// UTF-8 text to paste.
     pub content: String,
     /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
     pub socket: Option<String>,
@@ -2187,7 +2187,7 @@ impl TmuxMcpServer {
     // Dedicated terminal interaction tools
     #[tool(
         name = "send-keys",
-        description = "Send keystrokes to a pane. Use only for interactive programs (vim/htop/ssh/REPLs); for shell commands prefer execute-command + get-command-result. literal=false (default) interprets keys as key names/chords (Enter, C-c, Up, Tab); a string equal to a key name fires that key. literal=true types the exact characters verbatim (use for arbitrary text that could collide with key names). enter=true presses Enter after the keys (per repeat) so you type and submit in one call. For multi-line text that must NOT submit line-by-line, use paste-text. Pair with capture-pane in a read-act loop; delayMs for slow terminals.",
+        description = "Send keystrokes to a pane. Use for interactive programs; prefer execute-command for shell commands.",
         annotations(open_world_hint = true)
     )]
     async fn send_keys(
@@ -2220,7 +2220,7 @@ impl TmuxMcpServer {
         for _ in 0..repeat_count {
             if let Some(delay) = input.0.delay_ms {
                 if literal {
-                    // Literal mode: send each character individually with delay
+                    // Literal mode delays between characters.
                     for ch in input.0.keys.chars() {
                         if let Err(e) = tmux::send_keys(
                             &input.0.pane_id,
@@ -2237,8 +2237,7 @@ impl TmuxMcpServer {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 } else {
-                    // Non-literal: send the whole key sequence, then delay
-                    // (delay is between repeats, not between characters)
+                    // Non-literal mode delays between repeats.
                     if let Err(e) =
                         tmux::send_keys(&input.0.pane_id, &input.0.keys, false, socket.as_deref())
                             .await
@@ -2274,7 +2273,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "send-hex",
-        description = "Send raw bytes to a pane as whitespace-separated hex tokens (00-ff) via tmux send-keys -H. Use for escape sequences key names cannot express, e.g. CSI-u: \"1b 5b 31 33 3b 32 75\" = Shift+Enter. For normal keys/text use send-keys instead.",
+        description = "Send raw bytes to a pane as whitespace-separated hex tokens via tmux send-keys -H.",
         annotations(open_world_hint = true)
     )]
     async fn send_hex(&self, input: Parameters<SendHexInput>) -> Result<CallToolResult, McpError> {
@@ -2302,9 +2301,7 @@ impl TmuxMcpServer {
             .iter()
             .map(|t| u8::from_str_radix(t, 16).expect("normalized hex"))
             .collect();
-        // Reject erase/kill line-editing controls: they could rewrite the pending
-        // line to slip a denied command past the (best-effort) filter below. Use
-        // send-backspace for those keys instead.
+        // Reject line-editing controls that can rewrite filtered input.
         if let Some(&b) = decoded
             .iter()
             .find(|&&b| matches!(b, 0x08 | 0x15 | 0x17 | 0x7f))
@@ -2332,7 +2329,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "paste-text",
-        description = "Paste multi-line UTF-8 text into a pane via tmux bracketed paste (staged in a throwaway buffer, pasted with paste-buffer -p -d). Embedded newlines stay literal and do NOT submit line-by-line when the receiving program supports bracketed paste (modern shells/REPLs/editors). Programs without bracketed-paste support fall back to a plain paste where newlines act as Enter. Use for injecting code blocks or multi-line input; for single keystrokes/chords use send-keys.",
+        description = "Paste UTF-8 text into a pane via tmux bracketed paste.",
         annotations(open_world_hint = true)
     )]
     async fn paste_text(
@@ -2353,6 +2350,9 @@ impl TmuxMcpServer {
             .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
             .await
         {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self.policy.check_command(&input.0.content) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::paste_text(&input.0.pane_id, &input.0.content, socket.as_deref()).await {
@@ -5233,6 +5233,40 @@ mod tests {
 
     #[cfg(feature = "interactive")]
     #[tokio::test]
+    async fn paste_text_command_denied_by_policy() {
+        let server = server_with_policy(
+            "[security]\ncommand_filter = { mode = \"denylist\", patterns = [\"blocked\"] }\n",
+        );
+        let result = server
+            .paste_text(Parameters(PasteTextInput {
+                pane_id: "%1".into(),
+                content: "blocked".into(),
+                socket: None,
+            }))
+            .await
+            .expect("paste text");
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn paste_text_multiline_command_denied_by_policy() {
+        let server = server_with_policy(
+            "[security]\ncommand_filter = { mode = \"denylist\", patterns = [\"^rm \"] }\n",
+        );
+        let result = server
+            .paste_text(Parameters(PasteTextInput {
+                pane_id: "%1".into(),
+                content: "echo ok\nrm -rf /".into(),
+                socket: None,
+            }))
+            .await
+            .expect("paste text");
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
     async fn paste_text_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
@@ -5267,10 +5301,7 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
 
         let logged = std::fs::read_to_string(log.path()).expect("read paste-buffer log");
-        // -p brackets the paste so embedded newlines do not submit line-by-line;
-        // -d deletes the throwaway staging buffer. Guard both so a regression that
-        // drops either flag fails here (CI never runs the integration test, which
-        // is also blind to -p because its boot shell lacks bracketed-paste support).
+        // Guard bracketed paste and staging-buffer cleanup flags.
         assert!(
             logged.contains("paste-buffer"),
             "expected paste-buffer call, got: {logged}"
