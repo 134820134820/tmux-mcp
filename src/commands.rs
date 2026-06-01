@@ -87,11 +87,8 @@ fn default_completed_max_entries() -> u32 {
     1000
 }
 
-/// How long a tracked command whose START marker is no longer reachable in the
-/// pane history (e.g. it scrolled past `capture_max_lines` under heavy output)
-/// stays Pending before being declared expired. Generous on purpose: while the
-/// anchor is lost we cannot tell "still running" from "gone", so we err toward
-/// waiting. Raise it for workloads that emit very large output over long runs.
+/// How long a command stays Pending after its START marker is no longer
+/// reachable (scrolled past `capture_max_lines`) before being declared expired.
 fn default_tracking_deadline_seconds() -> u64 {
     600
 }
@@ -267,36 +264,24 @@ impl CommandTracker {
                 break;
             }
 
-            // No DONE marker yet. If the START marker is visible, the command is
-            // still running: DONE is echoed after START, so it lands within the
-            // same (or a smaller) window once printed. Widening the capture
-            // cannot surface a marker that does not exist yet, so leave the
-            // command Pending and let the caller poll again. Caching a terminal
-            // Error here would make it sticky via the early-return above and the
-            // command could never reach Completed.
+            // START visible but no DONE yet: still running. Stay Pending (caching
+            // an Error here would be sticky via the early-return above).
             if captured_output.contains(&get_start_marker(&execution.id)) {
                 break;
             }
 
-            // START is absent: it may simply have scrolled out of the captured
-            // window. Widen and retry first. If the window cannot grow any
-            // further (already at max_lines, or a degenerate backoff factor of 1
-            // that never advances) fall through to the expiry decision instead
-            // of re-capturing the same window forever.
+            // START absent: it may have scrolled out of the window. Widen and
+            // retry; fall through once the window can no longer grow (so a
+            // backoff factor of 1 cannot spin forever).
             let widened = (capture_lines.saturating_mul(backoff)).min(max_lines);
             if widened > capture_lines {
                 capture_lines = widened;
                 continue;
             }
 
-            // Even the widest window lacks the START marker. This is either a
-            // high-output command still running (its START scrolled past
-            // `capture_max_lines` and DONE is not printed yet) or genuinely lost
-            // tracking. Capture-line exhaustion is not a timeout, so fall back to
-            // a real time bound: stay Pending until the command has outlived the
-            // tracking deadline, only then declare it expired. This keeps a slow,
-            // verbose command recoverable (relax parse completes it once DONE
-            // appears) while still bounding genuinely-lost commands.
+            // No marker even at the widest window: could be a high-output command
+            // still running, or genuinely lost. Bound by time, not capture lines:
+            // stay Pending until the command outlives the tracking deadline.
             let deadline = Duration::from_secs(self.tracking.tracking_deadline_seconds);
             if execution.started_at.elapsed() <= deadline {
                 break;
@@ -407,11 +392,8 @@ pub fn get_end_marker(shell: &ShellType, command_id: &str) -> String {
 
 /// Parse captured output to extract command output and exit code.
 ///
-/// The DONE marker carries the exit code and is authoritative for completion.
-/// The START marker only delimits where the command's output begins, so it is
-/// optional: if it scrolled out of the captured window under heavy output, we
-/// still complete the command from the DONE marker (the leading output is then
-/// best-effort, bounded by whatever remains in the window).
+/// The DONE marker is authoritative for completion; START only delimits where
+/// output begins and is optional (it may have scrolled off under heavy output).
 /// Returns `None` if no DONE marker with a numeric exit code is present.
 fn parse_command_output(captured: &str, command_id: &str) -> Option<(String, i32)> {
     let start_marker = get_start_marker(command_id);
@@ -501,8 +483,7 @@ mod tests {
     )]
     #[case("no markers at all", None)]
     #[case("TMUX_MCP_START_cmd-1\nno end marker", None)]
-    // START scrolled off but DONE is present: complete from DONE alone, with the
-    // leading output best-effort (here, nothing precedes the marker).
+    // START scrolled off but DONE present: complete from DONE alone.
     #[case(
         "TMUX_MCP_DONE_cmd-1_0\nno start marker",
         Some((String::new(), 0))
@@ -726,8 +707,7 @@ mod tests {
         let id = "expired-cmd".to_string();
         stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "no markers here");
 
-        // deadline 0: any elapsed time past start counts as expired, so the
-        // markers-never-found path resolves to a terminal Error immediately.
+        // deadline 0: markers-never-found resolves to a terminal Error immediately.
         let tracking = TrackingConfig {
             capture_initial_lines: 1,
             capture_max_lines: 2,
@@ -766,10 +746,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_status_stays_pending_when_start_lost_within_deadline() {
-        // A high-output command can push its START marker past capture_max_lines
-        // while still running. With no marker reachable but the command well
-        // within its tracking deadline, check_status must stay Pending (not cache
-        // a terminal Error) so it can still complete once DONE finally appears.
+        // START lost but well within the deadline: must stay Pending (not Error)
+        // so it can still complete once DONE appears.
         let mut stub = TmuxStub::new();
         let id = "lost-start-cmd".to_string();
         stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "buried output, no markers");
@@ -813,9 +791,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_status_completes_when_start_marker_scrolled_off() {
-        // The DONE marker is authoritative: even if START scrolled out of the
-        // captured window, a visible DONE with a numeric exit code completes the
-        // command (leading output is best-effort).
+        // DONE is authoritative: a visible DONE completes the command even if
+        // START scrolled out of the window.
         let mut stub = TmuxStub::new();
         let id = "done-only-cmd".to_string();
         stub.set_var(
@@ -854,12 +831,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_status_terminates_with_degenerate_backoff_factor() {
-        // Regression: capture_backoff_factor == 1 cannot widen the capture
-        // window, so the escalation step never advances. The loop must still
-        // terminate (fall through to the expiry decision) rather than spin
-        // forever re-capturing the same window. deadline 0 makes it resolve to a
-        // terminal Error immediately once it falls through; without the fix this
-        // test hangs.
+        // Regression: capture_backoff_factor == 1 cannot widen the window; the
+        // loop must still terminate (fall through to expiry) rather than spin.
         let mut stub = TmuxStub::new();
         let id = "degenerate-backoff-cmd".to_string();
         stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "no markers here");
@@ -901,10 +874,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_status_stays_pending_while_command_still_running() {
-        // Regression: a command whose START marker is visible but whose DONE
-        // marker has not been printed yet (still running) must NOT be cached as
-        // a terminal Error. Otherwise the early-return path makes the bogus
-        // Error sticky and the command can never reach Completed on later polls.
+        // Regression: START visible, DONE not yet printed (still running) must
+        // NOT be cached as a terminal Error (the early-return makes it sticky).
         let mut stub = TmuxStub::new();
         let id = "running-cmd".to_string();
         stub.set_var(

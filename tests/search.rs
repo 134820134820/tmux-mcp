@@ -11,11 +11,8 @@ use tmux_mcp_rs::types::SearchMode;
 
 const FIXTURE_PATH: &str = "tests/fixtures/old-man-and-the-sea.txt";
 
-/// Load the fixture text, or `None` if it is not present.
-///
-/// The fixture (`old-man-and-the-sea.txt`) is gitignored to avoid committing
-/// copyrighted text, so it is absent on a fresh clone. Tests that depend on it
-/// skip gracefully instead of failing when it is missing.
+/// Load the fixture text, or `None` if absent. It is gitignored to avoid
+/// committing copyrighted text, so dependent tests skip on a fresh clone.
 fn load_fixture() -> Option<String> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH);
     fs::read_to_string(fixture).ok()

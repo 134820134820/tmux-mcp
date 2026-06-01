@@ -53,6 +53,32 @@ cd tmux-mcp
 cargo build --release
 ```
 
+### Hardened build (compile-time tool removal)
+The raw keystroke tools are gated behind Cargo features that are **enabled by
+default**:
+
+- `interactive` — the `send-keys` and `send-hex` tools.
+- `special-keys` — the `send-enter`, `send-tab`, `send-escape`, arrow, page,
+  home/end, `send-backspace`, `send-cancel`, and `send-eof` tools.
+
+Because these tools inject bytes straight into the PTY, the `command_filter`
+cannot reliably screen what they execute (a denied command can be typed
+character-by-character and then submitted with Enter). Disabling a feature
+removes those tools from the binary entirely — they are never registered, so an
+agent cannot call them and `list-tools` will not advertise them.
+
+```bash
+# Filtered-only build: execute-command is the sole shell-input path.
+cargo build --release --no-default-features --features rayon,rapidfuzz
+
+# Keep raw keystrokes but drop the special-key helpers (or vice versa).
+cargo build --release --no-default-features --features rayon,rapidfuzz,interactive
+```
+
+`execute-command` is always present and remains subject to the `command_filter`
+allow/deny patterns, so a hardened build forces all shell input through the
+validated path.
+
 ## Quick Start
 
 1) Add this MCP configuration. Examples for common MCP clients (pick one):
@@ -391,18 +417,23 @@ By default, the security policy is permissive to avoid breaking agent workflows:
 **Denylist behavior:** when `command_filter.mode = "denylist"`, any regex in
 `security.command_filter.patterns` that matches a command string will block that
 command. This applies to `execute-command` and non-literal `send-keys` only.
-For `send-hex`, the hex bytes are decoded to a UTF-8 string and screened by the
-same denylist before being sent. Literal `send-keys` and `paste-text` are raw
-input gated by `allow_send_keys` only, not the command filter — their content is
-not screened, and newlines (a literal `\n`, or a bracketed paste into a program
-without bracketed-paste support) can still reach the shell and execute. Scope
-them with `allowed_panes`/`allowed_sessions`, or disable `allow_send_keys`.
+For `send-hex`, the decoded bytes are screened by the same denylist on a
+best-effort basis: erase/kill line-editing control bytes are rejected outright,
+but raw bytes can still encode actions a string-matching regex cannot fully
+anticipate, so do not rely on the denylist as a hard boundary for `send-hex`.
+Literal `send-keys` and `paste-text` are raw input gated by `allow_send_keys`
+only, not the command filter — their content is not screened, and newlines (a
+literal `\n`, or a bracketed paste into a program without bracketed-paste
+support) can still reach the shell and execute. Scope them with
+`allowed_panes`/`allowed_sessions`, or disable `allow_send_keys`.
 
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
 
 To harden a deployment, flip specific `allow_*` flags, add deny/allow patterns,
-or restrict sockets/sessions/panes explicitly.
+or restrict sockets/sessions/panes explicitly. For the strongest guarantee that
+shell input cannot bypass the `command_filter`, compile without the raw
+keystroke tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
 
 ## Notes and limitations
 
