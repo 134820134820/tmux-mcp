@@ -596,6 +596,8 @@ pub struct SendKeysInput {
     pub keys: String,
     /// Send each character individually
     pub literal: Option<bool>,
+    /// Press Enter after the keys (per repeat). Lets you type and submit in one call.
+    pub enter: Option<bool>,
     /// Number of times to repeat the keys
     pub repeat: Option<u32>,
     /// Delay between key transmissions in milliseconds
@@ -614,6 +616,19 @@ pub struct SendHexInput {
     pub pane_id: String,
     /// Whitespace-separated hex byte tokens (00-ff), e.g. "1b 5b 31 33 3b 32 75" for Shift+Enter (CSI-u)
     pub hex: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
+/// Input parameters for the paste-text tool.
+#[cfg(feature = "interactive")]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PasteTextInput {
+    /// ID of the tmux pane
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// UTF-8 text to paste. Embedded newlines stay literal (no per-line submit) when the program supports bracketed paste.
+    pub content: String,
     /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
     pub socket: Option<String>,
 }
@@ -2172,7 +2187,7 @@ impl TmuxMcpServer {
     // Dedicated terminal interaction tools
     #[tool(
         name = "send-keys",
-        description = "Send keystrokes to a pane. Use only for interactive programs (vim/htop/ssh/REPLs); for commands prefer execute-command + get-command-result instead of send-keys+send-enter+capture-pane. Pair with capture-pane in a read-act loop. Use literal=true for exact text, delayMs for slow terminals.",
+        description = "Send keystrokes to a pane. Use only for interactive programs (vim/htop/ssh/REPLs); for shell commands prefer execute-command + get-command-result. literal=false (default) interprets keys as key names/chords (Enter, C-c, Up, Tab); a string equal to a key name fires that key. literal=true types the exact characters verbatim (use for arbitrary text that could collide with key names). enter=true presses Enter after the keys (per repeat) so you type and submit in one call. For multi-line text that must NOT submit line-by-line, use paste-text. Pair with capture-pane in a read-act loop; delayMs for slow terminals.",
         annotations(open_world_hint = true)
     )]
     async fn send_keys(
@@ -2241,6 +2256,15 @@ impl TmuxMcpServer {
                     "Error sending keys: {e}"
                 ))]));
             }
+            if input.0.enter.unwrap_or(false) {
+                if let Err(e) =
+                    tmux::send_keys(&input.0.pane_id, "Enter", false, socket.as_deref()).await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error sending Enter: {e}"
+                    ))]));
+                }
+            }
         }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Keys sent to pane {}",
@@ -2302,6 +2326,42 @@ impl TmuxMcpServer {
             ))])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error sending hex: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "paste-text",
+        description = "Paste multi-line UTF-8 text into a pane via tmux bracketed paste (staged in a throwaway buffer, pasted with paste-buffer -p -d). Embedded newlines stay literal and do NOT submit line-by-line when the receiving program supports bracketed paste (modern shells/REPLs/editors). Programs without bracketed-paste support fall back to a plain paste where newlines act as Enter. Use for injecting code blocks or multi-line input; for single keystrokes/chords use send-keys.",
+        annotations(open_world_hint = true)
+    )]
+    async fn paste_text(
+        &self,
+        input: Parameters<PasteTextInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("paste-text") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        match tmux::paste_text(&input.0.pane_id, &input.0.content, socket.as_deref()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Pasted text into pane {}",
+                input.0.pane_id
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error pasting text: {e}"
             ))])),
         }
     }
@@ -2760,8 +2820,8 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     };
                     resources.push(Annotated::new(
                         RawResource {
-                            uri: format!("tmux://command/{}/result", id),
-                            name: format!("Command: {}", truncated_cmd),
+                            uri: format!("tmux://command/{id}/result"),
+                            name: format!("Command: {truncated_cmd}"),
                             title: None,
                             description: Some(format!(
                                 "Tracked command status: {:?}. Poll to avoid re-running.",
@@ -3629,6 +3689,7 @@ mod tests {
             pane_id: "%1".into(),
             keys: "hello".into(),
             literal: None,
+            enter: None,
             repeat: None,
             delay_ms: None,
             socket: None,
@@ -4198,6 +4259,7 @@ mod tests {
                 pane_id: "%1".into(),
                 keys: "echo hi".into(),
                 literal: None,
+                enter: None,
                 repeat: None,
                 delay_ms: None,
                 socket: None,
@@ -4593,6 +4655,7 @@ mod tests {
                 pane_id: "%1".into(),
                 keys: "hi".into(),
                 literal: Some(false),
+                enter: None,
                 repeat: None,
                 delay_ms: None,
                 socket: None,
@@ -4615,6 +4678,7 @@ mod tests {
                 pane_id: "%1".into(),
                 keys: "hi".into(),
                 literal: Some(true),
+                enter: None,
                 repeat: None,
                 delay_ms: Some(1),
                 socket: None,
@@ -4628,6 +4692,7 @@ mod tests {
                 pane_id: "%1".into(),
                 keys: "C-c".into(),
                 literal: Some(false),
+                enter: None,
                 repeat: None,
                 delay_ms: Some(1),
                 socket: None,
@@ -4641,6 +4706,7 @@ mod tests {
                 pane_id: "%1".into(),
                 keys: "ls".into(),
                 literal: Some(false),
+                enter: None,
                 repeat: None,
                 delay_ms: None,
                 socket: None,
@@ -5083,6 +5149,7 @@ mod tests {
             pane_id: "%1".into(),
             keys: "hi".into(),
             literal: Some(true),
+            enter: None,
             repeat: Some(2),
             delay_ms: Some(0),
             socket: None,
@@ -5094,6 +5161,7 @@ mod tests {
             pane_id: "%1".into(),
             keys: "C-c".into(),
             literal: Some(false),
+            enter: None,
             repeat: Some(1),
             delay_ms: Some(0),
             socket: None,
@@ -5105,6 +5173,7 @@ mod tests {
             pane_id: "%1".into(),
             keys: "ls".into(),
             literal: Some(false),
+            enter: None,
             repeat: None,
             delay_ms: None,
             socket: None,
@@ -5113,7 +5182,111 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
     }
 
-    #[cfg(feature = "special-keys")]
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn send_keys_enter_flag_sends_enter() {
+        let mut stub = TmuxStub::new();
+        let log = NamedTempFile::new().expect("create log file");
+        stub.set_var("TMUX_STUB_SEND_KEYS_LOG", log.path());
+        let server = server_default();
+
+        let result = server
+            .send_keys(Parameters(SendKeysInput {
+                pane_id: "%1".into(),
+                keys: "ls".into(),
+                literal: Some(false),
+                enter: Some(true),
+                repeat: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("send keys");
+        assert_eq!(result.is_error, Some(false));
+
+        let logged = std::fs::read_to_string(log.path()).expect("read send-keys log");
+        // One send-keys for the payload, one for the Enter key.
+        assert!(
+            logged.contains("ls"),
+            "expected payload send, got: {logged}"
+        );
+        assert!(
+            logged.contains("Enter"),
+            "expected Enter send, got: {logged}"
+        );
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn paste_text_denied_by_policy() {
+        let server = server_with_policy("[security]\nallow_send_keys = false\n");
+        let result = server
+            .paste_text(Parameters(PasteTextInput {
+                pane_id: "%1".into(),
+                content: "hello".into(),
+                socket: None,
+            }))
+            .await
+            .expect("paste text");
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn paste_text_happy_path() {
+        let _stub = TmuxStub::new();
+        let server = server_default();
+        let result = server
+            .paste_text(Parameters(PasteTextInput {
+                pane_id: "%1".into(),
+                content: "line1\nline2\n".into(),
+                socket: None,
+            }))
+            .await
+            .expect("paste text");
+        assert_eq!(result.is_error, Some(false));
+        assert!(first_text(&result).contains("Pasted text"));
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn paste_text_uses_bracketed_paste_flags() {
+        let mut stub = TmuxStub::new();
+        let log = NamedTempFile::new().expect("create paste-buffer log");
+        stub.set_var("TMUX_STUB_PASTE_BUFFER_LOG", log.path());
+        let server = server_default();
+
+        let result = server
+            .paste_text(Parameters(PasteTextInput {
+                pane_id: "%1".into(),
+                content: "line1\nline2\n".into(),
+                socket: None,
+            }))
+            .await
+            .expect("paste text");
+        assert_eq!(result.is_error, Some(false));
+
+        let logged = std::fs::read_to_string(log.path()).expect("read paste-buffer log");
+        // -p brackets the paste so embedded newlines do not submit line-by-line;
+        // -d deletes the throwaway staging buffer. Guard both so a regression that
+        // drops either flag fails here (CI never runs the integration test, which
+        // is also blind to -p because its boot shell lacks bracketed-paste support).
+        assert!(
+            logged.contains("paste-buffer"),
+            "expected paste-buffer call, got: {logged}"
+        );
+        assert!(
+            logged.contains("-p"),
+            "expected bracketed flag -p, got: {logged}"
+        );
+        assert!(
+            logged.contains("-d"),
+            "expected delete flag -d, got: {logged}"
+        );
+        assert!(logged.contains("%1"), "expected target pane, got: {logged}");
+    }
+
+    #[cfg(all(feature = "interactive", feature = "special-keys"))]
     #[tokio::test]
     async fn send_special_keys_happy_path() {
         let _stub = TmuxStub::new();
