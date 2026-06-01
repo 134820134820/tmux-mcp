@@ -10,6 +10,7 @@ use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use crate::errors::{Error, Result};
 use crate::types::{
@@ -90,26 +91,82 @@ fn get_socket_args(socket: Option<&str>) -> Vec<String> {
     }
 }
 
+/// Parse a `TMUX_MCP_SSH` value into SSH argv tokens.
+pub fn parse_ssh_args(value: &str) -> Result<Option<Vec<String>>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let parts = shell_words::split(value).map_err(|e| Error::InvalidArgument {
+        message: format!("invalid TMUX_MCP_SSH: {e}"),
+    })?;
+    if parts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parts))
+    }
+}
+
 /// Get SSH arguments for tmux commands.
-/// If TMUX_MCP_SSH is set, returns parsed args (e.g. ["-i", "key", "user@host"]).
 fn get_ssh_args() -> Result<Option<Vec<String>>> {
     match std::env::var("TMUX_MCP_SSH") {
-        Ok(value) if !value.trim().is_empty() => {
-            let parts = shell_words::split(&value).map_err(|e| Error::InvalidArgument {
-                message: format!("invalid TMUX_MCP_SSH: {e}"),
-            })?;
-            if parts.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(parts))
-            }
-        }
-        _ => Ok(None),
+        Ok(value) => parse_ssh_args(&value),
+        Err(_) => Ok(None),
     }
 }
 
 fn ssh_enabled() -> Result<bool> {
     Ok(get_ssh_args()?.is_some())
+}
+
+fn quote_remote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+
+    if arg.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '=' | '+')
+    }) {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn build_remote_tmux_command(socket_args: &[String], args: &[&str]) -> String {
+    std::iter::once("tmux")
+        .chain(socket_args.iter().map(String::as_str))
+        .chain(args.iter().copied())
+        .map(quote_remote_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn build_tmux_command(args: &[&str], socket: Option<&str>) -> Result<Command> {
+    let socket_args = get_socket_args(socket);
+
+    if let Some(mut ssh_args) = get_ssh_args()? {
+        ssh_args.push(build_remote_tmux_command(&socket_args, args));
+        let mut cmd = Command::new("ssh");
+        cmd.args(&ssh_args);
+        Ok(cmd)
+    } else {
+        let mut tmux_args = socket_args;
+        tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
+        let mut cmd = Command::new("tmux");
+        cmd.args(&tmux_args);
+        Ok(cmd)
+    }
 }
 
 async fn run_tmux_with_socket(
@@ -121,23 +178,7 @@ async fn run_tmux_with_socket(
         message: format!("tmux semaphore closed: {e}"),
     })?;
 
-    let socket_args = get_socket_args(socket);
-    let ssh_args = get_ssh_args()?;
-
-    let mut command = if let Some(mut ssh_args) = ssh_args {
-        ssh_args.push("tmux".to_string());
-        ssh_args.extend(socket_args);
-        ssh_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("ssh");
-        cmd.args(&ssh_args);
-        cmd
-    } else {
-        let mut tmux_args = socket_args;
-        tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("tmux");
-        cmd.args(&tmux_args);
-        cmd
-    };
+    let mut command = build_tmux_command(args, socket)?;
 
     let output = if let Some(input) = stdin {
         let mut child = command
@@ -208,22 +249,7 @@ async fn execute_tmux_with_socket_to_file(
         message: format!("tmux semaphore closed: {e}"),
     })?;
 
-    let socket_args = get_socket_args(socket);
-    let ssh_args = get_ssh_args()?;
-    let mut command = if let Some(mut ssh_args) = ssh_args {
-        ssh_args.push("tmux".to_string());
-        ssh_args.extend(socket_args);
-        ssh_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("ssh");
-        cmd.args(&ssh_args);
-        cmd
-    } else {
-        let mut tmux_args = socket_args;
-        tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("tmux");
-        cmd.args(&tmux_args);
-        cmd
-    };
+    let mut command = build_tmux_command(args, socket)?;
 
     let mut child = command
         .stdout(Stdio::piped())
@@ -303,6 +329,30 @@ pub async fn is_tmux_running() -> Result<bool> {
         Err(Error::Tmux { ref message }) if message.contains("no sessions") => Ok(true),
         Err(e) => Err(e),
     }
+}
+
+/// Parse a `tmux -V` string like "tmux 3.4" or "tmux 3.6b" into (major, minor).
+/// Returns None when the version cannot be parsed.
+pub fn parse_tmux_version(output: &str) -> Option<(u32, u32)> {
+    let version = output.trim().strip_prefix("tmux ")?.trim();
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    // The minor field may carry a letter suffix (e.g. "6b") or "-rc"; keep the
+    // leading digits only.
+    let minor_raw = parts.next().unwrap_or("0");
+    let minor_digits: String = minor_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let minor: u32 = minor_digits.parse().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Query the running tmux version via `tmux -V`, honoring the socket/SSH path so
+/// a remote tmux reports its own version. Returns None if it cannot be determined.
+pub async fn tmux_version() -> Option<(u32, u32)> {
+    let output = execute_tmux(&["-V"]).await.ok()?;
+    parse_tmux_version(&output)
 }
 
 /// Parse `list-sessions -F '#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}'`
@@ -496,7 +546,7 @@ pub async fn capture_pane(
     } else {
         let lines_val = lines.unwrap_or(200);
         args.push("-S".into());
-        args.push(format!("-{}", lines_val));
+        args.push(format!("-{lines_val}"));
         args.push("-E".into());
         args.push("-".into());
     }
@@ -612,13 +662,13 @@ fn read_window_from_file(path: &Path, start: u64, len: u64) -> Result<Vec<u8>> {
 
 /// Save a tmux buffer to a file path.
 pub async fn save_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["save-buffer", "-b", name, path], socket).await?;
+    execute_tmux_with_socket(&["save-buffer", "-b", name, "--", path], socket).await?;
     Ok(())
 }
 
 /// Load a tmux buffer from a file path.
 pub async fn load_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["load-buffer", "-b", name, path], socket).await?;
+    execute_tmux_with_socket(&["load-buffer", "-b", name, "--", path], socket).await?;
     Ok(())
 }
 
@@ -671,7 +721,7 @@ pub async fn append_buffer(name: &str, content: &str, socket: Option<&str>) -> R
             .map_err(|e| Error::Tmux {
                 message: format!("failed to append temp buffer: {e}"),
             })?;
-        execute_tmux_with_socket(&["load-buffer", "-b", name, &path], socket).await?;
+        execute_tmux_with_socket(&["load-buffer", "-b", name, "--", &path], socket).await?;
         Ok(())
     } else {
         let mut existing_bytes = show_buffer_bytes(Some(name), socket).await?;
@@ -1321,10 +1371,7 @@ fn subsearch_text_view(
         }
         if resume_offset < start || resume_offset > end {
             return Err(Error::InvalidArgument {
-                message: format!(
-                    "resumeFromOffset {} is outside the anchor window",
-                    resume_offset
-                ),
+                message: format!("resumeFromOffset {resume_offset} is outside the anchor window"),
             });
         }
         scan_start = clamp_char_boundary(
@@ -1483,8 +1530,7 @@ async fn load_buffer_window(
         if window_start as usize > full_len {
             return Err(Error::InvalidArgument {
                 message: format!(
-                    "resumeFromOffset {} exceeds buffer '{}' length {}",
-                    window_start, buffer, full_len
+                    "resumeFromOffset {window_start} exceeds buffer '{buffer}' length {full_len}"
                 ),
             });
         }
@@ -1503,8 +1549,7 @@ async fn load_buffer_window(
         if window_start as usize > full_len {
             return Err(Error::InvalidArgument {
                 message: format!(
-                    "resumeFromOffset {} exceeds buffer '{}' length {}",
-                    window_start, buffer, full_len
+                    "resumeFromOffset {window_start} exceeds buffer '{buffer}' length {full_len}"
                 ),
             });
         }
@@ -1616,10 +1661,7 @@ pub async fn subsearch_buffer(
     let buffer_len = size_hint.unwrap_or(0) as usize;
     if anchor_offset as usize > buffer_len && size_hint.is_some() {
         return Err(Error::InvalidArgument {
-            message: format!(
-                "anchor offset {} exceeds buffer length {}",
-                anchor_offset, buffer_len
-            ),
+            message: format!("anchor offset {anchor_offset} exceeds buffer length {buffer_len}"),
         });
     }
 
@@ -1791,8 +1833,10 @@ pub async fn split_pane(
     let size_str;
     if let Some(s) = size {
         if s > 0 && s < 100 {
-            size_str = s.to_string();
-            args.push("-p");
+            // tmux 3.4 rejects the legacy `-p <percent>` flag with "size missing";
+            // `-l <percent>%` is the modern form and works across tmux 3.x.
+            size_str = format!("{s}%");
+            args.push("-l");
             args.push(&size_str);
         }
     }
@@ -1859,10 +1903,11 @@ pub async fn send_keys(
             return Ok(());
         }
         for chunk in chunk_literal_payload(keys) {
-            execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", &chunk], socket).await?;
+            execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", "--", &chunk], socket)
+                .await?;
         }
     } else {
-        execute_tmux_with_socket(&["send-keys", "-t", pane_id, keys], socket).await?;
+        execute_tmux_with_socket(&["send-keys", "-t", pane_id, "--", keys], socket).await?;
     }
     Ok(())
 }
@@ -1895,10 +1940,7 @@ pub fn parse_hex_tokens(hex: &str) -> Result<Vec<String>> {
 /// Max hex byte tokens per `send-keys -H` call, to stay clear of argv/tmux limits.
 const MAX_HEX_TOKENS_PER_CALL: usize = 1000;
 
-/// Send raw bytes to a pane via tmux `send-keys -H` (hex mode).
-///
-/// Each token is one byte (00-ff). Use this for escape sequences that key names
-/// cannot express, e.g. CSI-u (`1b 5b 31 33 3b 32 75` = Shift+Enter).
+/// Send raw bytes to a pane via tmux `send-keys -H`.
 pub async fn send_keys_hex(pane_id: &str, hex: &str, socket: Option<&str>) -> Result<()> {
     let tokens = parse_hex_tokens(hex)?;
     for chunk in tokens.chunks(MAX_HEX_TOKENS_PER_CALL) {
@@ -1929,6 +1971,33 @@ fn chunk_literal_payload(keys: &str) -> Vec<String> {
     chunks
 }
 
+/// Paste UTF-8 content into a pane with a temporary tmux buffer.
+pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> Result<()> {
+    let buffer_name = format!("__tmux_mcp_paste_{}", Uuid::new_v4());
+    set_buffer(&buffer_name, content, socket).await?;
+    let result = execute_tmux_with_socket(
+        &[
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            &buffer_name,
+            "-t",
+            pane_id,
+        ],
+        socket,
+    )
+    .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let _ = delete_buffer(&buffer_name, socket).await;
+            Err(e)
+        }
+    }
+}
+
 /// Get the current session (the one the client is attached to).
 pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
@@ -1942,7 +2011,7 @@ pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
 
 /// Rename a session.
 pub async fn rename_session(session_id: &str, name: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["rename-session", "-t", session_id, name], socket).await?;
+    execute_tmux_with_socket(&["rename-session", "-t", session_id, "--", name], socket).await?;
     Ok(())
 }
 
@@ -2013,7 +2082,7 @@ pub async fn zoom_pane(pane_id: &str, socket: Option<&str>) -> Result<()> {
 
 /// Select a window layout.
 pub async fn select_layout(window_id: &str, layout: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["select-layout", "-t", window_id, layout], socket).await?;
+    execute_tmux_with_socket(&["select-layout", "-t", window_id, "--", layout], socket).await?;
     Ok(())
 }
 
@@ -2107,7 +2176,7 @@ pub async fn set_synchronize_panes(
 
 /// Rename a window.
 pub async fn rename_window(window_id: &str, name: &str, socket: Option<&str>) -> Result<()> {
-    execute_tmux_with_socket(&["rename-window", "-t", window_id, name], socket).await?;
+    execute_tmux_with_socket(&["rename-window", "-t", window_id, "--", name], socket).await?;
     Ok(())
 }
 
@@ -2125,7 +2194,7 @@ pub async fn move_window(
     socket: Option<&str>,
 ) -> Result<()> {
     let target = match target_index {
-        Some(idx) => format!("{}:{}", target_session_id, idx),
+        Some(idx) => format!("{target_session_id}:{idx}"),
         None => target_session_id.to_string(),
     };
 
@@ -2168,6 +2237,51 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, "main");
         assert_eq!(result[1].name, "dev");
+    }
+
+    #[rstest]
+    #[case("tmux 3.4", Some((3, 4)))]
+    #[case("tmux 3.6b", Some((3, 6)))]
+    #[case("tmux 3.0a", Some((3, 0)))]
+    #[case("tmux 2.9", Some((2, 9)))]
+    #[case("tmux next-3.5", None)]
+    #[case("tmux 3", Some((3, 0)))]
+    #[case("garbage", None)]
+    #[case("", None)]
+    fn test_parse_tmux_version(#[case] input: &str, #[case] expected: Option<(u32, u32)>) {
+        assert_eq!(parse_tmux_version(input), expected);
+    }
+
+    #[rstest]
+    #[case("user@host", Some(vec!["user@host"]))]
+    #[case("-i /path/key user@host", Some(vec!["-i", "/path/key", "user@host"]))]
+    #[case("-i \"my key\" user@host", Some(vec!["-i", "my key", "user@host"]))]
+    #[case("-p 2222 user@host", Some(vec!["-p", "2222", "user@host"]))]
+    #[case("", None)]
+    #[case("   ", None)]
+    fn test_parse_ssh_args_ok(#[case] input: &str, #[case] expected: Option<Vec<&str>>) {
+        let result = parse_ssh_args(input).expect("should parse");
+        let expected = expected.map(|v| v.into_iter().map(String::from).collect::<Vec<_>>());
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_ssh_args_rejects_unbalanced_quotes() {
+        let err = parse_ssh_args("user@host 'unbalanced").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn remote_tmux_command_shell_quotes_args() {
+        let socket_args = vec!["-S".to_string(), "/tmp/tmux sock; echo bad".to_string()];
+        let command = build_remote_tmux_command(
+            &socket_args,
+            &["rename-window", "-t", "@1", "--", "Bob's window"],
+        );
+        assert_eq!(
+            command,
+            "tmux -S '/tmp/tmux sock; echo bad' rename-window -t @1 -- 'Bob'\"'\"'s window'"
+        );
     }
 
     #[rstest]
@@ -2244,7 +2358,28 @@ mod tests {
         let log = fs::read_to_string(&log_path).expect("read log");
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("-l hello"));
+        assert!(lines[0].contains("-l -- hello"));
+    }
+
+    #[tokio::test]
+    async fn send_keys_literal_uses_separator_for_leading_dash_payload() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        send_keys("%1", "-----BEGIN", true, None)
+            .await
+            .expect("send keys");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("-l -- -----BEGIN"),
+            "literal leading-dash payload should follow --, got: {log}"
+        );
     }
 
     #[tokio::test]
@@ -2300,6 +2435,31 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("-H"));
         assert!(lines[0].contains("1b 5b 31 33 3b 32 75"));
+    }
+
+    #[tokio::test]
+    async fn paste_text_deletes_staging_buffer_on_paste_failure() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("delete-buffer.log");
+        stub.set_var("TMUX_STUB_ERROR_CMD", "paste-buffer");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "paste failed");
+        stub.set_var(
+            "TMUX_STUB_DELETE_BUFFER_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        let err = paste_text("%1", "secret", None).await.unwrap_err();
+        match err {
+            Error::Tmux { message } => assert!(message.contains("paste failed")),
+            _ => panic!("expected tmux error"),
+        }
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("__tmux_mcp_paste_"),
+            "expected cleanup of staging buffer, got: {log}"
+        );
     }
 
     #[test]
@@ -2423,6 +2583,19 @@ mod tests {
 
         let output = execute_tmux(&["ssh-test"]).await.expect("ssh test");
         assert_eq!(output, "via-ssh");
+    }
+
+    #[tokio::test]
+    async fn execute_tmux_over_ssh_preserves_shell_sensitive_args() {
+        let mut stub = TmuxStub::new();
+        let socket = "/tmp/tmux sock 'quoted'; echo bad";
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+
+        let output = execute_tmux_with_socket(&["socket-test"], Some(socket))
+            .await
+            .expect("socket test over ssh");
+
+        assert_eq!(output, socket);
     }
 
     #[tokio::test]

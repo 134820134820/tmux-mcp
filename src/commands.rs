@@ -149,10 +149,7 @@ impl CommandTracker {
         } else {
             let end_marker = get_end_marker(&self.shell_type, &command_id);
             let start_marker = get_start_marker(&command_id);
-            let wrapped = format!(
-                "echo \"{}\"; {}; echo \"{}\"",
-                start_marker, command, end_marker
-            );
+            let wrapped = format!("echo \"{start_marker}\"; {command}; echo \"{end_marker}\"");
             (wrapped, false)
         };
 
@@ -323,10 +320,19 @@ impl CommandTracker {
         let retention_window = Duration::from_secs(retention_minutes.saturating_mul(60));
         let now = Instant::now();
 
+        // Pending commands only transition when polled, so cleanup also reclaims
+        // entries abandoned past the deadline plus retention window.
+        let pending_abandon_window = Duration::from_secs(self.tracking.tracking_deadline_seconds)
+            .saturating_add(retention_window)
+            .max(Duration::from_secs(1));
+
         let mut commands = self.active_commands.write().await;
         commands.retain(|_, exec| {
             if exec.status == CommandStatus::Pending {
-                return true;
+                let age = now
+                    .checked_duration_since(exec.started_at)
+                    .unwrap_or(Duration::ZERO);
+                return age < pending_abandon_window;
             }
             let completed_at = match exec.completed_at {
                 Some(instant) => instant,
@@ -501,7 +507,7 @@ mod tests {
         match (result, expected_exit) {
             (Some((_, code)), Some(expected)) => assert_eq!(code, expected),
             (None, None) => {}
-            (result, expected) => panic!("Expected {:?}, got {:?}", expected, result),
+            (result, expected) => panic!("Expected {expected:?}, got {result:?}"),
         }
     }
 
@@ -562,6 +568,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_command_keeps_new_pending_with_zero_cleanup_window() {
+        let _stub = TmuxStub::new();
+        let tracking = TrackingConfig {
+            completed_retention_minutes: 0,
+            tracking_deadline_seconds: 0,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+
+        let id = tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        assert!(tracker.get_command(&id).await.is_some());
+    }
+
+    #[tokio::test]
     async fn check_status_returns_early_for_completed() {
         let tracker = CommandTracker::new(ShellType::Bash);
         let id = "completed-cmd".to_string();
@@ -607,7 +631,7 @@ mod tests {
         let id = "error-cmd".to_string();
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
-            format!("TMUX_MCP_START_{id}\nbad\nTMUX_MCP_DONE_{id}_1\n", id = id),
+            format!("TMUX_MCP_START_{id}\nbad\nTMUX_MCP_DONE_{id}_1\n"),
         );
         let tracker = CommandTracker::new(ShellType::Bash);
         let execution = CommandExecution {
@@ -649,10 +673,7 @@ mod tests {
         stub.set_var("TMUX_STUB_CAPTURE_BEFORE", "prompt\nno markers yet\n");
         stub.set_var(
             "TMUX_STUB_CAPTURE_AFTER_OUTPUT",
-            format!(
-                "TMUX_MCP_START_{id}\nretry ok\nTMUX_MCP_DONE_{id}_0\n",
-                id = id
-            ),
+            format!("TMUX_MCP_START_{id}\nretry ok\nTMUX_MCP_DONE_{id}_0\n"),
         );
 
         let tracking = TrackingConfig {
@@ -791,10 +812,7 @@ mod tests {
         let id = "done-only-cmd".to_string();
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
-            format!(
-                "...truncated output...\nlast line\nTMUX_MCP_DONE_{id}_0\n",
-                id = id
-            ),
+            format!("...truncated output...\nlast line\nTMUX_MCP_DONE_{id}_0\n"),
         );
 
         let tracker = CommandTracker::new(ShellType::Bash);
@@ -877,7 +895,7 @@ mod tests {
         let id = "running-cmd".to_string();
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
-            format!("prompt\nTMUX_MCP_START_{id}\nstill working...\n", id = id),
+            format!("prompt\nTMUX_MCP_START_{id}\nstill working...\n"),
         );
 
         let tracking = TrackingConfig {
@@ -1070,5 +1088,83 @@ mod tests {
         assert!(commands.contains_key(&middle_id));
         assert!(commands.contains_key(&newest_id));
         assert!(commands.contains_key(&pending_id));
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_abandoned_pending_but_keeps_recent() {
+        // A Pending command transitions only when polled. cleanup must reclaim
+        // ones abandoned past (deadline + retention) so a fire-and-forget client
+        // cannot leak entries forever, while keeping recently-started ones.
+        let tracking = TrackingConfig {
+            tracking_deadline_seconds: 1,
+            completed_retention_minutes: 0,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+
+        let mk = |id: &str, started: Instant| CommandExecution {
+            id: id.into(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "sleep 100".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: started,
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+        let stale_started = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("backdate started_at");
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert("stale".into(), mk("stale", stale_started));
+            commands.insert("fresh".into(), mk("fresh", Instant::now()));
+        }
+
+        tracker.cleanup_completed().await;
+
+        let ids = tracker.get_active_ids().await;
+        assert!(
+            !ids.contains(&"stale".to_string()),
+            "abandoned pending should be reclaimed"
+        );
+        assert!(
+            ids.contains(&"fresh".to_string()),
+            "recently-started pending should be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_execute_command_tracks_unique_ids() {
+        // Invariant: concurrent execute_command calls each get a distinct id and
+        // none are lost from active_commands (the RwLock serializes the inserts).
+        let _stub = TmuxStub::new();
+        let tracker = Arc::new(CommandTracker::new(ShellType::Bash));
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let tracker = Arc::clone(&tracker);
+            handles.push(tokio::spawn(async move {
+                tracker
+                    .execute_command(&format!("%{i}"), "echo hi", false, false, None, None)
+                    .await
+                    .expect("execute command")
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.expect("join task"));
+        }
+
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "command ids must be unique");
+        let tracked = tracker.get_active_ids().await;
+        for id in &ids {
+            assert!(tracked.contains(id), "command {id} must be tracked");
+        }
     }
 }

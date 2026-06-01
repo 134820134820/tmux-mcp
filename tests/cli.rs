@@ -21,8 +21,14 @@ fn bin_path() -> PathBuf {
     bin
 }
 
+fn command() -> Command {
+    let mut command = Command::new(bin_path());
+    command.env_remove("TMUX_MCP_SSH");
+    command
+}
+
 fn run_with_stdin_closed(args: &[&str]) -> std::process::Output {
-    let mut child = Command::new(bin_path())
+    let mut child = command()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -35,7 +41,7 @@ fn run_with_stdin_closed(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn cli_rejects_missing_config() {
-    let output = Command::new(bin_path())
+    let output = command()
         .args(["--config", "does-not-exist.toml"])
         .output()
         .expect("run binary");
@@ -50,7 +56,7 @@ fn cli_rejects_invalid_config() {
     let mut file = NamedTempFile::new().expect("temp config");
     writeln!(file, "not = = valid").expect("write config");
 
-    let output = Command::new(bin_path())
+    let output = command()
         .args(["--config", file.path().to_str().unwrap()])
         .output()
         .expect("run binary");
@@ -69,7 +75,7 @@ fn cli_rejects_invalid_policy_regex() {
     )
     .expect("write config");
 
-    let output = Command::new(bin_path())
+    let output = command()
         .args(["--config", file.path().to_str().unwrap()])
         .output()
         .expect("run binary");
@@ -77,6 +83,32 @@ fn cli_rejects_invalid_policy_regex() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Error loading security policy"));
+}
+
+#[test]
+fn cli_rejects_invalid_ssh_quoting() {
+    let output = command()
+        .args(["--ssh", "user@host 'unterminated"])
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Error parsing SSH connection string"));
+    assert!(stderr.contains("invalid TMUX_MCP_SSH"));
+}
+
+#[test]
+fn cli_rejects_invalid_env_ssh_quoting() {
+    let output = command()
+        .env("TMUX_MCP_SSH", "user@host 'unterminated")
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Error parsing SSH connection string"));
+    assert!(stderr.contains("invalid TMUX_MCP_SSH"));
 }
 
 #[test]

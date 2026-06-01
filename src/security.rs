@@ -179,10 +179,10 @@ impl SecurityPolicy {
 
         let allowed = match tool_name {
             "execute-command" | "get-command-result" => self.config.allow_execute_command,
-            "send-keys" | "send-hex" | "send-cancel" | "send-eof" | "send-escape"
-            | "send-enter" | "send-tab" | "send-backspace" | "send-up" | "send-down"
-            | "send-left" | "send-right" | "send-page-up" | "send-page-down" | "send-home"
-            | "send-end" => self.config.allow_send_keys,
+            "send-keys" | "send-hex" | "paste-text" | "send-cancel" | "send-eof"
+            | "send-escape" | "send-enter" | "send-tab" | "send-backspace" | "send-up"
+            | "send-down" | "send-left" | "send-right" | "send-page-up" | "send-page-down"
+            | "send-home" | "send-end" => self.config.allow_send_keys,
             "kill-session" | "kill-window" | "kill-pane" | "detach-client" => {
                 self.config.allow_kill
             }
@@ -221,12 +221,7 @@ impl SecurityPolicy {
         }
     }
 
-    /// Validate a command string against allow/deny patterns.
-    pub fn check_command(&self, command: &str) -> Result<()> {
-        if !self.config.enabled {
-            return Ok(());
-        }
-
+    fn check_command_line(&self, command: &str) -> Result<()> {
         match self.config.command_filter.mode {
             CommandFilterMode::Off => Ok(()),
             CommandFilterMode::Allowlist => {
@@ -249,6 +244,28 @@ impl SecurityPolicy {
                     Ok(())
                 }
             }
+        }
+    }
+
+    /// Validate command text against allow/deny patterns, line by line.
+    pub fn check_command(&self, command: &str) -> Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let mut checked_any = false;
+        for line in command
+            .split(['\n', '\r'])
+            .filter(|line| !line.trim().is_empty())
+        {
+            checked_any = true;
+            self.check_command_line(line)?;
+        }
+
+        if checked_any {
+            Ok(())
+        } else {
+            self.check_command_line(command)
         }
     }
 
@@ -420,6 +437,57 @@ mod tests {
         assert!(policy.check_command("git status").is_ok());
         assert!(policy.check_command("rm -rf /").is_err());
         assert!(policy.check_command("sudo apt install").is_err());
+    }
+
+    #[test]
+    fn test_command_filter_checks_each_non_empty_line() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let compiled = config
+            .command_filter
+            .patterns
+            .iter()
+            .map(|p| Regex::new(p).unwrap())
+            .collect();
+        let policy = SecurityPolicy {
+            config,
+            compiled_patterns: compiled,
+        };
+
+        assert!(policy.check_command("echo ok\nrm -rf /").is_err());
+        assert!(policy.check_command("echo ok\r\nrm -rf /").is_err());
+        assert!(policy.check_command("echo ok\n\nprintf done").is_ok());
+    }
+
+    #[test]
+    fn test_command_allowlist_checks_each_non_empty_line() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^echo ".to_string(), "^printf ".to_string()],
+            },
+            ..Default::default()
+        };
+        let compiled = config
+            .command_filter
+            .patterns
+            .iter()
+            .map(|p| Regex::new(p).unwrap())
+            .collect();
+        let policy = SecurityPolicy {
+            config,
+            compiled_patterns: compiled,
+        };
+
+        assert!(policy.check_command("echo ok\nprintf done").is_ok());
+        assert!(policy.check_command("echo ok\nrm -rf /").is_err());
     }
 
     #[test]
