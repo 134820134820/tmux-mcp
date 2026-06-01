@@ -57,7 +57,7 @@ cargo build --release
 The raw keystroke tools are gated behind Cargo features that are **enabled by
 default**:
 
-- `interactive` — the `send-keys` and `send-hex` tools.
+- `interactive` — the `send-keys`, `send-hex`, and `paste-text` tools.
 - `special-keys` — the `send-enter`, `send-tab`, `send-escape`, arrow, page,
   home/end, `send-backspace`, `send-cancel`, and `send-eof` tools.
 
