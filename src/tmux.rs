@@ -10,6 +10,7 @@ use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use crate::errors::{Error, Result};
 use crate::types::{
@@ -1915,6 +1916,33 @@ fn chunk_literal_payload(keys: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
+}
+
+/// Paste UTF-8 content into a pane via tmux's bracketed paste.
+///
+/// Content is staged in a throwaway buffer and pasted with `paste-buffer -p -d`.
+/// `-p` brackets the paste (the receiving program sees one paste event instead of
+/// keystrokes) only when that program has enabled bracketed paste, so embedded
+/// newlines do not submit lines. If the program lacks bracketed-paste support,
+/// tmux falls back to a plain paste and newlines behave as Enter. `-d` deletes
+/// the staging buffer afterward.
+pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> Result<()> {
+    let buffer_name = format!("__tmux_mcp_paste_{}", Uuid::new_v4());
+    set_buffer(&buffer_name, content, socket).await?;
+    execute_tmux_with_socket(
+        &[
+            "paste-buffer",
+            "-p",
+            "-d",
+            "-b",
+            &buffer_name,
+            "-t",
+            pane_id,
+        ],
+        socket,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Get the current session (the one the client is attached to).

@@ -122,7 +122,7 @@ case "$cmd" in
       printf '%s\n' "send-keys $*" >> "$TMUX_STUB_SEND_KEYS_LOG"
     fi
     ;;
-  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|delete-buffer|set-buffer|load-buffer)
+  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|delete-buffer|set-buffer|load-buffer|paste-buffer)
     ;;
   *)
     echo "unknown command: $cmd" 1>&2

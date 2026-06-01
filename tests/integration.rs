@@ -290,6 +290,62 @@ async fn test_leading_dash_names_are_not_parsed_as_flags() {
 }
 
 #[tokio::test]
+async fn test_paste_text_delivers_content_and_cleans_buffer() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("paste-test");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let pane_id = &panes[0].id;
+
+    // Single-line token (no newline) so the assertion is deterministic regardless
+    // of whether the pane's shell supports bracketed paste. The held-not-submitted
+    // behavior for embedded newlines is verified manually, not in CI: the boot
+    // shell here is `bash --norc` (3.2 on macOS) which lacks bracketed-paste support.
+    let token = format!("PASTE_TOKEN_{}", std::process::id());
+    tmux::paste_text(pane_id, &token, socket_opt)
+        .await
+        .expect("paste text");
+
+    let content = wait_for_pane_output(pane_id, &token, Duration::from_secs(2), socket).await;
+    assert!(
+        content.contains(&token),
+        "pasted token should appear in pane, got: {content}"
+    );
+
+    // The throwaway staging buffer must be deleted by `paste-buffer -d`.
+    let buffers = tmux::list_buffers(socket_opt).await.expect("list buffers");
+    assert!(
+        !buffers
+            .iter()
+            .any(|b| b.name.starts_with("__tmux_mcp_paste_")),
+        "staging buffer should be cleaned up, found: {:?}",
+        buffers.iter().map(|b| &b.name).collect::<Vec<_>>()
+    );
+
+    tmux::kill_session(&session.id, socket_opt)
+        .await
+        .expect("kill session");
+}
+
+#[tokio::test]
 async fn test_execute_command_tracking() {
     if !should_run_integration_tests() {
         return;
