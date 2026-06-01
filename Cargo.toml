@@ -25,7 +25,7 @@ default = ["rayon", "rapidfuzz", "interactive", "special-keys"]
 rayon = ["dep:rayon"]
 rapidfuzz = ["dep:rapidfuzz"]
 fuzzy = ["rapidfuzz"]
-# Raw keystroke injection tools (send-keys, send-hex). Disable for a hardened
+# Raw input tools (send-keys, send-hex, paste-text). Disable for a hardened
 # build where shell input must go through the filtered execute-command path.
 interactive = []
 # Special-key tools (send-enter, send-tab, arrows, etc.). Disable to remove

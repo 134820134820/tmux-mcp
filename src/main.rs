@@ -142,9 +142,20 @@ async fn main() {
         .map(|s| parse_shell_type(&s))
         .unwrap_or_else(|| parse_shell_type(&cli.shell_type));
 
-    let ssh_connection = cli.ssh.or(config_ssh);
+    let ssh_connection = cli.ssh.or(config_ssh).or_else(|| {
+        std::env::var("TMUX_MCP_SSH")
+            .ok()
+            .filter(|ssh| !ssh.is_empty())
+    });
     if let Some(ssh) = ssh_connection {
-        std::env::set_var("TMUX_MCP_SSH", ssh);
+        match crate::tmux::parse_ssh_args(&ssh) {
+            Ok(Some(_)) => std::env::set_var("TMUX_MCP_SSH", ssh),
+            Ok(None) => std::env::remove_var("TMUX_MCP_SSH"),
+            Err(e) => {
+                eprintln!("Error parsing SSH connection string: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // This server targets tmux 3.x; older releases differ in output formats and

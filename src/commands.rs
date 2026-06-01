@@ -320,14 +320,11 @@ impl CommandTracker {
         let retention_window = Duration::from_secs(retention_minutes.saturating_mul(60));
         let now = Instant::now();
 
-        // A Pending command only transitions when it is polled (check_status).
-        // A client that fires commands without ever polling would otherwise leak
-        // entries forever, so drop Pending ones abandoned well past the tracking
-        // deadline. The threshold (deadline + retention) is generous enough that a
-        // client polling anywhere near the deadline still sees the proper
-        // "expired" Error before the entry is reclaimed.
-        let pending_abandon_window =
-            Duration::from_secs(self.tracking.tracking_deadline_seconds) + retention_window;
+        // Pending commands only transition when polled, so cleanup also reclaims
+        // entries abandoned past the deadline plus retention window.
+        let pending_abandon_window = Duration::from_secs(self.tracking.tracking_deadline_seconds)
+            .saturating_add(retention_window)
+            .max(Duration::from_secs(1));
 
         let mut commands = self.active_commands.write().await;
         commands.retain(|_, exec| {
@@ -568,6 +565,24 @@ mod tests {
             Error::Tmux { message } => assert!(message.contains("stub error")),
             _ => panic!("expected tmux error"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_command_keeps_new_pending_with_zero_cleanup_window() {
+        let _stub = TmuxStub::new();
+        let tracking = TrackingConfig {
+            completed_retention_minutes: 0,
+            tracking_deadline_seconds: 0,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+
+        let id = tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        assert!(tracker.get_command(&id).await.is_some());
     }
 
     #[tokio::test]
