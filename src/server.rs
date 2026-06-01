@@ -2735,8 +2735,8 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     };
                     resources.push(Annotated::new(
                         RawResource {
-                            uri: format!("tmux://command/{}/result", id),
-                            name: format!("Command: {}", truncated_cmd),
+                            uri: format!("tmux://command/{id}/result"),
+                            name: format!("Command: {truncated_cmd}"),
                             title: None,
                             description: Some(format!(
                                 "Tracked command status: {:?}. Poll to avoid re-running.",
