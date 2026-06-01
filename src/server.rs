@@ -5194,6 +5194,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paste_text_uses_bracketed_paste_flags() {
+        let mut stub = TmuxStub::new();
+        let log = NamedTempFile::new().expect("create paste-buffer log");
+        stub.set_var("TMUX_STUB_PASTE_BUFFER_LOG", log.path());
+        let server = server_default();
+
+        let result = server
+            .paste_text(Parameters(PasteTextInput {
+                pane_id: "%1".into(),
+                content: "line1\nline2\n".into(),
+                socket: None,
+            }))
+            .await
+            .expect("paste text");
+        assert_eq!(result.is_error, Some(false));
+
+        let logged = std::fs::read_to_string(log.path()).expect("read paste-buffer log");
+        // -p brackets the paste so embedded newlines do not submit line-by-line;
+        // -d deletes the throwaway staging buffer. Guard both so a regression that
+        // drops either flag fails here (CI never runs the integration test, which
+        // is also blind to -p because its boot shell lacks bracketed-paste support).
+        assert!(
+            logged.contains("paste-buffer"),
+            "expected paste-buffer call, got: {logged}"
+        );
+        assert!(
+            logged.contains("-p"),
+            "expected bracketed flag -p, got: {logged}"
+        );
+        assert!(
+            logged.contains("-d"),
+            "expected delete flag -d, got: {logged}"
+        );
+        assert!(logged.contains("%1"), "expected target pane, got: {logged}");
+    }
+
+    #[tokio::test]
     async fn send_special_keys_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
