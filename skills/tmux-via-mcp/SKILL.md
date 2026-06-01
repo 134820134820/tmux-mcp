@@ -16,6 +16,8 @@ Use this skill when a task needs a real TTY, persistent shell state, or multiple
 - Avoid the fragile loop of send-keys -> send-enter -> capture-pane for routine command output. Use `execute-command` + `get-command-result` instead.
 - Use `send-keys` only for interactive programs (REPLs, prompts, TUIs, ssh). Pair it with `capture-pane` in a read-act loop.
 - When key names cannot express a key (escape sequences like CSI-u Shift+Enter), use `send-hex` with raw byte tokens instead of `send-keys`.
+- For multi-line input (code blocks, multi-line REPL paste), use `paste-text` — it sends via tmux bracketed paste so embedded newlines stay literal instead of submitting line-by-line (in shells/REPLs that support it). A multi-line `send-keys` string would execute each line as it arrives.
+- `send-keys` accepts `enter=true` to type and submit in one call, avoiding a separate `send-enter`.
 - Treat `capture-pane` as a state probe. Use it to check progress, verify prompts, or read live output when tracking is unavailable.
 - Broadcast carefully. If you enable `set-synchronize-panes(windowId, enabled=true)`, disable it as soon as the fan-out step is done.
 - For large outputs, move data into buffers and explore incrementally. Use `set-buffer`/`load-buffer` with `search-buffer` and `subsearch-buffer`, or trigger the `tmux-buffer-explorer` skill.
@@ -74,14 +76,18 @@ Use this for prompts, REPLs, ssh, or text UIs.
 
    `capture-pane(paneId="<paneId>", lines=120, join=true, socket="<socket>")`
 
-2. Send text precisely:
+2. Send text precisely. Type and submit in one call with `enter=true`:
 
-   `send-keys(paneId="<paneId>", keys="your input", literal=true, socket="<socket>")`
+   `send-keys(paneId="<paneId>", keys="your input", literal=true, enter=true, socket="<socket>")`
+
+   For a multi-line block (e.g. a code snippet into a REPL) that must not submit line-by-line, paste it instead:
+
+   `paste-text(paneId="<paneId>", content="line1\nline2\n", socket="<socket>")`
 
 3. Confirm the action:
 
-   - `send-enter(paneId="<paneId>", socket="<socket>")`
    - `capture-pane(paneId="<paneId>", lines=120, join=true, socket="<socket>")`
+   - If you sent keys without `enter=true`, submit with `send-enter(paneId="<paneId>", socket="<socket>")`
 
 4. For keys that key names cannot express, send raw bytes. Use `send-hex` for escape sequences such as CSI-u (e.g. Shift+Enter = `1b 5b 31 33 3b 32 75`), which `send-keys` collapses to a plain Enter:
 
