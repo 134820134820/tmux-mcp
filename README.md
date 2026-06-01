@@ -13,7 +13,10 @@ A Model Context Protocol (MCP) server for tmux, written in Rust. It lets AI assi
 - The user/developer can attach to the same session to watch or participate in real time.
 - Bonus: it also works with human-created sessions, including remote setups over SSH.
 
-Requires tmux installed and available on `PATH`.
+Requires **tmux 3.x** installed and available on `PATH`. The server checks the
+version on startup and refuses to run against tmux 2.x, whose output formats and
+split flags differ. CI exercises the integration suite on tmux 3.4; development
+is on 3.6.
 
 > [!WARNING]
 > Using this MCP allows the agent to escape the sandbox and its security limitations. Here be dragons!
@@ -54,7 +57,7 @@ cargo build --release
 The raw keystroke tools are gated behind Cargo features that are **enabled by
 default**:
 
-- `interactive` — the `send-keys` and `send-hex` tools.
+- `interactive` — the `send-keys`, `send-hex`, and `paste-text` tools.
 - `special-keys` — the `send-enter`, `send-tab`, `send-escape`, arrow, page,
   home/end, `send-backspace`, `send-cancel`, and `send-eof` tools.
 
@@ -249,7 +252,8 @@ streaming_threshold_bytes = 262144
 - **subsearch-buffer** - Anchor-scoped follow-up search with structured metadata
 
 ### Key Sending
-- **send-keys** - Send arbitrary keys to a pane (interactive only)
+- **send-keys** - Send keys to a pane (interactive only). `literal=true` types exact characters; `literal=false` interprets key names/chords (Enter, C-c, Up). `enter=true` presses Enter after the keys (per repeat) to type and submit in one call
+- **paste-text** - Paste multi-line UTF-8 text via bracketed paste (`paste-buffer -p`); embedded newlines stay literal (no per-line submit) when the receiving program supports bracketed paste
 - **send-hex** - Send raw bytes as whitespace-separated hex tokens (e.g. CSI-u `1b 5b 31 33 3b 32 75` = Shift+Enter) for escape sequences key names cannot express
 - **send-cancel** - Send Ctrl+C
 - **send-eof** - Send Ctrl+D (EOF)
@@ -330,6 +334,8 @@ tmux-mcp-rs --ssh "user@host"
 ```
 
 For extra SSH options, put them before the host (e.g. `--ssh "-i ~/.ssh/key user@host"`) or use `~/.ssh/config`. The destination should be the last token in the `--ssh` string.
+
+The connection string is split with shell-word rules (quotes honored); an unbalanced quote is rejected at startup. On the remote, the server runs `ssh <args> tmux ...`, and the tmux version check applies to the remote tmux. SSH parsing is unit-tested; end-to-end remote behavior is verified manually, not in CI (no remote host in the test environment).
 
 ### Remote + isolated (SSH + socket)
 
@@ -415,6 +421,11 @@ For `send-hex`, the decoded bytes are screened by the same denylist on a
 best-effort basis: erase/kill line-editing control bytes are rejected outright,
 but raw bytes can still encode actions a string-matching regex cannot fully
 anticipate, so do not rely on the denylist as a hard boundary for `send-hex`.
+Literal `send-keys` and `paste-text` are raw input gated by `allow_send_keys`
+only, not the command filter — their content is not screened, and newlines (a
+literal `\n`, or a bracketed paste into a program without bracketed-paste
+support) can still reach the shell and execute. Scope them with
+`allowed_panes`/`allowed_sessions`, or disable `allow_send_keys`.
 
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
@@ -424,6 +435,29 @@ or restrict sockets/sessions/panes explicitly. For the strongest guarantee that
 shell input cannot bypass the `command_filter`, compile without the raw
 keystroke tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
 
+## Notes and limitations
+
+- **Memory use is unbounded by design.** Paste buffers and command output live in
+  RAM (the buffer-explorer workflow deliberately keeps large data resident for
+  fast search/slicing). `paste-text`, `set-buffer`/`append-buffer`, and a single
+  command's captured output are not size-capped, so very large content consumes
+  host memory accordingly. Search streams large buffers via a temp file once they
+  exceed `search.streaming_threshold_bytes`, but the buffers themselves are not
+  evicted by size. Keep this in mind when pasting or capturing huge payloads.
+- **tmux output is parsed as tab-delimited fields.** Sessions, windows, panes,
+  clients, and buffers are read from `\t`-separated `-F` format strings. A field
+  value containing a literal tab (rare, but possible in a pane title or path) can
+  shift the remaining fields and produce a malformed or skipped row. This is a
+  known limitation; titles/paths with embedded tabs are not supported.
+- **`paste-text` newline-holding depends on the receiving program.** Content is
+  wrapped in bracketed-paste markers (`ESC[200~`/`ESC[201~`), but holding embedded
+  newlines (instead of submitting line by line) only works when the program at the
+  pane understands those markers — zsh, bash ≥ 5.1, and most modern REPLs/editors.
+  Programs without bracketed-paste support — notably **bash 3.2, the default
+  `/bin/bash` on macOS** — ignore the markers, so each embedded newline acts as
+  Enter and a multi-line paste executes one line at a time. Use zsh (the macOS
+  login-shell default since Catalina) or a newer bash for the target pane when
+  multi-line input must stay un-submitted.
 
 ## License
 

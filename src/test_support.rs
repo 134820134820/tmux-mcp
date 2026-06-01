@@ -122,6 +122,11 @@ case "$cmd" in
       printf '%s\n' "send-keys $*" >> "$TMUX_STUB_SEND_KEYS_LOG"
     fi
     ;;
+  paste-buffer)
+    if [ -n "${TMUX_STUB_PASTE_BUFFER_LOG:-}" ]; then
+      printf '%s\n' "paste-buffer $*" >> "$TMUX_STUB_PASTE_BUFFER_LOG"
+    fi
+    ;;
   kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|delete-buffer|set-buffer|load-buffer)
     ;;
   *)

@@ -179,10 +179,10 @@ impl SecurityPolicy {
 
         let allowed = match tool_name {
             "execute-command" | "get-command-result" => self.config.allow_execute_command,
-            "send-keys" | "send-hex" | "send-cancel" | "send-eof" | "send-escape"
-            | "send-enter" | "send-tab" | "send-backspace" | "send-up" | "send-down"
-            | "send-left" | "send-right" | "send-page-up" | "send-page-down" | "send-home"
-            | "send-end" => self.config.allow_send_keys,
+            "send-keys" | "send-hex" | "paste-text" | "send-cancel" | "send-eof"
+            | "send-escape" | "send-enter" | "send-tab" | "send-backspace" | "send-up"
+            | "send-down" | "send-left" | "send-right" | "send-page-up" | "send-page-down"
+            | "send-home" | "send-end" => self.config.allow_send_keys,
             "kill-session" | "kill-window" | "kill-pane" | "detach-client" => {
                 self.config.allow_kill
             }
