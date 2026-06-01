@@ -345,7 +345,7 @@ async fn test_workflow_synchronized_panes_broadcast() {
         .await
         .expect("enable synchronize-panes");
 
-    let token = format!("sync-{}", session_name);
+    let token = format!("sync-{session_name}");
     tmux::send_keys(first_pane, &format!("echo {token}"), false, socket_opt)
         .await
         .expect("send sync command");
@@ -474,7 +474,7 @@ async fn test_workflow_metadata_and_zoom() {
         .expect("list windows");
     let window_id = &windows[0].id;
 
-    let new_session_name = format!("renamed-{}", session_name);
+    let new_session_name = format!("renamed-{session_name}");
     tmux::rename_session(&session.id, &new_session_name, socket_opt)
         .await
         .expect("rename session");
@@ -565,8 +565,8 @@ async fn test_workflow_buffer_roundtrip() {
         .await
         .expect("create session");
 
-    let buffer_name = format!("buffer-{}", session_name);
-    let buffer_value = format!("buffer-value-{}", session_name);
+    let buffer_name = format!("buffer-{session_name}");
+    let buffer_value = format!("buffer-value-{session_name}");
 
     tmux::execute_tmux_with_socket(
         &["set-buffer", "-b", &buffer_name, &buffer_value],
@@ -661,18 +661,14 @@ async fn test_workflow_agent_orchestration() {
         .await
         .expect("rename watcher pane");
 
-    let server_token = format!("srv-ready-{}", session_name);
-    let tests_token = format!("tests-done-{}", session_name);
-    let logs_token = format!("log-2-{}", session_name);
+    let server_token = format!("srv-ready-{session_name}");
+    let tests_token = format!("tests-done-{session_name}");
+    let logs_token = format!("log-2-{session_name}");
 
-    let server_cmd = format!(
-        "sh -c 'printf \"srv-start\\n\"; sleep 0.2; printf \"{}\\n\"'",
-        server_token
-    );
-    let tests_cmd = format!(
-        "sh -c 'printf \"test-start\\n\"; sleep 0.1; printf \"{}\\n\"'",
-        tests_token
-    );
+    let server_cmd =
+        format!("sh -c 'printf \"srv-start\\n\"; sleep 0.2; printf \"{server_token}\\n\"'");
+    let tests_cmd =
+        format!("sh -c 'printf \"test-start\\n\"; sleep 0.1; printf \"{tests_token}\\n\"'");
 
     let server_cmd_id = tracker
         .execute_command(
@@ -697,10 +693,7 @@ async fn test_workflow_agent_orchestration() {
         .await
         .expect("execute tests command");
 
-    let logs_cmd = format!(
-        "sh -c 'printf \"log-1\\n\"; sleep 0.1; printf \"{}\\n\"'",
-        logs_token
-    );
+    let logs_cmd = format!("sh -c 'printf \"log-1\\n\"; sleep 0.1; printf \"{logs_token}\\n\"'");
     tmux::send_keys(&logs_pane, &logs_cmd, false, socket_opt)
         .await
         .expect("send logs command");
@@ -795,7 +788,7 @@ async fn test_workflow_interactive_interrupts() {
     let output = wait_for_pane_output(pane_id, "canceled", Duration::from_secs(2), socket).await;
     assert!(output.contains("canceled"));
 
-    let eof_token = format!("eof-{}", session_name);
+    let eof_token = format!("eof-{session_name}");
     tmux::send_keys(pane_id, "cat", false, socket_opt)
         .await
         .expect("send cat");
@@ -874,8 +867,7 @@ async fn test_send_keys_and_capture() {
         .expect("capture pane");
     assert!(
         content.contains("sent-via-keys"),
-        "Output should contain sent text: {}",
-        content
+        "Output should contain sent text: {content}"
     );
 
     // Cleanup
@@ -974,7 +966,7 @@ async fn test_workflow_stateful_shell_context() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    let token = format!("wf-state-{}", session_name);
+    let token = format!("wf-state-{session_name}");
 
     tmux::send_keys(
         pane_id,
@@ -1029,7 +1021,7 @@ async fn test_workflow_interactive_prompt() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    let token = format!("prompt-{}", session_name);
+    let token = format!("prompt-{session_name}");
     let command = "sh -c 'printf \"input? \"; read ANSWER; echo \"prompt:$ANSWER\"'";
 
     tmux::send_keys(pane_id, command, false, socket_opt)
@@ -1090,10 +1082,7 @@ async fn test_workflow_continuous_output_capture() {
 
     let tick_one = format!("tick-1-{session_name}");
     let tick_two = format!("tick-2-{session_name}");
-    let command = format!(
-        "sh -c 'printf \"{}\\n\"; sleep 0.2; printf \"{}\\n\"'",
-        tick_one, tick_two
-    );
+    let command = format!("sh -c 'printf \"{tick_one}\\n\"; sleep 0.2; printf \"{tick_two}\\n\"'");
 
     tmux::send_keys(pane_id, &command, false, socket_opt)
         .await
@@ -1138,7 +1127,7 @@ async fn test_workflow_audit_context_bundle() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    let token = format!("audit-{}", session_name);
+    let token = format!("audit-{session_name}");
     let tracker = CommandTracker::new(ShellType::Bash);
     let cmd_id = tracker
         .execute_command(

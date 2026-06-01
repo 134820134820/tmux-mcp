@@ -152,10 +152,7 @@ impl CommandTracker {
         } else {
             let end_marker = get_end_marker(&self.shell_type, &command_id);
             let start_marker = get_start_marker(&command_id);
-            let wrapped = format!(
-                "echo \"{}\"; {}; echo \"{}\"",
-                start_marker, command, end_marker
-            );
+            let wrapped = format!("echo \"{start_marker}\"; {command}; echo \"{end_marker}\"");
             (wrapped, false)
         };
 
@@ -520,7 +517,7 @@ mod tests {
         match (result, expected_exit) {
             (Some((_, code)), Some(expected)) => assert_eq!(code, expected),
             (None, None) => {}
-            (result, expected) => panic!("Expected {:?}, got {:?}", expected, result),
+            (result, expected) => panic!("Expected {expected:?}, got {result:?}"),
         }
     }
 
@@ -626,7 +623,7 @@ mod tests {
         let id = "error-cmd".to_string();
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
-            format!("TMUX_MCP_START_{id}\nbad\nTMUX_MCP_DONE_{id}_1\n", id = id),
+            format!("TMUX_MCP_START_{id}\nbad\nTMUX_MCP_DONE_{id}_1\n"),
         );
         let tracker = CommandTracker::new(ShellType::Bash);
         let execution = CommandExecution {
@@ -668,10 +665,7 @@ mod tests {
         stub.set_var("TMUX_STUB_CAPTURE_BEFORE", "prompt\nno markers yet\n");
         stub.set_var(
             "TMUX_STUB_CAPTURE_AFTER_OUTPUT",
-            format!(
-                "TMUX_MCP_START_{id}\nretry ok\nTMUX_MCP_DONE_{id}_0\n",
-                id = id
-            ),
+            format!("TMUX_MCP_START_{id}\nretry ok\nTMUX_MCP_DONE_{id}_0\n"),
         );
 
         let tracking = TrackingConfig {
@@ -814,10 +808,7 @@ mod tests {
         let id = "done-only-cmd".to_string();
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
-            format!(
-                "...truncated output...\nlast line\nTMUX_MCP_DONE_{id}_0\n",
-                id = id
-            ),
+            format!("...truncated output...\nlast line\nTMUX_MCP_DONE_{id}_0\n"),
         );
 
         let tracker = CommandTracker::new(ShellType::Bash);
@@ -906,7 +897,7 @@ mod tests {
         let id = "running-cmd".to_string();
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
-            format!("prompt\nTMUX_MCP_START_{id}\nstill working...\n", id = id),
+            format!("prompt\nTMUX_MCP_START_{id}\nstill working...\n"),
         );
 
         let tracking = TrackingConfig {

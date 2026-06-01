@@ -496,7 +496,7 @@ pub async fn capture_pane(
     } else {
         let lines_val = lines.unwrap_or(200);
         args.push("-S".into());
-        args.push(format!("-{}", lines_val));
+        args.push(format!("-{lines_val}"));
         args.push("-E".into());
         args.push("-".into());
     }
@@ -1321,10 +1321,7 @@ fn subsearch_text_view(
         }
         if resume_offset < start || resume_offset > end {
             return Err(Error::InvalidArgument {
-                message: format!(
-                    "resumeFromOffset {} is outside the anchor window",
-                    resume_offset
-                ),
+                message: format!("resumeFromOffset {resume_offset} is outside the anchor window"),
             });
         }
         scan_start = clamp_char_boundary(
@@ -1483,8 +1480,7 @@ async fn load_buffer_window(
         if window_start as usize > full_len {
             return Err(Error::InvalidArgument {
                 message: format!(
-                    "resumeFromOffset {} exceeds buffer '{}' length {}",
-                    window_start, buffer, full_len
+                    "resumeFromOffset {window_start} exceeds buffer '{buffer}' length {full_len}"
                 ),
             });
         }
@@ -1503,8 +1499,7 @@ async fn load_buffer_window(
         if window_start as usize > full_len {
             return Err(Error::InvalidArgument {
                 message: format!(
-                    "resumeFromOffset {} exceeds buffer '{}' length {}",
-                    window_start, buffer, full_len
+                    "resumeFromOffset {window_start} exceeds buffer '{buffer}' length {full_len}"
                 ),
             });
         }
@@ -1616,10 +1611,7 @@ pub async fn subsearch_buffer(
     let buffer_len = size_hint.unwrap_or(0) as usize;
     if anchor_offset as usize > buffer_len && size_hint.is_some() {
         return Err(Error::InvalidArgument {
-            message: format!(
-                "anchor offset {} exceeds buffer length {}",
-                anchor_offset, buffer_len
-            ),
+            message: format!("anchor offset {anchor_offset} exceeds buffer length {buffer_len}"),
         });
     }
 
@@ -2121,7 +2113,7 @@ pub async fn move_window(
     socket: Option<&str>,
 ) -> Result<()> {
     let target = match target_index {
-        Some(idx) => format!("{}:{}", target_session_id, idx),
+        Some(idx) => format!("{target_session_id}:{idx}"),
         None => target_session_id.to_string(),
     };
 
