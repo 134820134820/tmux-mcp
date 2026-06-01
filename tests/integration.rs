@@ -39,21 +39,14 @@ impl TmuxFixture {
         let socket_path = socket_dir.path().join("tmux.sock");
         let socket_path = socket_path.to_string_lossy().to_string();
 
-        // Boot the tmux server with a deterministic, non-interactive shell.
-        //
-        // Tests construct `CommandTracker::new(ShellType::Bash)`, which assumes
-        // panes run bash. But `create_session` only does `new-session -d`, so
-        // panes inherit the developer's login shell. An interactive shell with an
-        // async prompt (e.g. zsh + powerlevel10k) can swallow the carriage return
-        // on long wrapped command lines, so the tracked command never executes and
-        // tracking times out. CI uses a plain bash login shell, so it never hit this.
-        //
-        // Force every pane on this isolated server to run `bash --norc --noprofile`
-        // via `default-command`, aligning the runtime with the declared shell type.
+        // Tests assume panes run bash (CommandTracker::new(ShellType::Bash)), but
+        // `new-session` inherits the developer's login shell, whose async prompt can
+        // swallow carriage returns on wrapped lines and stall tracking. Force a
+        // deterministic non-interactive bash (resolved via PATH for portability).
         let config = socket_dir.path().join("tmux.conf");
         std::fs::write(
             &config,
-            "set-option -g default-command \"/bin/bash --norc --noprofile\"\n",
+            "set-option -g default-command \"/usr/bin/env bash --norc --noprofile\"\n",
         )
         .expect("write tmux config");
 

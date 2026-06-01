@@ -1919,17 +1919,21 @@ pub fn parse_hex_tokens(hex: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
+/// Max hex byte tokens per `send-keys -H` call, to stay clear of argv/tmux limits.
+const MAX_HEX_TOKENS_PER_CALL: usize = 1000;
+
 /// Send raw bytes to a pane via tmux `send-keys -H` (hex mode).
 ///
 /// Each token is one byte (00-ff). Use this for escape sequences that key names
 /// cannot express, e.g. CSI-u (`1b 5b 31 33 3b 32 75` = Shift+Enter).
 pub async fn send_keys_hex(pane_id: &str, hex: &str, socket: Option<&str>) -> Result<()> {
     let tokens = parse_hex_tokens(hex)?;
-    let mut args: Vec<&str> = vec!["send-keys", "-t", pane_id, "-H"];
-    for token in &tokens {
-        args.push(token);
+    for chunk in tokens.chunks(MAX_HEX_TOKENS_PER_CALL) {
+        let mut args: Vec<&str> = Vec::with_capacity(4 + chunk.len());
+        args.extend(["send-keys", "-t", pane_id, "-H"]);
+        args.extend(chunk.iter().map(String::as_str));
+        execute_tmux_with_socket(&args, socket).await?;
     }
-    execute_tmux_with_socket(&args, socket).await?;
     Ok(())
 }
 
