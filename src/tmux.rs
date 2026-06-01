@@ -91,9 +91,7 @@ fn get_socket_args(socket: Option<&str>) -> Vec<String> {
     }
 }
 
-/// Parse a `TMUX_MCP_SSH` value into argv tokens (e.g. `-i key user@host` ->
-/// `["-i", "key", "user@host"]`). Empty/whitespace-only yields None; unbalanced
-/// quotes are a hard error so a misconfigured connection string fails loudly.
+/// Parse a `TMUX_MCP_SSH` value into SSH argv tokens.
 pub fn parse_ssh_args(value: &str) -> Result<Option<Vec<String>>> {
     if value.trim().is_empty() {
         return Ok(None);
@@ -109,7 +107,6 @@ pub fn parse_ssh_args(value: &str) -> Result<Option<Vec<String>>> {
 }
 
 /// Get SSH arguments for tmux commands.
-/// If TMUX_MCP_SSH is set, returns parsed args (e.g. ["-i", "key", "user@host"]).
 fn get_ssh_args() -> Result<Option<Vec<String>>> {
     match std::env::var("TMUX_MCP_SSH") {
         Ok(value) => parse_ssh_args(&value),
@@ -121,6 +118,57 @@ fn ssh_enabled() -> Result<bool> {
     Ok(get_ssh_args()?.is_some())
 }
 
+fn quote_remote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+
+    if arg.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '%' | '=' | '+')
+    }) {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn build_remote_tmux_command(socket_args: &[String], args: &[&str]) -> String {
+    std::iter::once("tmux")
+        .chain(socket_args.iter().map(String::as_str))
+        .chain(args.iter().copied())
+        .map(quote_remote_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn build_tmux_command(args: &[&str], socket: Option<&str>) -> Result<Command> {
+    let socket_args = get_socket_args(socket);
+
+    if let Some(mut ssh_args) = get_ssh_args()? {
+        ssh_args.push(build_remote_tmux_command(&socket_args, args));
+        let mut cmd = Command::new("ssh");
+        cmd.args(&ssh_args);
+        Ok(cmd)
+    } else {
+        let mut tmux_args = socket_args;
+        tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
+        let mut cmd = Command::new("tmux");
+        cmd.args(&tmux_args);
+        Ok(cmd)
+    }
+}
+
 async fn run_tmux_with_socket(
     args: &[&str],
     socket: Option<&str>,
@@ -130,23 +178,7 @@ async fn run_tmux_with_socket(
         message: format!("tmux semaphore closed: {e}"),
     })?;
 
-    let socket_args = get_socket_args(socket);
-    let ssh_args = get_ssh_args()?;
-
-    let mut command = if let Some(mut ssh_args) = ssh_args {
-        ssh_args.push("tmux".to_string());
-        ssh_args.extend(socket_args);
-        ssh_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("ssh");
-        cmd.args(&ssh_args);
-        cmd
-    } else {
-        let mut tmux_args = socket_args;
-        tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("tmux");
-        cmd.args(&tmux_args);
-        cmd
-    };
+    let mut command = build_tmux_command(args, socket)?;
 
     let output = if let Some(input) = stdin {
         let mut child = command
@@ -217,22 +249,7 @@ async fn execute_tmux_with_socket_to_file(
         message: format!("tmux semaphore closed: {e}"),
     })?;
 
-    let socket_args = get_socket_args(socket);
-    let ssh_args = get_ssh_args()?;
-    let mut command = if let Some(mut ssh_args) = ssh_args {
-        ssh_args.push("tmux".to_string());
-        ssh_args.extend(socket_args);
-        ssh_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("ssh");
-        cmd.args(&ssh_args);
-        cmd
-    } else {
-        let mut tmux_args = socket_args;
-        tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("tmux");
-        cmd.args(&tmux_args);
-        cmd
-    };
+    let mut command = build_tmux_command(args, socket)?;
 
     let mut child = command
         .stdout(Stdio::piped())
@@ -1886,7 +1903,8 @@ pub async fn send_keys(
             return Ok(());
         }
         for chunk in chunk_literal_payload(keys) {
-            execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", &chunk], socket).await?;
+            execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", "--", &chunk], socket)
+                .await?;
         }
     } else {
         execute_tmux_with_socket(&["send-keys", "-t", pane_id, "--", keys], socket).await?;
@@ -1922,10 +1940,7 @@ pub fn parse_hex_tokens(hex: &str) -> Result<Vec<String>> {
 /// Max hex byte tokens per `send-keys -H` call, to stay clear of argv/tmux limits.
 const MAX_HEX_TOKENS_PER_CALL: usize = 1000;
 
-/// Send raw bytes to a pane via tmux `send-keys -H` (hex mode).
-///
-/// Each token is one byte (00-ff). Use this for escape sequences that key names
-/// cannot express, e.g. CSI-u (`1b 5b 31 33 3b 32 75` = Shift+Enter).
+/// Send raw bytes to a pane via tmux `send-keys -H`.
 pub async fn send_keys_hex(pane_id: &str, hex: &str, socket: Option<&str>) -> Result<()> {
     let tokens = parse_hex_tokens(hex)?;
     for chunk in tokens.chunks(MAX_HEX_TOKENS_PER_CALL) {
@@ -1956,18 +1971,11 @@ fn chunk_literal_payload(keys: &str) -> Vec<String> {
     chunks
 }
 
-/// Paste UTF-8 content into a pane via tmux's bracketed paste.
-///
-/// Content is staged in a throwaway buffer and pasted with `paste-buffer -p -d`.
-/// `-p` brackets the paste (the receiving program sees one paste event instead of
-/// keystrokes) only when that program has enabled bracketed paste, so embedded
-/// newlines do not submit lines. If the program lacks bracketed-paste support,
-/// tmux falls back to a plain paste and newlines behave as Enter. `-d` deletes
-/// the staging buffer afterward.
+/// Paste UTF-8 content into a pane with a temporary tmux buffer.
 pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> Result<()> {
     let buffer_name = format!("__tmux_mcp_paste_{}", Uuid::new_v4());
     set_buffer(&buffer_name, content, socket).await?;
-    execute_tmux_with_socket(
+    let result = execute_tmux_with_socket(
         &[
             "paste-buffer",
             "-p",
@@ -1979,8 +1987,15 @@ pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> R
         ],
         socket,
     )
-    .await?;
-    Ok(())
+    .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let _ = delete_buffer(&buffer_name, socket).await;
+            Err(e)
+        }
+    }
 }
 
 /// Get the current session (the one the client is attached to).
@@ -2256,6 +2271,19 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument { .. }));
     }
 
+    #[test]
+    fn remote_tmux_command_shell_quotes_args() {
+        let socket_args = vec!["-S".to_string(), "/tmp/tmux sock; echo bad".to_string()];
+        let command = build_remote_tmux_command(
+            &socket_args,
+            &["rename-window", "-t", "@1", "--", "Bob's window"],
+        );
+        assert_eq!(
+            command,
+            "tmux -S '/tmp/tmux sock; echo bad' rename-window -t @1 -- 'Bob'\"'\"'s window'"
+        );
+    }
+
     #[rstest]
     #[case(
         "@0\tzsh\t1\n@1\tvim\t0",
@@ -2330,7 +2358,28 @@ mod tests {
         let log = fs::read_to_string(&log_path).expect("read log");
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("-l hello"));
+        assert!(lines[0].contains("-l -- hello"));
+    }
+
+    #[tokio::test]
+    async fn send_keys_literal_uses_separator_for_leading_dash_payload() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        send_keys("%1", "-----BEGIN", true, None)
+            .await
+            .expect("send keys");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("-l -- -----BEGIN"),
+            "literal leading-dash payload should follow --, got: {log}"
+        );
     }
 
     #[tokio::test]
@@ -2386,6 +2435,31 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("-H"));
         assert!(lines[0].contains("1b 5b 31 33 3b 32 75"));
+    }
+
+    #[tokio::test]
+    async fn paste_text_deletes_staging_buffer_on_paste_failure() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("delete-buffer.log");
+        stub.set_var("TMUX_STUB_ERROR_CMD", "paste-buffer");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "paste failed");
+        stub.set_var(
+            "TMUX_STUB_DELETE_BUFFER_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        let err = paste_text("%1", "secret", None).await.unwrap_err();
+        match err {
+            Error::Tmux { message } => assert!(message.contains("paste failed")),
+            _ => panic!("expected tmux error"),
+        }
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("__tmux_mcp_paste_"),
+            "expected cleanup of staging buffer, got: {log}"
+        );
     }
 
     #[test]
@@ -2509,6 +2583,19 @@ mod tests {
 
         let output = execute_tmux(&["ssh-test"]).await.expect("ssh test");
         assert_eq!(output, "via-ssh");
+    }
+
+    #[tokio::test]
+    async fn execute_tmux_over_ssh_preserves_shell_sensitive_args() {
+        let mut stub = TmuxStub::new();
+        let socket = "/tmp/tmux sock 'quoted'; echo bad";
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+
+        let output = execute_tmux_with_socket(&["socket-test"], Some(socket))
+            .await
+            .expect("socket test over ssh");
+
+        assert_eq!(output, socket);
     }
 
     #[tokio::test]

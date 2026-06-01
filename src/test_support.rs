@@ -127,7 +127,12 @@ case "$cmd" in
       printf '%s\n' "paste-buffer $*" >> "$TMUX_STUB_PASTE_BUFFER_LOG"
     fi
     ;;
-  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|delete-buffer|set-buffer|load-buffer)
+  delete-buffer)
+    if [ -n "${TMUX_STUB_DELETE_BUFFER_LOG:-}" ]; then
+      printf '%s\n' "delete-buffer $*" >> "$TMUX_STUB_DELETE_BUFFER_LOG"
+    fi
+    ;;
+  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|set-buffer|load-buffer)
     ;;
   *)
     echo "unknown command: $cmd" 1>&2
@@ -141,10 +146,15 @@ if [ "$#" -lt 2 ]; then
   echo "missing ssh args" 1>&2
   exit 1
 fi
-dest="$1"
-shift
+remote_command=""
+for arg in "$@"; do
+  remote_command="$arg"
+done
 export TMUX_STUB_SSH_SEEN=1
-exec "$@"
+if [ -n "${TMUX_STUB_SSH_LOG:-}" ]; then
+  printf '%s\n' "$remote_command" >> "$TMUX_STUB_SSH_LOG"
+fi
+exec sh -c "$remote_command"
 "#;
 
 pub struct TmuxStub {
