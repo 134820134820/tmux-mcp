@@ -223,7 +223,8 @@ streaming_threshold_bytes = 262144
 - **subsearch-buffer** - Anchor-scoped follow-up search with structured metadata
 
 ### Key Sending
-- **send-keys** - Send arbitrary keys to a pane (interactive only)
+- **send-keys** - Send keys to a pane (interactive only). `literal=true` types exact characters; `literal=false` interprets key names/chords (Enter, C-c, Up). `enter=true` presses Enter after the keys (per repeat) to type and submit in one call
+- **paste-text** - Paste multi-line UTF-8 text via bracketed paste (`paste-buffer -p`); embedded newlines stay literal (no per-line submit) when the receiving program supports bracketed paste
 - **send-hex** - Send raw bytes as whitespace-separated hex tokens (e.g. CSI-u `1b 5b 31 33 3b 32 75` = Shift+Enter) for escape sequences key names cannot express
 - **send-cancel** - Send Ctrl+C
 - **send-eof** - Send Ctrl+D (EOF)
@@ -386,7 +387,11 @@ By default, the security policy is permissive to avoid breaking agent workflows:
 `security.command_filter.patterns` that matches a command string will block that
 command. This applies to `execute-command` and non-literal `send-keys` only.
 For `send-hex`, the hex bytes are decoded to a UTF-8 string and screened by the
-same denylist before being sent.
+same denylist before being sent. Literal `send-keys` and `paste-text` are raw
+input gated by `allow_send_keys` only, not the command filter — their content is
+not screened, and newlines (a literal `\n`, or a bracketed paste into a program
+without bracketed-paste support) can still reach the shell and execute. Scope
+them with `allowed_panes`/`allowed_sessions`, or disable `allow_send_keys`.
 
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
