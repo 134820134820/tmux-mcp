@@ -130,7 +130,13 @@ async fn main() {
                 )
             }
             None => (
-                SecurityPolicy::default(),
+                match SecurityPolicy::default_with_env() {
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        eprintln!("Error loading security policy: {e}");
+                        std::process::exit(1);
+                    }
+                },
                 None,
                 None,
                 TrackingConfig::default(),

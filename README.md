@@ -149,7 +149,7 @@ Add the Quick Start snippet to your MCP client config. Example below includes al
 | `--ssh <CONNECTION>` | Run tmux over SSH (options + destination, destination last) | None |
 | `--config <PATH>` | Path to TOML configuration file | None |
 
-Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). `TMUX_MCP_SSH` can set the SSH connection string and is parsed with the same startup validation as `--ssh`.
+Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). `TMUX_MCP_SSH` can set the SSH connection string and is parsed with the same startup validation as `--ssh`. `TMUX_MCP_TOOLS` can override the configured tool surface for one process.
 
 ### Sample Configuration (config.toml)
 
@@ -170,6 +170,10 @@ allowed_panes = ["%1"]
 [security.command_filter]
 mode = "off" # off | allowlist | denylist
 patterns = []
+
+[security.tools]
+mode = "deny" # deny | allow
+items = []    # tool names or groups such as "@raw-input"
 
 [tracking]
 capture_initial_lines = 1000
@@ -193,6 +197,55 @@ streaming_threshold_bytes = 262144
 
 ### Search configuration (optional)
 - `streaming_threshold_bytes`: when a buffer exceeds this size, search streams a window via a temp file instead of loading the full buffer in memory.
+
+### Tool surface configuration (optional)
+
+Use `[security.tools]` to remove tools from `list-tools` and deny direct calls.
+Entries can be exact tool names or groups prefixed with `@`.
+
+```toml
+# Disable raw PTY input while keeping execute-command available.
+[security.tools]
+mode = "deny"
+items = ["@raw-input"]
+```
+
+```toml
+# Expose only read-only context tools plus tracked command execution.
+[security.tools]
+mode = "allow"
+items = ["@read", "execute-command"]
+```
+
+`TMUX_MCP_TOOLS` overrides `[security.tools]` for a single process. Without a
+prefix it is a denylist; use `allow:` for an explicit allowlist.
+
+```bash
+TMUX_MCP_TOOLS=send-keys,paste-text tmux-mcp-rs
+TMUX_MCP_TOOLS=deny:@raw-input tmux-mcp-rs
+TMUX_MCP_TOOLS=allow:@read,execute-command tmux-mcp-rs
+```
+
+Known groups:
+
+| Group | Tools |
+|-------|-------|
+| `@all` | Every known tool compiled into the binary |
+| `@read` | Read-only/introspection tools, including list/find, capture, buffer reads, and command result reads |
+| `@list` | `list-*`, `find-session`, and `get-current-session` |
+| `@execute` | `execute-command`, `get-command-result` |
+| `@raw-input` | All raw PTY input tools from `@interactive` and `@special-keys` |
+| `@interactive` | `send-keys`, `send-hex`, `paste-text` |
+| `@special-keys` | `send-enter`, arrows, page/home/end, tab, escape, backspace, cancel, EOF |
+| `@capture` | `capture-pane` |
+| `@buffer-read` | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer` |
+| `@buffer-write` | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer` |
+| `@create` | `create-session`, `create-window` |
+| `@split` | `split-pane` |
+| `@rename` | `rename-session`, `rename-window`, `rename-pane` |
+| `@move` | focus, resize, zoom, layout, join, break, swap, move, synchronize-panes |
+| `@kill` | `kill-session`, `kill-window`, `kill-pane`, `detach-client` |
+| `@socket` | `socket-for-path` |
 
 ## Tools
 
@@ -412,6 +465,7 @@ Integration tests create an isolated tmux server using a temp socket, so they wo
 By default, the security policy is permissive to avoid breaking agent workflows:
 
 - `security.enabled = true`, but all `allow_*` flags are `true`
+- `security.tools.mode = "deny"` with no items (no tool filtering)
 - `command_filter.mode = "off"` (no allow/deny patterns)
 - `allowed_sockets/sessions/panes` are unset (no scoping)
 
@@ -431,10 +485,12 @@ disable `allow_send_keys`.
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
 
-To harden a deployment, flip specific `allow_*` flags, add deny/allow patterns,
-or restrict sockets/sessions/panes explicitly. For the strongest guarantee that
-shell input cannot bypass the `command_filter`, compile without the raw
-input tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
+To harden a deployment, configure `[security.tools]`, add command deny/allow
+patterns, or restrict sockets/sessions/panes explicitly. The older `allow_*`
+flags still work as coarse group gates, but `[security.tools]` is the preferred
+surface because it removes disabled tools from `list-tools`. For the strongest
+guarantee that shell input cannot bypass the `command_filter`, compile without
+the raw input tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
 
 ## Notes and limitations
 
