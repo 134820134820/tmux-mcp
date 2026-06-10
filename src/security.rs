@@ -283,10 +283,7 @@ fn is_known_tool(name: &str) -> bool {
 }
 
 fn is_known_group(name: &str) -> bool {
-    name == "all"
-        || TOOL_MANIFEST
-            .iter()
-            .any(|tool| tool.groups.iter().any(|group| *group == name))
+    name == "all" || TOOL_MANIFEST.iter().any(|tool| tool.groups.contains(&name))
 }
 
 fn expand_tool_filter_item(item: &str, tools: &mut BTreeSet<String>) -> Result<()> {
@@ -302,7 +299,7 @@ fn expand_tool_filter_item(item: &str, tools: &mut BTreeSet<String>) -> Result<(
             });
         }
         for tool in TOOL_MANIFEST {
-            if group == "all" || tool.groups.iter().any(|candidate| *candidate == group) {
+            if group == "all" || tool.groups.contains(&group) {
                 tools.insert(tool.name.to_string());
             }
         }
