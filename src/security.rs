@@ -1,9 +1,377 @@
 use regex::Regex;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::commands::TrackingConfig;
 use crate::errors::{Error, Result};
+
+const TOOLS_ENV_VAR: &str = "TMUX_MCP_TOOLS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolFilterMode {
+    /// Disable the listed tools/groups; every other compiled tool remains available.
+    #[default]
+    Deny,
+    /// Enable only the listed tools/groups.
+    Allow,
+}
+
+/// Runtime tool-surface filtering configuration.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ToolFilter {
+    #[serde(default)]
+    pub mode: ToolFilterMode,
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledToolFilter {
+    mode: ToolFilterMode,
+    tools: BTreeSet<String>,
+}
+
+impl Default for CompiledToolFilter {
+    fn default() -> Self {
+        Self {
+            mode: ToolFilterMode::Deny,
+            tools: BTreeSet::new(),
+        }
+    }
+}
+
+struct ToolManifestEntry {
+    name: &'static str,
+    groups: &'static [&'static str],
+}
+
+const TOOL_MANIFEST: &[ToolManifestEntry] = &[
+    ToolManifestEntry {
+        name: "socket-for-path",
+        groups: &["socket", "read"],
+    },
+    ToolManifestEntry {
+        name: "list-sessions",
+        groups: &["list", "read"],
+    },
+    ToolManifestEntry {
+        name: "find-session",
+        groups: &["list", "read"],
+    },
+    ToolManifestEntry {
+        name: "list-windows",
+        groups: &["list", "read"],
+    },
+    ToolManifestEntry {
+        name: "list-panes",
+        groups: &["list", "read"],
+    },
+    ToolManifestEntry {
+        name: "list-clients",
+        groups: &["list", "read"],
+    },
+    ToolManifestEntry {
+        name: "list-buffers",
+        groups: &["list", "buffer-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "capture-pane",
+        groups: &["capture", "read"],
+    },
+    ToolManifestEntry {
+        name: "show-buffer",
+        groups: &["buffer-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "search-buffer",
+        groups: &["buffer-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "subsearch-buffer",
+        groups: &["buffer-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "save-buffer",
+        groups: &["buffer-write"],
+    },
+    ToolManifestEntry {
+        name: "load-buffer",
+        groups: &["buffer-write"],
+    },
+    ToolManifestEntry {
+        name: "delete-buffer",
+        groups: &["buffer-write"],
+    },
+    ToolManifestEntry {
+        name: "set-buffer",
+        groups: &["buffer-write"],
+    },
+    ToolManifestEntry {
+        name: "append-buffer",
+        groups: &["buffer-write"],
+    },
+    ToolManifestEntry {
+        name: "rename-buffer",
+        groups: &["buffer-write"],
+    },
+    ToolManifestEntry {
+        name: "create-session",
+        groups: &["create"],
+    },
+    ToolManifestEntry {
+        name: "create-window",
+        groups: &["create"],
+    },
+    ToolManifestEntry {
+        name: "split-pane",
+        groups: &["split"],
+    },
+    ToolManifestEntry {
+        name: "kill-session",
+        groups: &["kill"],
+    },
+    ToolManifestEntry {
+        name: "kill-window",
+        groups: &["kill"],
+    },
+    ToolManifestEntry {
+        name: "kill-pane",
+        groups: &["kill"],
+    },
+    ToolManifestEntry {
+        name: "detach-client",
+        groups: &["kill"],
+    },
+    ToolManifestEntry {
+        name: "execute-command",
+        groups: &["execute"],
+    },
+    ToolManifestEntry {
+        name: "get-command-result",
+        groups: &["execute", "read"],
+    },
+    ToolManifestEntry {
+        name: "get-current-session",
+        groups: &["list", "read"],
+    },
+    ToolManifestEntry {
+        name: "rename-session",
+        groups: &["rename"],
+    },
+    ToolManifestEntry {
+        name: "rename-window",
+        groups: &["rename"],
+    },
+    ToolManifestEntry {
+        name: "rename-pane",
+        groups: &["rename"],
+    },
+    ToolManifestEntry {
+        name: "move-window",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "select-window",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "select-pane",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "resize-pane",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "zoom-pane",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "select-layout",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "join-pane",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "break-pane",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "swap-pane",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "set-synchronize-panes",
+        groups: &["move"],
+    },
+    ToolManifestEntry {
+        name: "send-keys",
+        groups: &["interactive", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-hex",
+        groups: &["interactive", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "paste-text",
+        groups: &["interactive", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-cancel",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-eof",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-escape",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-enter",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-tab",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-backspace",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-up",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-down",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-left",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-right",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-page-up",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-page-down",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-home",
+        groups: &["special-keys", "raw-input"],
+    },
+    ToolManifestEntry {
+        name: "send-end",
+        groups: &["special-keys", "raw-input"],
+    },
+];
+
+fn is_known_tool(name: &str) -> bool {
+    TOOL_MANIFEST.iter().any(|tool| tool.name == name)
+}
+
+fn is_known_group(name: &str) -> bool {
+    name == "all"
+        || TOOL_MANIFEST
+            .iter()
+            .any(|tool| tool.groups.iter().any(|group| *group == name))
+}
+
+fn expand_tool_filter_item(item: &str, tools: &mut BTreeSet<String>) -> Result<()> {
+    let normalized = item.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(group) = normalized.strip_prefix('@') {
+        if !is_known_group(group) {
+            return Err(Error::Config {
+                message: format!("unknown tool group '@{group}' in tool filter"),
+            });
+        }
+        for tool in TOOL_MANIFEST {
+            if group == "all" || tool.groups.iter().any(|candidate| *candidate == group) {
+                tools.insert(tool.name.to_string());
+            }
+        }
+        return Ok(());
+    }
+
+    if !is_known_tool(&normalized) {
+        return Err(Error::Config {
+            message: format!("unknown tool '{normalized}' in tool filter"),
+        });
+    }
+    tools.insert(normalized);
+    Ok(())
+}
+
+fn compile_tool_filter(filter: &ToolFilter) -> Result<CompiledToolFilter> {
+    let mut tools = BTreeSet::new();
+    for item in &filter.items {
+        expand_tool_filter_item(item, &mut tools)?;
+    }
+    Ok(CompiledToolFilter {
+        mode: filter.mode,
+        tools,
+    })
+}
+
+fn parse_tool_filter_items(items: &str) -> Vec<String> {
+    items
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn tool_filter_from_env() -> Result<Option<ToolFilter>> {
+    let value = match std::env::var(TOOLS_ENV_VAR) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(Error::Config {
+                message: format!("{TOOLS_ENV_VAR} must be valid UTF-8"),
+            });
+        }
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let (mode, items) = match trimmed.split_once(':') {
+        Some((mode, items)) if mode.eq_ignore_ascii_case("allow") => (ToolFilterMode::Allow, items),
+        Some((mode, items)) if mode.eq_ignore_ascii_case("deny") => (ToolFilterMode::Deny, items),
+        Some((mode, _)) => {
+            return Err(Error::Config {
+                message: format!(
+                    "invalid {TOOLS_ENV_VAR} mode '{mode}', expected 'allow:' or 'deny:'"
+                ),
+            });
+        }
+        None => (ToolFilterMode::Deny, trimmed),
+    };
+
+    Ok(Some(ToolFilter {
+        mode,
+        items: parse_tool_filter_items(items),
+    }))
+}
 
 /// Mode for applying regex-based command filters.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -93,6 +461,8 @@ pub struct SecurityConfig {
     pub allowed_panes: Option<Vec<String>>,
     #[serde(default)]
     pub command_filter: CommandFilter,
+    #[serde(default)]
+    pub tools: ToolFilter,
 }
 
 fn default_true() -> bool {
@@ -117,6 +487,7 @@ impl Default for SecurityConfig {
             allowed_sessions: None,
             allowed_panes: None,
             command_filter: CommandFilter::default(),
+            tools: ToolFilter::default(),
         }
     }
 }
@@ -137,13 +508,35 @@ pub struct ConfigFile {
 }
 
 /// Enforces security rules derived from configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     config: SecurityConfig,
     compiled_patterns: Vec<Regex>,
+    tool_filter: CompiledToolFilter,
+}
+
+impl Default for SecurityPolicy {
+    fn default() -> Self {
+        Self::from_config(SecurityConfig::default()).expect("default security policy")
+    }
 }
 
 impl SecurityPolicy {
+    pub fn from_config(config: SecurityConfig) -> Result<Self> {
+        Self::compile(config)
+    }
+
+    pub fn from_config_with_env(mut config: SecurityConfig) -> Result<Self> {
+        if let Some(filter) = tool_filter_from_env()? {
+            config.tools = filter;
+        }
+        Self::compile(config)
+    }
+
+    pub fn default_with_env() -> Result<Self> {
+        Self::from_config_with_env(SecurityConfig::default())
+    }
+
     /// Load and compile policy configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| Error::Config {
@@ -154,8 +547,11 @@ impl SecurityPolicy {
             message: format!("failed to parse config file: {e}"),
         })?;
 
-        let compiled_patterns = config_file
-            .security
+        Self::from_config_with_env(config_file.security)
+    }
+
+    fn compile(config: SecurityConfig) -> Result<Self> {
+        let compiled_patterns = config
             .command_filter
             .patterns
             .iter()
@@ -164,10 +560,12 @@ impl SecurityPolicy {
             .map_err(|e| Error::Config {
                 message: format!("invalid regex pattern: {e}"),
             })?;
+        let tool_filter = compile_tool_filter(&config.tools)?;
 
         Ok(Self {
-            config: config_file.security,
+            config,
             compiled_patterns,
+            tool_filter,
         })
     }
 
@@ -212,12 +610,25 @@ impl SecurityPolicy {
             _ => true,
         };
 
-        if allowed {
-            Ok(())
-        } else {
-            Err(Error::PolicyDenied {
+        if !allowed {
+            return Err(Error::PolicyDenied {
                 message: format!("tool '{tool_name}' is not allowed by security policy"),
-            })
+            });
+        }
+
+        if !self.check_tool_filter(tool_name) {
+            return Err(Error::PolicyDenied {
+                message: format!("tool '{tool_name}' is not allowed by configured tool filter"),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn check_tool_filter(&self, tool_name: &str) -> bool {
+        match self.tool_filter.mode {
+            ToolFilterMode::Deny => !self.tool_filter.tools.contains(tool_name),
+            ToolFilterMode::Allow => self.tool_filter.tools.contains(tool_name),
         }
     }
 
@@ -376,10 +787,7 @@ mod tests {
             allow_kill: false,
             ..Default::default()
         };
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: Vec::new(),
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_tool("kill-session").is_err());
         assert!(policy.check_tool("kill-window").is_err());
@@ -397,16 +805,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let compiled = config
-            .command_filter
-            .patterns
-            .iter()
-            .map(|p| Regex::new(p).unwrap())
-            .collect();
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: compiled,
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_command("git status").is_ok());
         assert!(policy.check_command("ls -la").is_ok());
@@ -423,16 +822,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let compiled = config
-            .command_filter
-            .patterns
-            .iter()
-            .map(|p| Regex::new(p).unwrap())
-            .collect();
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: compiled,
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_command("git status").is_ok());
         assert!(policy.check_command("rm -rf /").is_err());
@@ -449,16 +839,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let compiled = config
-            .command_filter
-            .patterns
-            .iter()
-            .map(|p| Regex::new(p).unwrap())
-            .collect();
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: compiled,
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_command("echo ok\nrm -rf /").is_err());
         assert!(policy.check_command("echo ok\r\nrm -rf /").is_err());
@@ -475,16 +856,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let compiled = config
-            .command_filter
-            .patterns
-            .iter()
-            .map(|p| Regex::new(p).unwrap())
-            .collect();
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: compiled,
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_command("echo ok\nprintf done").is_ok());
         assert!(policy.check_command("echo ok\nrm -rf /").is_err());
@@ -497,10 +869,7 @@ mod tests {
             allowed_sessions: Some(vec!["work".to_string(), "dev".to_string()]),
             ..Default::default()
         };
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: Vec::new(),
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_session("work").is_ok());
         assert!(policy.check_session("dev").is_ok());
@@ -514,10 +883,7 @@ mod tests {
             allowed_panes: Some(vec!["%1".to_string(), "%2".to_string()]),
             ..Default::default()
         };
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: Vec::new(),
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_pane("%1").is_ok());
         assert!(policy.check_pane("%2").is_ok());
@@ -531,10 +897,7 @@ mod tests {
             allowed_sockets: Some(vec!["/tmp/allowed.sock".to_string()]),
             ..Default::default()
         };
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: Vec::new(),
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_socket(Some("/tmp/allowed.sock")).is_ok());
         assert!(policy.check_socket(Some("/tmp/other.sock")).is_err());
@@ -553,16 +916,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let compiled = config
-            .command_filter
-            .patterns
-            .iter()
-            .map(|p| Regex::new(p).unwrap())
-            .collect();
-        let policy = SecurityPolicy {
-            config,
-            compiled_patterns: compiled,
-        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_tool("kill-session").is_ok());
         assert!(policy.check_command("anything").is_ok());
@@ -576,6 +930,105 @@ mod tests {
     fn test_check_tool_allows_unknown() {
         let policy = SecurityPolicy::default();
         assert!(policy.check_tool("unknown-tool").is_ok());
+    }
+
+    #[test]
+    fn test_tool_filter_denies_exact_tools() {
+        let config = SecurityConfig {
+            tools: ToolFilter {
+                mode: ToolFilterMode::Deny,
+                items: vec!["kill-session".to_string(), "paste-text".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_tool("kill-session").is_err());
+        assert!(policy.check_tool("paste-text").is_err());
+        assert!(policy.check_tool("execute-command").is_ok());
+    }
+
+    #[test]
+    fn test_tool_filter_allows_only_list_group() {
+        let config = SecurityConfig {
+            tools: ToolFilter {
+                mode: ToolFilterMode::Allow,
+                items: vec!["@list".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_tool("list-sessions").is_ok());
+        assert!(policy.check_tool("find-session").is_ok());
+        assert!(policy.check_tool("capture-pane").is_err());
+        assert!(policy.check_tool("execute-command").is_err());
+    }
+
+    #[test]
+    fn test_tool_filter_group_denies_raw_input() {
+        let config = SecurityConfig {
+            tools: ToolFilter {
+                mode: ToolFilterMode::Deny,
+                items: vec!["@raw-input".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_tool("send-keys").is_err());
+        assert!(policy.check_tool("send-enter").is_err());
+        assert!(policy.check_tool("execute-command").is_ok());
+    }
+
+    #[test]
+    fn test_tool_filter_rejects_unknown_items() {
+        let config = SecurityConfig {
+            tools: ToolFilter {
+                mode: ToolFilterMode::Deny,
+                items: vec!["missing-tool".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let err = SecurityPolicy::from_config(config).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config { message } if message.contains("unknown tool 'missing-tool'")
+        ));
+    }
+
+    #[test]
+    fn test_tool_filter_rejects_unknown_groups() {
+        let config = SecurityConfig {
+            tools: ToolFilter {
+                mode: ToolFilterMode::Deny,
+                items: vec!["@missing".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let err = SecurityPolicy::from_config(config).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Config { message } if message.contains("unknown tool group '@missing'")
+        ));
+    }
+
+    #[test]
+    fn test_disabled_security_ignores_tool_filter() {
+        let config = SecurityConfig {
+            enabled: false,
+            tools: ToolFilter {
+                mode: ToolFilterMode::Allow,
+                items: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_tool("execute-command").is_ok());
+        assert!(policy.check_tool("send-keys").is_ok());
     }
 
     #[test]

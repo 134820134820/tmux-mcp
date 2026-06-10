@@ -675,12 +675,26 @@ impl TmuxMcpServer {
         router.merge(Self::interactive_tool_router());
         #[cfg(feature = "special-keys")]
         router.merge(Self::special_keys_tool_router());
+        Self::apply_tool_policy(&mut router, &policy);
         Self {
             tracker: Arc::new(tracker),
             policy: Arc::new(policy),
             search,
             router,
             session_cache: Arc::new(tokio::sync::RwLock::new(SessionScopeCache::new())),
+        }
+    }
+
+    fn apply_tool_policy(router: &mut ToolRouter<Self>, policy: &SecurityPolicy) {
+        for tool_name in router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect::<Vec<_>>()
+        {
+            if policy.check_tool(&tool_name).is_err() {
+                router.remove_route(&tool_name);
+            }
         }
     }
 
@@ -3315,6 +3329,7 @@ mod tests {
     use rmcp::service::{self, RequestContext, RoleServer};
     use rmcp::ServerHandler;
     use serde_json::Value;
+    use std::collections::BTreeSet;
     use std::io::Write;
     use tempfile::NamedTempFile;
     use tokio::io::duplex;
@@ -3354,6 +3369,15 @@ mod tests {
             }
         }
         ""
+    }
+
+    fn tool_names(server: &TmuxMcpServer) -> BTreeSet<String> {
+        server
+            .router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
     }
 
     fn context_for_server(
@@ -3887,6 +3911,30 @@ mod tests {
             .await
             .expect("get current session");
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn tool_filter_prunes_denied_tools_from_router() {
+        let server = server_with_policy(
+            "[security.tools]\nmode = \"deny\"\nitems = [\"kill-session\", \"@special-keys\"]\n",
+        );
+        let names = tool_names(&server);
+
+        assert!(!names.contains("kill-session"));
+        #[cfg(feature = "special-keys")]
+        assert!(!names.contains("send-enter"));
+        assert!(names.contains("execute-command"));
+    }
+
+    #[tokio::test]
+    async fn tool_filter_allowlist_prunes_router_to_allowed_tools() {
+        let server =
+            server_with_policy("[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\"]\n");
+        let names = tool_names(&server);
+
+        assert!(names.contains("list-sessions"));
+        assert!(!names.contains("execute-command"));
+        assert_eq!(names.len(), 1);
     }
 
     #[tokio::test]

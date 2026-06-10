@@ -24,6 +24,7 @@ fn bin_path() -> PathBuf {
 fn command() -> Command {
     let mut command = Command::new(bin_path());
     command.env_remove("TMUX_MCP_SSH");
+    command.env_remove("TMUX_MCP_TOOLS");
     command
 }
 
@@ -109,6 +110,19 @@ fn cli_rejects_invalid_env_ssh_quoting() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Error parsing SSH connection string"));
     assert!(stderr.contains("invalid TMUX_MCP_SSH"));
+}
+
+#[test]
+fn cli_rejects_invalid_tools_env() {
+    let output = command()
+        .env("TMUX_MCP_TOOLS", "maybe:send-keys")
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Error loading security policy"));
+    assert!(stderr.contains("invalid TMUX_MCP_TOOLS mode"));
 }
 
 #[test]

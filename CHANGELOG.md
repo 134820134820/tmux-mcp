@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Added `[security.tools]` and `TMUX_MCP_TOOLS` allow/deny filters for hiding and denying exact tools or tool groups at runtime.
+
+### Changed
+- Runtime-denied tools are pruned from the advertised MCP tool list instead of only failing when called.
 
 ## [0.4.0] - 2026-06-01
 ### Added
