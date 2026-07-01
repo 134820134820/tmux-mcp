@@ -7,118 +7,148 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-A Model Context Protocol (MCP) server for tmux, written in Rust. It lets AI assistants create sessions, split panes, run commands, and capture output.
+`tmux-mcp-rs` is a Model Context Protocol (MCP) server for tmux. It lets MCP clients create sessions, shape windows and panes, run tracked commands, inspect output, manage tmux buffers, and drive interactive terminal programs through structured tools instead of brittle screen scraping.
 
-- The agent runs this MCP server to create and manage its own tmux session (often on an isolated socket).
-- The user/developer can attach to the same session to watch or participate in real time.
-- Bonus: it also works with human-created sessions, including remote setups over SSH.
-
-Requires **tmux 3.x** installed and available on `PATH`. The server checks the
-version on startup and refuses to run against tmux 2.x, whose output formats and
-split flags differ. CI runs integration tests against the tmux version provided
-by `ubuntu-latest`; development is on 3.6.
+Use it when an agent needs a real TTY, long-running commands, parallel panes, resumable terminal state, or a tmux session that a human can attach to during the same task.
 
 > [!WARNING]
-> Using this MCP allows the agent to escape the sandbox and its security limitations. Here be dragons!
+> This server can let an MCP client run shell commands, type into panes, read terminal output, modify tmux sessions, and read or write tmux buffers. The default runtime policy is permissive. Use isolated tmux sockets and a `config.toml` policy before exposing it to a client you do not fully trust.
 
-## Why MCP (Not Just A Skill)
+## Contents
 
-You can automate tmux with a plain-text skill, but the MCP tools are more reliable and cheaper to run:
+- [What the server provides](#what-the-server-provides)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Client configuration](#client-configuration)
+- [Configuration reference](#configuration-reference)
+- [Security hardening](#security-hardening)
+- [MCP tool reference](#mcp-tool-reference)
+- [MCP resource reference](#mcp-resource-reference)
+- [Remote and socket workflows](#remote-and-socket-workflows)
+- [Agent workflow patterns](#agent-workflow-patterns)
+- [Development](#development)
+- [Notes and limitations](#notes-and-limitations)
+- [Source anchors](#source-anchors)
 
-- Structured inputs and structured outputs reduce ambiguity, which improves agent quality.
-- Tool responses return stable IDs (session/window/pane/command), which avoids fragile name matching.
-- `execute-command` + `get-command-result` yields attributable output and exit codes without screen scraping.
-- Structured results are compact, so the agent spends fewer tokens than repeatedly capturing and parsing panes.
-- The MCP server can enforce policy (tool gating, allow/deny patterns, scoped sockets/sessions/panes).
+## What the server provides
+
+- Session, window, pane, client, and buffer tools with structured inputs and outputs.
+- `execute-command` and `get-command-result` for shell commands with command IDs, status, output, and exit-code tracking.
+- Pane and tmux-buffer resources for lightweight state checks without re-running commands.
+- Optional raw input tools for interactive programs, prompts, REPLs, and TUIs.
+- Runtime policy controls for tool filtering, command filtering, socket/session/pane scoping, and coarse operation groups.
+- Compile-time feature flags that remove raw input tools from the binary for hardened builds.
+- Optional SSH routing so the local MCP server can control a remote tmux server.
+
+The MCP path is usually more reliable than a plain tmux skill because every operation has a named tool, typed parameters, stable IDs, and structured responses. Clients do not need to infer pane IDs from captured text or parse command output to determine whether a command has finished.
+
+## Requirements
+
+- tmux 3.0 or newer on `PATH`.
+- Rust 1.70 or newer when building from source.
+- A shell supported by the command tracker: `bash`, `zsh`, or `fish`.
+
+On startup the server runs `tmux -V`. It exits when it detects tmux 2.x because tmux 2.x uses different output formats and split flags. If the version cannot be detected, startup continues and tmux errors are reported by the affected tool calls.
 
 ## Installation
 
-### Cargo (crates.io)
+### Cargo
+
 ```bash
 cargo install tmux-mcp-rs
 ```
 
 ### Homebrew
+
 ```bash
 brew install bnomei/tmux-mcp/tmux-mcp-rs
 ```
 
 ### GitHub Releases
-Download a prebuilt archive from the GitHub Releases page, extract it, and place `tmux-mcp-rs` on your `PATH`.
+
+Download a prebuilt archive from [GitHub Releases](https://github.com/bnomei/tmux-mcp/releases), extract it, and place `tmux-mcp-rs` on your `PATH`.
 
 ### From source
+
 ```bash
 git clone https://github.com/bnomei/tmux-mcp.git
 cd tmux-mcp
 cargo build --release
 ```
 
-### Hardened build (compile-time tool removal)
-The raw input tools are gated behind Cargo features that are **enabled by
-default**:
+The binary is written to `target/release/tmux-mcp-rs`.
 
-- `interactive` — the `send-keys`, `send-hex`, and `paste-text` tools.
-- `special-keys` — the `send-enter`, `send-tab`, `send-escape`, arrow, page,
-  home/end, `send-backspace`, `send-cancel`, and `send-eof` tools.
-
-Because these tools can inject bytes straight into the PTY, the
-`command_filter` is not a complete boundary for the feature set (for example, a
-denied command can be typed character-by-character and then submitted with
-Enter). Disabling a feature removes those tools from the binary entirely — they
-are never registered, so an agent cannot call them and `list-tools` will not
-advertise them.
+### Verify the install
 
 ```bash
-# Filtered-only build: execute-command is the sole shell-input path.
-cargo build --release --no-default-features --features rayon,rapidfuzz
-
-# Keep raw keystrokes but drop the special-key helpers (or vice versa).
-cargo build --release --no-default-features --features rayon,rapidfuzz,interactive
+tmux -V
+tmux-mcp-rs --version
 ```
 
-`execute-command` is always present and remains subject to the `command_filter`
-allow/deny patterns, so a hardened build forces all shell input through the
-validated path.
+Expected output:
 
-## Quick Start
+```txt
+tmux 3.x
+tmux-mcp-rs <version>
+```
 
-1) Add this MCP configuration. Examples for common MCP clients (pick one):
-    
+## Quick start
+
+1. Add the server to your MCP client.
+
+   Codex CLI:
+
+   ```bash
+   codex mcp add tmux -- tmux-mcp-rs
+   ```
+
+   Claude Code:
+
+   ```bash
+   claude mcp add --transport stdio tmux -- tmux-mcp-rs
+   ```
+
+   Generic MCP client configuration:
+
+   ```json
+   {
+     "mcpServers": {
+       "tmux": {
+         "command": "tmux-mcp-rs"
+       }
+     }
+   }
+   ```
+
+2. In your MCP client, ask the agent to create or list tmux sessions.
+
+   A typical first task is:
+
+   ```txt
+   Create a tmux session named workspace, list its windows and panes, then run pwd in the first pane.
+   ```
+
+   The tool responses should include a session ID, window ID, pane ID, and a `commandId` for the tracked command.
+
+3. Attach to the same tmux session if you want to watch or participate.
+
+   ```bash
+   tmux attach -t workspace
+   ```
+
+For safer multi-agent work, start with an isolated socket instead of the default tmux server:
+
 ```bash
-# Claude Code
-claude mcp add --transport stdio tmux -- tmux-mcp-rs
-
-# Codex CLI
-codex mcp add tmux -- tmux-mcp-rs
-
-# OpenCode (interactive)
-opencode mcp add
-
-# Amp (non-workspace)
-amp mcp add tmux -- tmux-mcp-rs
+tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
+tmux -S /tmp/tmux-mcp-agent.sock attach -t workspace
 ```
 
-```json
-{
-  "mcpServers": {
-    "tmux": {
-      "command": "tmux-mcp-rs"
-    }
-  }
-}
-```
+Then configure the MCP server with `--socket /tmp/tmux-mcp-agent.sock`, `TMUX_MCP_SOCKET=/tmp/tmux-mcp-agent.sock`, or a per-tool `socket` override.
 
-2) Let the agent create its own tmux session (it will return the session id by default), or start one yourself if you want a pre-existing session (local, isolated socket, or remote over SSH).
-3) Optional: attach to watch the agent work:
-```bash
-tmux attach -t <session>
-```
+## Client configuration
 
-## Usage
-
-### MCP Configuration
-
-Add the Quick Start snippet to your MCP client config. Example below includes all supported args (remove the ones you don't need):
+Use `args` when your MCP client accepts JSON configuration:
 
 ```json
 {
@@ -129,9 +159,7 @@ Add the Quick Start snippet to your MCP client config. Example below includes al
         "--shell-type",
         "zsh",
         "--socket",
-        "/path/to/tmux.sock",
-        "--ssh",
-        "user@host",
+        "/tmp/tmux-mcp-agent.sock",
         "--config",
         "/path/to/config.toml"
       ]
@@ -140,18 +168,60 @@ Add the Quick Start snippet to your MCP client config. Example below includes al
 }
 ```
 
-### CLI Options
+For a remote tmux server, add `--ssh`:
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--shell-type <SHELL>` | Shell to use (bash, zsh, fish) | `bash` |
-| `--socket <PATH>` | Path to tmux server socket (recommend per-agent isolated socket id) | Default server (if unset) |
-| `--ssh <CONNECTION>` | Run tmux over SSH (options + destination, destination last) | None |
-| `--config <PATH>` | Path to TOML configuration file | None |
+```json
+{
+  "mcpServers": {
+    "tmux": {
+      "command": "tmux-mcp-rs",
+      "args": [
+        "--ssh",
+        "user@host",
+        "--socket",
+        "/tmp/tmux-mcp-agent.sock"
+      ]
+    }
+  }
+}
+```
 
-Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). If neither `--socket` nor `TMUX_MCP_SOCKET` is set, tmux-mcp uses tmux's default socket path (`$TMUX_TMPDIR/tmux-$UID/default`, or `/tmp/tmux-$UID/default` when `TMUX_TMPDIR` is unset). `TMUX_MCP_SSH` can set the SSH connection string and is parsed with the same startup validation as `--ssh`. `TMUX_MCP_TOOLS` can override the configured tool surface for one process.
+Every MCP tool except `socket-for-path` accepts an optional `socket` parameter. If a tool omits it, the server uses the process default socket.
 
-### Sample Configuration (config.toml)
+## Configuration reference
+
+`tmux-mcp-rs` does not auto-load a config file. Pass one with `--config /path/to/config.toml`.
+
+### CLI options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--shell-type <SHELL>` | `bash` | Shell used for shell-aware command tracking. Supported values: `bash`, `zsh`, `fish`. If `[shell].type` exists in the config file, the config value wins. |
+| `--config <PATH>` | unset | TOML configuration file to read. Invalid TOML, invalid regexes, and unknown tools or groups fail startup. |
+| `--socket <PATH>` | tmux default socket | Sets `TMUX_MCP_SOCKET` for this server process. A per-tool `socket` parameter still wins for that call. |
+| `--ssh <CONNECTION>` | unset | Routes tmux commands through SSH. This value wins over `[ssh].remote` and `TMUX_MCP_SSH`. |
+| `--help` | n/a | Prints CLI help. |
+| `--version` | n/a | Prints the binary version. |
+
+### Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `TMUX_MCP_SOCKET` | Default tmux socket path when no per-tool `socket` override is provided. If unset, the server uses tmux's default socket path: `$TMUX_TMPDIR/tmux-$UID/default`, or `/tmp/tmux-$UID/default` when `TMUX_TMPDIR` is unset. |
+| `TMUX_MCP_SSH` | SSH connection string used when `--ssh` and `[ssh].remote` are unset. The string is parsed with shell-word rules. Unbalanced quotes fail startup. |
+| `TMUX_MCP_TOOLS` | Per-process override for `[security.tools]`. Use `allow:<items>` or `deny:<items>`. Without a prefix, the value is treated as a denylist. |
+| `RUST_LOG` | Enables tracing output through `tracing-subscriber` when set. Logs are written to stderr. |
+
+Precedence rules:
+
+| Setting | Precedence |
+| --- | --- |
+| Socket | Per-tool `socket` parameter, then `--socket` or `TMUX_MCP_SOCKET`, then tmux default socket path. |
+| SSH | `--ssh`, then `[ssh].remote`, then `TMUX_MCP_SSH`, then no SSH. |
+| Shell type | `[shell].type`, then `--shell-type`, then `bash`. |
+| Tool filter | `TMUX_MCP_TOOLS`, then `[security.tools]`, then deny mode with no denied items. |
+
+### Example config
 
 ```toml
 [shell]
@@ -163,17 +233,26 @@ remote = "user@host"
 [security]
 enabled = true
 allow_execute_command = true
-allowed_sockets = ["/tmp/ai-agent.sock"]
+allow_raw_mode = true
+allow_send_keys = false
+allow_kill = true
+allow_create = true
+allow_split = true
+allow_rename = true
+allow_move = true
+allow_capture = true
+allow_list = true
+allowed_sockets = ["/tmp/tmux-mcp-agent.sock"]
 allowed_sessions = ["workspace"]
 allowed_panes = ["%1"]
 
 [security.command_filter]
-mode = "off" # off | allowlist | denylist
-patterns = []
+mode = "allowlist"
+patterns = ["^cargo ", "^git ", "^rg ", "^sed "]
 
 [security.tools]
-mode = "deny" # deny | allow
-items = []    # tool names or groups such as "@raw-input"
+mode = "deny"
+items = ["@raw-input"]
 
 [tracking]
 capture_initial_lines = 1000
@@ -187,98 +266,97 @@ tracking_deadline_seconds = 600
 streaming_threshold_bytes = 262144
 ```
 
-### Security defaults and controls
+### Security options
 
-By default, `tmux-mcp-rs` is intentionally permissive. If you do not provide a
-`config.toml`, security policy enforcement is enabled but every operation group
-is allowed, command filtering is off, and sockets, sessions, and panes are not
-restricted. This means an MCP client can create and kill tmux objects, send raw
-PTY input, run shell commands, capture pane and buffer contents, and target any
-tmux socket reachable by the process. Use an isolated socket per agent whenever
-possible.
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `security.enabled` | boolean | `true` | Enables policy checks. Set to `false` only when you want to bypass every policy check. |
+| `security.allow_execute_command` | boolean | `true` | Allows `execute-command` and `get-command-result`. |
+| `security.allow_raw_mode` | boolean | `true` | Allows `execute-command` with `rawMode=true`, which sends the command without tracking markers. |
+| `security.allow_send_keys` | boolean | `true` | Allows raw input tools: `send-keys`, `send-hex`, `paste-text`, and special-key helpers. |
+| `security.allow_kill` | boolean | `true` | Allows `kill-session`, `kill-window`, `kill-pane`, and `detach-client`. |
+| `security.allow_create` | boolean | `true` | Allows `create-session` and `create-window`. |
+| `security.allow_split` | boolean | `true` | Allows `split-pane`. |
+| `security.allow_rename` | boolean | `true` | Allows session, window, and pane rename tools. |
+| `security.allow_move` | boolean | `true` | Allows focus, resize, zoom, layout, join, break, swap, move, and synchronize-panes tools. |
+| `security.allow_capture` | boolean | `true` | Allows `capture-pane` and tmux buffer read, write, and search tools. Buffer file operations are part of this capture surface. |
+| `security.allow_list` | boolean | `true` | Allows session, window, pane, client, buffer, and current-session listing tools. |
+| `security.allowed_sockets` | string array or unset | unset | When set, the effective socket for every tool and resource request must exactly match one of these paths. |
+| `security.allowed_sessions` | string array or unset | unset | When set, session-scoped operations are limited to the listed tmux session IDs. |
+| `security.allowed_panes` | string array or unset | unset | When set, direct pane operations are limited to the listed pane IDs. |
+| `security.command_filter.mode` | `off`, `allowlist`, `denylist` | `off` | Regex command filter mode. |
+| `security.command_filter.patterns` | string array | `[]` | Regex patterns used by the command filter. |
+| `security.tools.mode` | `deny`, `allow` | `deny` | Runtime tool-surface filter mode. |
+| `security.tools.items` | string array | `[]` | Exact tool names or groups such as `@raw-input`. |
 
-The settings below are the runtime controls that affect command, capture, and
-socket behavior:
+`security.command_filter` checks each non-empty shell statement for `execute-command`, non-literal `send-keys`, `paste-text`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, newlines, and command substitutions before matching. It does not screen literal `send-keys` content or special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
 
-| Setting | Default | Effect |
-|---------|---------|--------|
-| `security.enabled` | `true` | Turns policy checks on. Set to `false` only to bypass all security policy checks. |
-| `security.allow_execute_command` | `true` | Allows `execute-command` and `get-command-result`. `execute-command` is the only shell-input path checked by `security.command_filter`. |
-| `security.command_filter` | `mode = "off"` | Applies regex allowlist or denylist checks to each non-empty line passed to `execute-command`. It does not cover raw input tools such as `send-keys` or `paste-text`. |
-| `security.allow_send_keys` | `true` | Allows raw PTY input tools (`send-keys`, `send-hex`, `paste-text`, and special-key helpers). Disable this or deny `@raw-input` to prevent typing directly into panes. |
-| `security.allow_capture` | `true` | Allows `capture-pane` and buffer read/write/search tools, so clients can read pane output and tmux buffers. Set to `false` to block capture and buffer tools. |
-| `security.allow_list` | `true` | Allows session/window/pane/client/buffer listing and discovery tools. |
-| `security.allowed_sockets` | unset | When unset, the default tmux server and any provided socket override are accepted. When set, socket overrides must exactly match one of the listed socket paths; calls without a socket still use the default socket. |
-| `security.allowed_sessions` | unset | When set, operations scoped to a session/window/pane are limited to the listed tmux session IDs. |
-| `security.allowed_panes` | unset | When set, direct pane operations are limited to the listed pane IDs. |
-| `security.tools` | deny mode with no items | Filters the advertised and callable tool surface. Deny mode removes listed tools/groups; allow mode exposes only listed tools/groups. |
-| `shell.type` / `--shell-type` | `bash` | Selects the shell used for shell-aware command wrapping (`bash`, `zsh`, or `fish`). It is not a security boundary. |
-| `--socket` / `TMUX_MCP_SOCKET` | unset | Sets this server process's default tmux socket. Combine with `allowed_sockets` to keep the process on an isolated socket. |
+### Tracking options
 
-Examples for tightening a local setup without introducing a profile system:
+| Key | Default | Description |
+| --- | --- | --- |
+| `tracking.capture_initial_lines` | `1000` | Initial pane lines captured while looking for command tracking markers. |
+| `tracking.capture_max_lines` | `16000` | Maximum pane lines captured before the tracker stops expanding the search window. |
+| `tracking.capture_backoff_factor` | `2` | Multiplier used when retrying larger capture windows. |
+| `tracking.completed_retention_minutes` | `240` | Age limit for completed command history retained in memory. |
+| `tracking.completed_max_entries` | `1000` | Maximum completed command entries retained in memory. |
+| `tracking.tracking_deadline_seconds` | `600` | Time a command can stay pending after its start marker scrolls out of reach before it is declared expired. |
+
+### Search options
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `search.streaming_threshold_bytes` | `262144` | Buffer size threshold where search streams through a temp file instead of loading the full buffer text into one string for the search pass. |
+
+## Security hardening
+
+By default, policy enforcement is enabled but permissive:
+
+- All coarse `allow_*` gates are `true`.
+- `command_filter.mode` is `off`.
+- `allowed_sockets`, `allowed_sessions`, and `allowed_panes` are unset.
+- `[security.tools]` is deny mode with no denied items.
+
+That default is convenient for local experimentation, but it is not a sandbox.
+
+### Use an isolated tmux socket
+
+```bash
+tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
+tmux-mcp-rs --socket /tmp/tmux-mcp-agent.sock --config config.toml
+```
 
 ```toml
-# Keep one agent on one isolated tmux socket.
 [security]
 allowed_sockets = ["/tmp/tmux-mcp-agent.sock"]
 ```
 
+When `allowed_sockets` is set, calls without an explicit socket still resolve to the process default socket and must match the allowlist.
+
+### Remove raw input at runtime
+
 ```toml
-# Force shell input through execute-command and regex filtering.
 [security]
 allow_send_keys = false
-command_filter = { mode = "allowlist", patterns = ["^cargo ", "^git ", "^npm (test|run )"] }
 
 [security.tools]
 mode = "deny"
 items = ["@raw-input"]
 ```
 
+Use this when shell input should go through `execute-command` so command filtering and command-result tracking remain central.
+
+### Expose only read tools and tracked command execution
+
 ```toml
-# Read/list plus tracked command execution only; no create, split, kill, move, or raw input tools.
 [security.tools]
 mode = "allow"
 items = ["@read", "execute-command"]
 ```
 
-```toml
-# Prevent clients from reading pane contents or tmux buffers.
-[security]
-allow_capture = false
-```
+`@read` includes `get-command-result`, listing tools, capture tools, buffer read/search tools, and `socket-for-path`.
 
-### Tracking configuration (optional)
-- `capture_initial_lines`: initial number of lines to capture for command output.
-- `capture_max_lines`: maximum lines to capture before giving up.
-- `capture_backoff_factor`: multiplier for each capture retry window.
-- `completed_retention_minutes`: age threshold for evicting completed command history.
-- `completed_max_entries`: max number of completed commands retained.
-- `tracking_deadline_seconds`: how long a command whose START marker has scrolled out of reach (very large output) stays Pending before being declared expired. The DONE marker still completes it at any time; this only bounds genuinely-lost tracking. Raise it for high-output commands that also run long.
-
-### Search configuration (optional)
-- `streaming_threshold_bytes`: when a buffer exceeds this size, search streams a window via a temp file instead of loading the full buffer in memory.
-
-### Tool surface configuration (optional)
-
-Use `[security.tools]` to remove tools from `list-tools` and deny direct calls.
-Entries can be exact tool names or groups prefixed with `@`.
-
-```toml
-# Disable raw PTY input while keeping execute-command available.
-[security.tools]
-mode = "deny"
-items = ["@raw-input"]
-```
-
-```toml
-# Expose only read-only context tools plus tracked command execution.
-[security.tools]
-mode = "allow"
-items = ["@read", "execute-command"]
-```
-
-`TMUX_MCP_TOOLS` overrides `[security.tools]` for a single process. Without a
-prefix it is a denylist; use `allow:` for an explicit allowlist.
+### Override the tool surface for one process
 
 ```bash
 TMUX_MCP_TOOLS=send-keys,paste-text tmux-mcp-rs
@@ -286,302 +364,221 @@ TMUX_MCP_TOOLS=deny:@raw-input tmux-mcp-rs
 TMUX_MCP_TOOLS=allow:@read,execute-command tmux-mcp-rs
 ```
 
-Known groups:
+### Compile out raw input tools
+
+The default Cargo feature set includes `interactive` and `special-keys`.
+
+- `interactive` registers `send-keys`, `send-hex`, and `paste-text`.
+- `special-keys` registers `send-enter`, `send-tab`, `send-escape`, arrow keys, page keys, home/end, `send-backspace`, `send-cancel`, and `send-eof`.
+
+Disable those features to remove the tools from the binary:
+
+```bash
+# Filtered-only build: execute-command is the only shell-input path.
+cargo build --release --no-default-features --features rayon,rapidfuzz
+
+# Keep raw keystrokes but remove special-key helpers.
+cargo build --release --no-default-features --features rayon,rapidfuzz,interactive
+```
+
+`execute-command` is always registered and remains subject to `security.command_filter`.
+
+## MCP tool reference
+
+Tool availability depends on Cargo features and runtime policy. Runtime-denied tools are removed from the advertised MCP tool list and denied when called.
+
+### Tool groups
 
 | Group | Tools |
-|-------|-------|
-| `@all` | Every known tool compiled into the binary |
-| `@read` | Read-only/introspection tools, including list/find, capture, buffer reads, and command result reads |
-| `@list` | `list-*`, `find-session`, and `get-current-session` |
-| `@execute` | `execute-command`, `get-command-result` |
-| `@raw-input` | All raw PTY input tools from `@interactive` and `@special-keys` |
-| `@interactive` | `send-keys`, `send-hex`, `paste-text` |
-| `@special-keys` | `send-enter`, arrows, page/home/end, tab, escape, backspace, cancel, EOF |
-| `@capture` | `capture-pane` |
-| `@buffer-read` | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer` |
-| `@buffer-write` | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer` |
-| `@create` | `create-session`, `create-window` |
-| `@split` | `split-pane` |
-| `@rename` | `rename-session`, `rename-window`, `rename-pane` |
-| `@move` | focus, resize, zoom, layout, join, break, swap, move, synchronize-panes |
-| `@kill` | `kill-session`, `kill-window`, `kill-pane`, `detach-client` |
-| `@socket` | `socket-for-path` |
+| --- | --- |
+| `@all` | Every known tool compiled into the binary. |
+| `@read` | `socket-for-path`, list/find tools, `capture-pane`, buffer read/search tools, and `get-command-result`. |
+| `@socket` | `socket-for-path`. |
+| `@list` | `list-sessions`, `find-session`, `list-windows`, `list-panes`, `list-clients`, `list-buffers`, `get-current-session`. |
+| `@execute` | `execute-command`, `get-command-result`. |
+| `@capture` | `capture-pane`. |
+| `@buffer-read` | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer`. |
+| `@buffer-write` | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer`. |
+| `@create` | `create-session`, `create-window`. |
+| `@split` | `split-pane`. |
+| `@rename` | `rename-session`, `rename-window`, `rename-pane`. |
+| `@move` | `move-window`, `select-window`, `select-pane`, `resize-pane`, `zoom-pane`, `select-layout`, `join-pane`, `break-pane`, `swap-pane`, `set-synchronize-panes`. |
+| `@kill` | `kill-session`, `kill-window`, `kill-pane`, `detach-client`. |
+| `@interactive` | `send-keys`, `send-hex`, `paste-text`. |
+| `@special-keys` | `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, arrows, page keys, home, end. |
+| `@raw-input` | All `@interactive` and `@special-keys` tools. |
 
-Buffer file operations (`save-buffer` and `load-buffer`) are intentionally part of the existing capture permission surface: `[security].allow_capture = false` denies them alongside `capture-pane` and buffer inspection tools. Use `[security.tools]` for finer-grained filtering (for example, deny `save-buffer`, `load-buffer`, or `@buffer-write`) when capture should remain available but filesystem-backed buffer import/export should not. No separate `allow_buffer_read` or `allow_buffer_write` configuration exists.
+### Tools by task
 
-## Tools
+| Task | Tools |
+| --- | --- |
+| Socket utility | `socket-for-path` derives a deterministic `/tmp/<hash>.sock` path from a project path. |
+| Session management | `list-sessions`, `find-session`, `create-session`, `kill-session`, `get-current-session`, `rename-session`. |
+| Window management | `list-windows`, `create-window`, `kill-window`, `rename-window`, `move-window`, `select-window`, `select-layout`, `set-synchronize-panes`. |
+| Pane management | `list-panes`, `split-pane`, `kill-pane`, `rename-pane`, `capture-pane`, `select-pane`, `resize-pane`, `zoom-pane`, `join-pane`, `break-pane`, `swap-pane`. |
+| Command execution | `execute-command` sends a shell command and returns a `commandId`; `get-command-result` polls status, output, and exit code. |
+| Client management | `list-clients`, `detach-client`. |
+| Buffer inspection | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer`. |
+| Buffer mutation | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer`. |
+| Raw input | `send-keys`, `paste-text`, `send-hex`, `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, arrow keys, page keys, home, end. |
 
-### Core Utilities
-- **socket-for-path** - Derive a deterministic tmux socket path for a project directory
+Prefer `execute-command` plus `get-command-result` for non-interactive commands. Use `capture-pane` for live progress or terminal state. Use raw input tools only for prompts, REPLs, editors, pagers, and TUIs.
 
-### Session Management
-- **list-sessions** - List all tmux sessions
-- **find-session** - Find a session by name pattern
-- **create-session** - Create a new session
-- **kill-session** - Kill a session
-- **get-current-session** - Get the current/attached session
-- **rename-session** - Rename a session
+## MCP resource reference
 
-### Window Management
-- **list-windows** - List windows in a session
-- **create-window** - Create a new window
-- **kill-window** - Kill a window
-- **rename-window** - Rename a window
-- **move-window** - Move a window to another position/session
-- **select-window** - Select/focus a window
-- **select-layout** - Apply a window layout (tiled/even/main-*)
-- **set-synchronize-panes** - Toggle synchronize-panes for a window
-
-### Pane Management
-- **list-panes** - List panes in a window
-- **split-pane** - Split a pane horizontally or vertically
-- **kill-pane** - Kill a pane (closing the last pane also closes its window)
-- **rename-pane** - Set pane title
-- **capture-pane** - Capture pane content (state/logs; not for routine command output)
-- **select-pane** - Select/focus a pane
-- **resize-pane** - Resize a pane by direction or size
-- **zoom-pane** - Toggle pane zoom
-- **join-pane** - Join a source pane into a target pane's window
-- **break-pane** - Break a pane into a new window
-- **swap-pane** - Swap two panes
-
-### Command Execution
-- **execute-command** - Execute a command in a pane (preferred for non-interactive)
-- **get-command-result** - Get the result of an executed command (preferred output path)
-
-### Client Management
-- **list-clients** - List tmux clients
-- **detach-client** - Detach a tmux client
-
-### Buffer Management
-- **list-buffers** - List tmux paste buffers
-- **show-buffer** - Show buffer contents (supports offset/max bytes; defaults to 64KB)
-- **save-buffer** - Save buffer contents to a file (writes to the server filesystem; governed by `allow_capture` and `[security.tools]`)
-- **delete-buffer** - Delete a buffer
-
-### Additional Buffer Tools
-- **set-buffer** - Create or replace a buffer with UTF-8 content
-- **load-buffer** - Load buffer contents from a file (reads from the server filesystem; governed by `allow_capture` and `[security.tools]`)
-- **append-buffer** - Append UTF-8 content to an existing buffer
-- **rename-buffer** - Emulate rename by copying then deleting
-- **search-buffer** - Structured search over one or more buffers (literal/regex + metadata)
-- **subsearch-buffer** - Anchor-scoped follow-up search with structured metadata
-
-### Key Sending
-- **send-keys** - Send keys to a pane (interactive only). Use `literal=true` for exact text and `enter=true` to submit in one call
-- **paste-text** - Paste multi-line UTF-8 text via bracketed paste (`paste-buffer -p`); embedded newlines stay literal (no per-line submit) when the receiving program supports bracketed paste
-- **send-hex** - Send raw bytes as whitespace-separated hex tokens (e.g. CSI-u `1b 5b 31 33 3b 32 75` = Shift+Enter) for escape sequences key names cannot express
-- **send-cancel** - Send Ctrl+C
-- **send-eof** - Send Ctrl+D (EOF)
-- **send-escape** - Send Escape key
-- **send-enter** - Send Enter key (interactive prompts)
-- **send-tab** - Send Tab key
-- **send-backspace** - Send Backspace key
-
-### Navigation Keys
-- **send-up** - Send Up arrow
-- **send-down** - Send Down arrow
-- **send-left** - Send Left arrow
-- **send-right** - Send Right arrow
-- **send-page-up** - Send Page Up
-- **send-page-down** - Send Page Down
-- **send-home** - Send Home key
-- **send-end** - Send End key
-
-
-## Resources
-
-The server exposes the following MCP resources:
+Resources reflect the server's default socket. They are dynamically enumerated and filtered by the current security policy.
 
 | URI | Description |
-|-----|-------------|
-| `tmux://server/info` | Default socket and SSH context for routing tool calls |
-| `tmux://pane/{paneId}` | Content of a specific pane (last 200 lines) |
-| `tmux://pane/{paneId}/info` | Metadata for a specific pane |
-| `tmux://pane/{paneId}/tail/{lines}` | Tail N lines from a pane |
-| `tmux://pane/{paneId}/tail/{lines}/ansi` | Tail N lines with ANSI colors |
-| `tmux://window/{windowId}/info` | Metadata for a window |
-| `tmux://session/{sessionId}/tree` | Session + windows + panes snapshot |
-| `tmux://clients` | List tmux clients |
-| `tmux://command/{commandId}/result` | Status and output of a tracked command |
+| --- | --- |
+| `tmux://server/info` | JSON with default socket and SSH context. |
+| `tmux://pane/{paneId}` | Last 200 lines from a pane as plain text. |
+| `tmux://pane/{paneId}/info` | Pane metadata as JSON. |
+| `tmux://pane/{paneId}/tail/{lines}` | Tail N lines from a pane as plain text. |
+| `tmux://pane/{paneId}/tail/{lines}/ansi` | Tail N lines from a pane with ANSI colors. |
+| `tmux://window/{windowId}/info` | Window metadata as JSON. |
+| `tmux://session/{sessionId}/tree` | Session, window, and pane snapshot as JSON. |
+| `tmux://clients` | tmux clients as JSON. |
+| `tmux://command/{commandId}/result` | Tracked command status and output. |
 
-Resources are dynamically enumerated - the server lists available panes, windows, sessions, clients, and active commands.
+## Remote and socket workflows
 
-## Skills
+### Remote SSH
 
-- [tmux-via-mcp](skills/tmux-via-mcp/SKILL.md) - Use the tmux MCP tools to create sessions, shape layouts, run tracked commands, and automate interactive terminals when a real TTY or parallel panes are required.
-- [tmux-buffer-explorer](skills/tmux-buffer-explorer/SKILL.md) - Explore large tmux buffers via search and bounded slices. Use when buffer data is too large to load at once or needs incremental inspection.
-
-### Probing and Refining with tmux-buffer-explorer
-
-The additonal buffer tools extend tmux’s native buffers for the probe‑and‑refine workflow described in the paper from Alex L. Zhang, Tim Kraska and Omar Khattab [Recursive Language Models](https://arxiv.org/pdf/2512.24601), while keeping all state inside tmux buffers and thus in RAM. They’re general-purpose building blocks used by the coordinating Skill at [skills/tmux-buffer-explorer/SKILL.md](https://github.com/bnomei/tmux-mcp/blob/main/skills/tmux-buffer-explorer/SKILL.md).
-
-The tmux buffer search is **not intended to replace ripgrep** or similar search approaches. `rg` is a high-performance, one-shot search tool optimized for humans who already know what they are looking for. This skill targets a different problem: enabling **LLM agents to explore large contexts incrementally**.
-
-Search here is a **navigation primitive**, not an end result. It provides:
-- structured results with stable offsets and match IDs
-- bounded, zoom-able reads for follow-up inspection
-- deterministic behavior across multiple reasoning steps
-
-This aligns with the *Recursive Language Models* approach: treat context as an **external environment to explore**, not a blob to ingest. Performance is more than enough for buffer-scale text, and the dominant cost is agent reasoning, not scanning.
-
-### Examples: Old Man and the Sea (113 KB = too big for LLM context)
-- **Q:** Use the _tmux buffer_ to search the tests/fixtures/old-man-and-the-sea.txt for
-baseball near dimago.
-- **Q:** Where does the old man talk about why he admires DiMaggio, and what reason does he
-give?
-- **Q:** Where does the old man reflect on his loneliness at sea, and how does that reflection change later in the story?
-- **Q:** Find the passage where the lions are mentioned most vividly and summarize what they symbolize.
-
-> **Q:** Locate the moment where the old man’s confidence shifts into doubt during the fight with the fish.
-> 
-> **A:** In tmux buffer oldman around byte offset ~56320 (mid‑fight, when his left hand
-  cramps), he asserts he can handle the line with his right arm alone, then
-  immediately says he doesn’t know what the fish will do and starts questioning the
-  fish’s plan and his own. That’s the confidence‑to‑doubt shift.
-
-
-## Remote SSH (optional)
-
-Use `--ssh` to control a tmux server on another machine. Make sure SSH authentication is non-interactive (e.g. agent or keys).
+Use `--ssh` to run tmux commands on another machine. SSH authentication must be non-interactive, such as an agent or key-based login.
 
 ```bash
 tmux-mcp-rs --ssh "user@host"
 ```
 
-For extra SSH options, put them before the host (e.g. `--ssh "-i ~/.ssh/key user@host"`) or use `~/.ssh/config`. The destination should be the last token in the `--ssh` string.
-
-The connection string is split with shell-word rules (quotes honored); an unbalanced quote is rejected at startup. On the remote, the server runs `ssh <args> <quoted tmux command>`, and the tmux version check applies to the remote tmux when it can be reached. SSH parsing and remote command quoting are unit-tested; end-to-end remote behavior is verified manually, not in CI (no remote host in the test environment).
-
-### Remote + isolated (SSH + socket)
-
-Create a dedicated tmux server on the remote host, then point the MCP server at that socket:
+Pass SSH options before the destination:
 
 ```bash
-# On the remote host (once):
-ssh user@host 'tmux -S /tmp/ai-agent.sock -f /dev/null new-session -d -s workspace'
-
-# Locally:
-tmux-mcp-rs --ssh "user@host" --socket /tmp/ai-agent.sock
+tmux-mcp-rs --ssh "-i ~/.ssh/key user@host"
 ```
 
-## Socket isolation (optional)
+The connection string is split with shell-word rules. The destination should be the last token. The server quotes the remote tmux command before sending it to SSH, and the tmux version check applies to the remote tmux when it can be reached.
 
-Use `--socket` or `TMUX_MCP_SOCKET` to point the MCP server at a specific tmux server socket.
+### Remote plus isolated socket
+
+Create a dedicated tmux server on the remote host:
 
 ```bash
-# Connect to a specific socket id
-tmux-mcp-rs --socket /tmp/tmux-mcp-<agent-id>.sock
-
-# Or via environment variable
-TMUX_MCP_SOCKET=/tmp/tmux-mcp-<agent-id>.sock tmux-mcp-rs
+ssh user@host 'tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace'
 ```
 
-If you want to pre-create an isolated tmux server for the agent:
+Start the local MCP server against that remote socket:
 
 ```bash
-tmux -S /tmp/ai-agent.sock -f /dev/null new-session -d -s workspace
-TMUX_MCP_SOCKET=/tmp/ai-agent.sock tmux-mcp-rs
+tmux-mcp-rs --ssh "user@host" --socket /tmp/tmux-mcp-agent.sock
 ```
 
-## Workflow Patterns (CLI Agents)
+Attach directly from a shell when needed:
 
-These patterns mirror how CLI agents like Codex can structure tmux work. Each core flow is backed by an integration test in `tests/integration.rs` (run with `TMUX_MCP_INTEGRATION=1`).
+```bash
+ssh -t user@host 'tmux -S /tmp/tmux-mcp-agent.sock attach -t workspace'
+```
 
-- **ID-first targeting**: Use window/pane IDs for operations when names collide. Tools: list-windows/list-panes, rename-window. Test: `test_workflow_id_first_targeting`.
-- **Task-per-session layout**: Create a session per task, add windows for build/test/docs, and split panes for runners/logs. Tools: create-session, create-window, split-pane, rename-pane, list-windows, list-panes. Test: `test_workflow_task_per_session_layout`.
-- **Stateful shell context**: Set environment/state in a pane and reuse it across commands. Tools: send-keys, capture-pane. Test: `test_workflow_stateful_shell_context`.
-- **Continuous output pane**: Run a long command and poll `capture-pane` to summarize progress without losing terminal state. Tools: send-keys, capture-pane. Test: `test_workflow_continuous_output_capture`.
-- **Interactive prompt automation**: Drive a blocking prompt (or simple TUI) by sending responses via keys, then capture the result. Tools: send-keys, capture-pane. Test: `test_workflow_interactive_prompt`.
-- **Interactive interrupts**: Cancel long-running commands and end stdin streams with EOF. Tools: send-cancel, send-eof, capture-pane. Test: `test_workflow_interactive_interrupts`.
-- **Synchronized panes broadcast**: Fan out a command to multiple panes at once using synchronize-panes. Tools: set-synchronize-panes, send-keys, capture-pane. Test: `test_workflow_synchronized_panes_broadcast`.
-- **Buffer handoff + probe**: Stash output in buffers, inspect it, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer. Test: `test_workflow_buffer_roundtrip` (core flow).
-- **Pane rearrangements**: Swap/break/join panes and apply layouts while preserving pane identities. Tools: split-pane, select-layout, swap-pane, break-pane, join-pane, list-panes, list-windows. Test: `test_workflow_pane_rearrangements`.
-- **Metadata + zoom**: Rename session/window/pane and inspect pane/window metadata; toggle zoom and resize. Tools: rename-session, rename-window, rename-pane, zoom-pane, resize-pane. Resources: `tmux://pane/{paneId}/info`, `tmux://window/{windowId}/info`. Test: `test_workflow_metadata_and_zoom`.
-- **Audit-ready context bundle**: Pair tracked command output with raw pane capture for traceability. Tools: execute-command, get-command-result, capture-pane. Test: `test_workflow_audit_context_bundle`.
-- **Agent orchestration**: Run parallel commands across windows/panes with log monitoring. Tools: create-window, split-pane, execute-command, send-keys, capture-pane. Test: `test_workflow_agent_orchestration`.
+### Socket isolation
+
+Use `--socket` or `TMUX_MCP_SOCKET` to keep one agent on one tmux server:
+
+```bash
+tmux-mcp-rs --socket /tmp/tmux-mcp-agent.sock
+```
+
+```bash
+TMUX_MCP_SOCKET=/tmp/tmux-mcp-agent.sock tmux-mcp-rs
+```
+
+Pre-create the session when you want a human-visible workspace before the MCP client starts:
+
+```bash
+tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
+TMUX_MCP_SOCKET=/tmp/tmux-mcp-agent.sock tmux-mcp-rs
+```
+
+## Agent workflow patterns
+
+The integration tests cover these tmux workflows:
+
+| Pattern | Tool surface |
+| --- | --- |
+| ID-first targeting | `list-windows`, `list-panes`, `rename-window`. |
+| Task-per-session layout | `create-session`, `create-window`, `split-pane`, `rename-pane`, list tools. |
+| Stateful shell context | `send-keys`, `capture-pane`. |
+| Continuous output pane | `send-keys`, `capture-pane`. |
+| Interactive prompt automation | `send-keys`, `capture-pane`. |
+| Interactive interrupts | `send-cancel`, `send-eof`, `capture-pane`. |
+| Synchronized panes broadcast | `set-synchronize-panes`, `send-keys`, `capture-pane`. |
+| Buffer handoff and search | `list-buffers`, `show-buffer`, `save-buffer`, `delete-buffer`, `search-buffer`, `subsearch-buffer`. |
+| Pane rearrangements | `split-pane`, `select-layout`, `swap-pane`, `break-pane`, `join-pane`. |
+| Metadata and zoom | Rename tools, `zoom-pane`, `resize-pane`, pane/window resources. |
+| Audit-ready context bundle | `execute-command`, `get-command-result`, `capture-pane`. |
+| Agent orchestration | `create-window`, `split-pane`, `execute-command`, `send-keys`, `capture-pane`. |
+
+For agent-facing tmux workflows, see:
+
+- [tmux-via-mcp](skills/tmux-via-mcp/SKILL.md)
+- [tmux-buffer-explorer](skills/tmux-buffer-explorer/SKILL.md)
+
+`tmux-buffer-explorer` uses tmux buffers as an external search space for large text. It is useful when an agent needs bounded search and follow-up slices instead of loading a whole buffer into context.
 
 ## Development
 
-### Running Tests
+Build the binary:
 
-Unit tests (no tmux required):
 ```bash
-cargo test --lib
+cargo build --release
 ```
 
-Integration tests (requires tmux installed):
-```bash
-# Install tmux if needed
-# macOS: brew install tmux
-# Ubuntu: sudo apt-get install tmux
+Run unit tests that do not require tmux:
 
-# Run integration tests (uses isolated tmux server)
+```bash
+cargo test --lib
+cargo test --test cli
+cargo test --test search
+```
+
+Run tmux-backed integration tests:
+
+```bash
 TMUX_MCP_INTEGRATION=1 cargo test --test integration
 ```
 
-Integration tests create an isolated tmux server using a temp socket, so they won't affect your running tmux sessions.
+Integration tests create isolated tmux servers using temporary sockets and clean them up afterward.
 
-### Security defaults (why nothing is denied)
+Run the same Rust checks as CI:
 
-By default, the security policy is permissive to avoid breaking agent workflows:
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
 
-- `security.enabled = true`, but all `allow_*` flags are `true`
-- `security.tools.mode = "deny"` with no items (no tool filtering)
-- `command_filter.mode = "off"` (no allow/deny patterns)
-- `allowed_sockets/sessions/panes` are unset (no scoping)
-
-**Denylist behavior:** when `command_filter.mode = "denylist"`, any regex in
-`security.command_filter.patterns` that matches a command string will block that
-command. This applies to `execute-command`, non-literal `send-keys`, and
-`paste-text`; multi-line inputs are checked one non-empty line at a time so
-anchored patterns such as `^rm ` still apply after embedded newlines. For
-`send-hex`, decoded bytes are screened by the same command filter on a
-best-effort basis: erase/kill line-editing control bytes are rejected outright,
-but raw bytes can still encode actions a string-matching regex cannot fully
-anticipate, so do not rely on the denylist as a hard boundary for raw input.
-Literal `send-keys` is gated by `allow_send_keys` only; its content is not
-screened. Scope raw input tools with `allowed_panes`/`allowed_sessions`, or
-disable `allow_send_keys`.
-
-When `allowed_sockets` is configured, it is enforced against the effective socket for every tool and resource request: an explicit tool socket wins, otherwise `TMUX_MCP_SOCKET`/`--socket` is used, and otherwise tmux's default socket path is checked. Include the default socket path in `allowed_sockets` only if default-server access is intended; otherwise set `--socket` or `TMUX_MCP_SOCKET` to an allowed isolated socket.
-
-Command results are socket-bound: when a command is executed, the resolved socket is recorded
-and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
-
-To harden a deployment, configure `[security.tools]`, add command deny/allow
-patterns, or restrict sockets/sessions/panes explicitly. The older `allow_*`
-flags still work as coarse group gates, but `[security.tools]` is the preferred
-surface because it removes disabled tools from `list-tools`. For the strongest
-guarantee that shell input cannot bypass the `command_filter`, compile without
-the raw input tools (see [Hardened build](#hardened-build-compile-time-tool-removal)).
+Release notes and release packaging details live in [CHANGELOG.md](CHANGELOG.md) and [docs/RELEASE.md](docs/RELEASE.md).
 
 ## Notes and limitations
 
-- **Memory use is intentionally bounded only in some paths.** Paste buffers and
-  command output live in
-  RAM (the buffer-explorer workflow deliberately keeps large data resident for
-  fast search/slicing). `paste-text`, `set-buffer`/`append-buffer`, and a single
-  command's retained output can consume host memory accordingly. Tracked output
-  is line-capped by `capture_max_lines`, but retained strings and individual line
-  length are not byte-capped. Search streams large buffers via a temp file once
-  they exceed `search.streaming_threshold_bytes`, but the buffers themselves are
-  not evicted by size. Keep this in mind when pasting or capturing huge payloads.
-- **tmux output is parsed as tab-delimited fields.** Sessions, windows, panes,
-  clients, and buffers are read from `\t`-separated `-F` format strings. A field
-  value containing a literal tab (rare, but possible in a pane title or path) can
-  shift the remaining fields and produce a malformed or skipped row. This is a
-  known limitation; titles/paths with embedded tabs are not supported.
-- **`paste-text` newline-holding depends on the receiving program.** Content is
-  wrapped in bracketed-paste markers (`ESC[200~`/`ESC[201~`), but holding embedded
-  newlines (instead of submitting line by line) only works when the program at the
-  pane understands those markers — zsh, bash ≥ 5.1, and most modern REPLs/editors.
-  Programs without bracketed-paste support — notably **bash 3.2, the default
-  `/bin/bash` on macOS** — ignore the markers, so each embedded newline acts as
-  Enter and a multi-line paste executes one line at a time. Use zsh (the macOS
-  login-shell default since Catalina) or a newer bash for the target pane when
-  multi-line input must stay un-submitted.
+- Paste buffers and retained command output live in memory. `paste-text`, `set-buffer`, `append-buffer`, and large retained command outputs can consume host memory. Tracked output is line-capped by `capture_max_lines`, but retained strings and individual line length are not byte-capped.
+- Buffer search streams large buffers through a temp file after `search.streaming_threshold_bytes`, but tmux buffers themselves are not evicted by size.
+- tmux rows are parsed from tab-delimited `-F` output. A literal tab inside a pane title, path, or similar field can shift later fields and produce malformed or skipped rows.
+- `paste-text` uses bracketed paste markers. Shells and programs that do not support bracketed paste may treat embedded newlines as Enter. On macOS, the default `/bin/bash` 3.2 does not support modern bracketed paste behavior; zsh or a newer bash is safer for multi-line input that should not submit line by line.
+- `save-buffer` writes to the server filesystem, and `load-buffer` reads from it. Both are governed by `allow_capture` and `[security.tools]`.
+- Command results are socket-bound. `get-command-result` must use the same effective socket as the original `execute-command` call.
+- End-to-end SSH behavior is manually verified because CI does not provide a remote host.
+
+## Source anchors
+
+- CLI parsing and startup behavior: [src/main.rs](src/main.rs)
+- MCP tools, resources, and server instructions: [src/server.rs](src/server.rs)
+- Security policy and tool groups: [src/security.rs](src/security.rs)
+- Command tracking: [src/commands.rs](src/commands.rs)
+- tmux socket, SSH, and process wrapper behavior: [src/tmux.rs](src/tmux.rs)
+- Public data types: [src/types.rs](src/types.rs)
+- CLI tests: [tests/cli.rs](tests/cli.rs)
+- Integration workflows: [tests/integration.rs](tests/integration.rs)
+- Buffer search tests: [tests/search.rs](tests/search.rs)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE).
