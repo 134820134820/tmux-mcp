@@ -20,6 +20,7 @@ pub enum ToolFilterMode {
 
 /// Runtime tool-surface filtering configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ToolFilter {
     #[serde(default)]
     pub mode: ToolFilterMode,
@@ -385,6 +386,7 @@ pub enum CommandFilterMode {
 
 /// Shell configuration loaded from config.toml.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ShellConfig {
     #[serde(rename = "type")]
     pub shell_type: Option<String>,
@@ -392,6 +394,7 @@ pub struct ShellConfig {
 
 /// SSH configuration loaded from config.toml.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SshConfig {
     #[serde(default)]
     pub remote: Option<String>,
@@ -399,6 +402,7 @@ pub struct SshConfig {
 
 /// Search configuration loaded from config.toml.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchConfig {
     #[serde(default = "default_streaming_threshold_bytes")]
     pub streaming_threshold_bytes: u64,
@@ -418,6 +422,7 @@ impl Default for SearchConfig {
 
 /// Regex-based command filtering configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CommandFilter {
     #[serde(default)]
     pub mode: CommandFilterMode,
@@ -427,6 +432,7 @@ pub struct CommandFilter {
 
 /// Security policy configuration loaded from config.toml.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -491,6 +497,7 @@ impl Default for SecurityConfig {
 
 /// Root configuration file schema for config.toml.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     #[serde(default)]
     pub shell: ShellConfig,
@@ -597,7 +604,8 @@ impl SecurityPolicy {
             "capture-pane" | "show-buffer" | "save-buffer" | "load-buffer" | "delete-buffer"
             | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
             | "subsearch-buffer" => self.config.allow_capture,
-            "list-sessions"
+            "socket-for-path"
+            | "list-sessions"
             | "list-windows"
             | "list-panes"
             | "find-session"
@@ -672,6 +680,8 @@ impl SecurityPolicy {
             return Ok(());
         }
 
+        reject_unsupported_shell_filter_syntax(command)?;
+
         let mut statements = Vec::new();
         collect_shell_statements(command, &mut statements);
 
@@ -712,6 +722,15 @@ impl SecurityPolicy {
 
     /// Validate a session id against the allowed sessions list.
     pub fn check_session(&self, session: &str) -> Result<()> {
+        self.check_session_identity(session, None)
+    }
+
+    /// Validate a session id/name pair against the allowed sessions list.
+    pub fn check_session_identity(
+        &self,
+        session_id: &str,
+        session_name: Option<&str>,
+    ) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
@@ -719,11 +738,18 @@ impl SecurityPolicy {
         match &self.config.allowed_sessions {
             None => Ok(()),
             Some(allowed) => {
-                if allowed.iter().any(|s| s == session) {
+                if allowed
+                    .iter()
+                    .any(|s| s == session_id || session_name.is_some_and(|name| s == name))
+                {
                     Ok(())
                 } else {
+                    let target = match session_name {
+                        Some(name) => format!("session '{session_id}' (name '{name}')"),
+                        None => format!("session '{session_id}'"),
+                    };
                     Err(Error::PolicyDenied {
-                        message: format!("session '{session}' is not in allowed sessions list"),
+                        message: format!("{target} is not in allowed sessions list"),
                     })
                 }
             }
@@ -769,6 +795,171 @@ impl SecurityPolicy {
     pub fn has_session_allowlist(&self) -> bool {
         self.config.allowed_sessions.is_some()
     }
+
+    /// Returns true if pane allowlist enforcement is configured.
+    pub fn has_pane_allowlist(&self) -> bool {
+        self.config.allowed_panes.is_some()
+    }
+}
+
+fn reject_unsupported_shell_filter_syntax(command: &str) -> Result<()> {
+    if has_ansi_c_quote(command) {
+        return Err(Error::PolicyDenied {
+            message: "command filter rejects ANSI-C quoted strings ($'...')".to_string(),
+        });
+    }
+
+    if has_shell_escape_in_word(command) {
+        return Err(Error::PolicyDenied {
+            message: "command filter rejects backslash escapes in command words".to_string(),
+        });
+    }
+
+    if has_unsupported_shell_grouping(command) {
+        return Err(Error::PolicyDenied {
+            message: "command filter rejects grouped shell commands".to_string(),
+        });
+    }
+
+    if has_shell_c_wrapper(command) {
+        return Err(Error::PolicyDenied {
+            message: "command filter rejects shell -c wrappers".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn has_ansi_c_quote(input: &str) -> bool {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if !in_single => {
+                i += 1;
+            }
+            '$' if !in_single && !in_double && i + 1 < chars.len() && chars[i + 1] == '\'' => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    false
+}
+
+fn has_shell_escape_in_word(input: &str) -> bool {
+    let chars: Vec<char> = input.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for c in chars {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if !in_single => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn has_unsupported_shell_grouping(input: &str) -> bool {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if !in_single => {
+                i += 2;
+                continue;
+            }
+            '(' if !in_single && !in_double => {
+                let prev = i.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
+                if !matches!(prev, Some('$' | '<' | '>')) {
+                    return true;
+                }
+            }
+            '{' if !in_single && !in_double => {
+                let prev = i.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
+                if prev
+                    .map(|ch| ch.is_whitespace() || matches!(ch, ';' | '|' | '&'))
+                    .unwrap_or(true)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    false
+}
+
+fn has_shell_c_wrapper(command: &str) -> bool {
+    let mut statements = Vec::new();
+    collect_shell_statements(command, &mut statements);
+    if statements.is_empty() {
+        statements.push(command.trim().to_string());
+    }
+
+    statements.iter().any(|statement| {
+        let Ok(args) = shell_words::split(statement) else {
+            return false;
+        };
+        let Some(shell_idx) = shell_command_index(&args) else {
+            return false;
+        };
+        args.iter()
+            .skip(shell_idx + 1)
+            .take_while(|arg| arg.starts_with('-'))
+            .any(|arg| arg.chars().skip(1).any(|ch| ch == 'c'))
+    })
+}
+
+fn shell_command_index(args: &[String]) -> Option<usize> {
+    let first = args.first()?;
+    if is_shell_command(first) {
+        return Some(0);
+    }
+
+    if command_basename(first) != "env" {
+        return None;
+    }
+
+    args.iter().enumerate().skip(1).find_map(|(idx, arg)| {
+        if arg.starts_with('-') || arg.contains('=') {
+            None
+        } else if is_shell_command(arg) {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_shell_command(command: &str) -> bool {
+    matches!(
+        command_basename(command),
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh"
+    )
+}
+
+fn command_basename(command: &str) -> &str {
+    command.rsplit('/').next().unwrap_or(command)
 }
 
 /// Append a trimmed, non-empty statement to the output list.
@@ -778,6 +969,41 @@ fn flush_statement(current: &mut String, out: &mut Vec<String>) {
         out.push(trimmed.to_string());
     }
     current.clear();
+}
+
+fn find_matching_paren(chars: &[char], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut j = start;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while j < chars.len() {
+        match chars[j] {
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '\\' if !in_single => {
+                j += 2;
+                continue;
+            }
+            '(' if !in_single && !in_double => {
+                depth += 1;
+            }
+            ')' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+
+    j
 }
 
 /// Split a command into the individual shell statements the shell would run.
@@ -847,46 +1073,20 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
             }
             '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
                 // `$(...)` command substitution: extract inner statements,
-                // tracking nested parentheses.
+                // tracking nested parentheses without letting quoted `)` close
+                // the substitution early.
                 let start = i + 2;
-                let mut depth = 1usize;
-                let mut j = start;
-                while j < chars.len() {
-                    match chars[j] {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
+                let j = find_matching_paren(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
                 collect_shell_statements(&inner, out);
                 i = j + 1;
             }
             '<' | '>' if !in_double && i + 1 < chars.len() && chars[i + 1] == '(' => {
                 // Bash/zsh process substitution: extract inner statements,
-                // tracking nested parentheses.
+                // tracking nested parentheses without letting quoted `)` close
+                // the substitution early.
                 let start = i + 2;
-                let mut depth = 1usize;
-                let mut j = start;
-                while j < chars.len() {
-                    match chars[j] {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                    j += 1;
-                }
+                let j = find_matching_paren(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
                 collect_shell_statements(&inner, out);
                 i = j + 1;

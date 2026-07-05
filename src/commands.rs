@@ -52,6 +52,7 @@ impl Drop for EnvVarGuard {
 
 /// Tracking configuration for command capture retries.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrackingConfig {
     #[serde(default = "default_capture_initial_lines")]
     pub capture_initial_lines: u32,
@@ -345,6 +346,9 @@ impl CommandTracker {
         });
 
         let max_entries = self.tracking.completed_max_entries as usize;
+        if max_entries == 0 {
+            return;
+        }
         let mut completed: Vec<(String, Instant)> = commands
             .iter()
             .filter_map(|(id, exec)| {

@@ -696,15 +696,8 @@ pub async fn delete_buffer(name: &str, socket: Option<&str>) -> Result<()> {
 /// Set a tmux buffer from raw bytes, preferring stdin load-buffer.
 pub async fn set_buffer_bytes(name: &str, content: &[u8], socket: Option<&str>) -> Result<()> {
     let load_args = ["load-buffer", "-b", name, "-"];
-    match execute_tmux_with_socket_bytes(&load_args, socket, Some(content)).await {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let content_str = String::from_utf8_lossy(content);
-            execute_tmux_with_socket(&["set-buffer", "-b", name, "--", &content_str], socket)
-                .await?;
-            Ok(())
-        }
-    }
+    execute_tmux_with_socket_bytes(&load_args, socket, Some(content)).await?;
+    Ok(())
 }
 
 /// Set a tmux buffer from UTF-8 content.
@@ -1767,8 +1760,9 @@ pub async fn window_info(window_id: &str, socket: Option<&str>) -> Result<Window
 /// Create a new tmux session.
 pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
+    let session_arg = format!("-s{name}");
     let output = execute_tmux_with_socket(
-        &["new-session", "-d", "-P", "-F", format, "-s", name],
+        &["new-session", "-d", "-P", "-F", format, &session_arg],
         socket,
     )
     .await?;
@@ -1790,6 +1784,7 @@ pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session>
 /// Create a new window in a session.
 pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -> Result<Window> {
     let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}";
+    let name_arg = format!("-n{name}");
     let output = execute_tmux_with_socket(
         &[
             "new-window",
@@ -1798,8 +1793,7 @@ pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -
             format,
             "-t",
             session_id,
-            "-n",
-            name,
+            &name_arg,
         ],
         socket,
     )
