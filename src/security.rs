@@ -655,26 +655,34 @@ impl SecurityPolicy {
         }
     }
 
-    /// Validate command text against allow/deny patterns, line by line.
+    /// Validate command text against allow/deny patterns.
+    ///
+    /// The executed command is interpolated unquoted into a shell line, so the
+    /// shell would run every statement separated by `;`, `|`, `&` (and inside
+    /// command substitutions `$(...)`/`` `...` ``). Validating the raw line as a
+    /// single regex match would let an allowed prefix smuggle extra statements
+    /// past the filter, so split the command into the statements the shell would
+    /// actually execute and check each one.
     pub fn check_command(&self, command: &str) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
 
-        let mut checked_any = false;
-        for line in command
-            .split(['\n', '\r'])
-            .filter(|line| !line.trim().is_empty())
-        {
-            checked_any = true;
-            self.check_command_line(line)?;
+        if matches!(self.config.command_filter.mode, CommandFilterMode::Off) {
+            return Ok(());
         }
 
-        if checked_any {
-            Ok(())
-        } else {
-            self.check_command_line(command)
+        let mut statements = Vec::new();
+        collect_shell_statements(command, &mut statements);
+
+        if statements.is_empty() {
+            return self.check_command_line(command.trim());
         }
+
+        for statement in &statements {
+            self.check_command_line(statement)?;
+        }
+        Ok(())
     }
 
     /// Validate a socket path against the allowed sockets list.
@@ -761,6 +769,115 @@ impl SecurityPolicy {
     pub fn has_session_allowlist(&self) -> bool {
         self.config.allowed_sessions.is_some()
     }
+}
+
+/// Append a trimmed, non-empty statement to the output list.
+fn flush_statement(current: &mut String, out: &mut Vec<String>) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        out.push(trimmed.to_string());
+    }
+    current.clear();
+}
+
+/// Split a command into the individual shell statements the shell would run.
+///
+/// Statements are separated on unquoted `;`, `|`, `&`, and newlines. Single
+/// quotes are treated as literal (no splitting or substitution inside them).
+/// Inside double quotes, separators do not split but command substitutions are
+/// still active. Command substitutions `$(...)` and backtick `` `...` `` are
+/// recursively extracted so the commands they run are checked too.
+fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            current.push(c);
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '\'' => {
+                in_single = true;
+                current.push(c);
+                i += 1;
+            }
+            '"' => {
+                in_double = !in_double;
+                current.push(c);
+                i += 1;
+            }
+            '\\' => {
+                // Preserve an escaped character verbatim so `\;` etc. are not
+                // mistaken for statement separators.
+                current.push(c);
+                if i + 1 < chars.len() {
+                    current.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '`' => {
+                // Backtick command substitution: extract inner statements.
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '`' {
+                    if chars[j] == '\\' {
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                collect_shell_statements(&inner, out);
+                i = j + 1;
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                // `$(...)` command substitution: extract inner statements,
+                // tracking nested parentheses.
+                let start = i + 2;
+                let mut depth = 1usize;
+                let mut j = start;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                collect_shell_statements(&inner, out);
+                i = j + 1;
+            }
+            ';' | '|' | '&' | '\n' | '\r' if !in_double => {
+                flush_statement(&mut current, out);
+                i += 1;
+            }
+            _ => {
+                current.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    flush_statement(&mut current, out);
 }
 
 #[cfg(test)]
@@ -859,6 +976,67 @@ mod tests {
 
         assert!(policy.check_command("echo ok\nprintf done").is_ok());
         assert!(policy.check_command("echo ok\nrm -rf /").is_err());
+    }
+
+    #[test]
+    fn test_command_filter_blocks_chained_statements() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        // Semicolon, pipe, and ampersand chaining must not smuggle past the filter.
+        assert!(policy.check_command("true; rm -rf /").is_err());
+        assert!(policy.check_command("true | rm -rf /").is_err());
+        assert!(policy.check_command("true && rm -rf /").is_err());
+        assert!(policy.check_command("true & rm -rf /").is_err());
+        // Command substitution must also be screened.
+        assert!(policy.check_command("echo $(rm -rf /)").is_err());
+        assert!(policy.check_command("echo `rm -rf /`").is_err());
+        // Plain allowed command still passes.
+        assert!(policy.check_command("true; echo ok").is_ok());
+    }
+
+    #[test]
+    fn test_command_allowlist_blocks_chained_statements() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^git ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_command("git status").is_ok());
+        assert!(policy.check_command("git status; git log").is_ok());
+        // A disallowed statement chained after an allowed prefix is rejected.
+        assert!(policy.check_command("git status; rm -rf /").is_err());
+        assert!(policy.check_command("git status && curl evil").is_err());
+    }
+
+    #[test]
+    fn test_command_filter_respects_single_quotes() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        // Inside single quotes the shell does not split or substitute, so the
+        // literal text is not a separate statement.
+        assert!(policy.check_command("echo 'true; rm -rf /'").is_ok());
+        assert!(policy.check_command("echo '$(rm -rf /)'").is_ok());
     }
 
     #[test]
