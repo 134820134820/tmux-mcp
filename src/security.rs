@@ -786,7 +786,9 @@ fn flush_statement(current: &mut String, out: &mut Vec<String>) {
 /// quotes are treated as literal (no splitting or substitution inside them).
 /// Inside double quotes, separators do not split but command substitutions are
 /// still active. Command substitutions `$(...)` and backtick `` `...` `` are
-/// recursively extracted so the commands they run are checked too.
+/// recursively extracted so the commands they run are checked too. Bash/zsh
+/// process substitutions `<(...)`/`>(...)` are recursively extracted only when
+/// unquoted.
 fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -845,6 +847,29 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
             }
             '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
                 // `$(...)` command substitution: extract inner statements,
+                // tracking nested parentheses.
+                let start = i + 2;
+                let mut depth = 1usize;
+                let mut j = start;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                collect_shell_statements(&inner, out);
+                i = j + 1;
+            }
+            '<' | '>' if !in_double && i + 1 < chars.len() && chars[i + 1] == '(' => {
+                // Bash/zsh process substitution: extract inner statements,
                 // tracking nested parentheses.
                 let start = i + 2;
                 let mut depth = 1usize;
@@ -1000,6 +1025,37 @@ mod tests {
         assert!(policy.check_command("echo `rm -rf /`").is_err());
         // Plain allowed command still passes.
         assert!(policy.check_command("true; echo ok").is_ok());
+    }
+
+    #[test]
+    fn test_command_filter_blocks_process_substitution_statements() {
+        let deny_config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let deny_policy = SecurityPolicy::from_config(deny_config).expect("compile policy");
+
+        assert!(deny_policy.check_command("cat <(rm -rf /)").is_err());
+        assert!(deny_policy.check_command("cat >(rm -rf /)").is_err());
+        assert!(deny_policy.check_command("cat <(printf ok)").is_ok());
+        assert!(deny_policy.check_command("echo \"<(rm -rf /)\"").is_ok());
+
+        let allow_config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^cat".to_string(), "^printf ".to_string()],
+            },
+            ..Default::default()
+        };
+        let allow_policy = SecurityPolicy::from_config(allow_config).expect("compile policy");
+
+        assert!(allow_policy.check_command("cat <(printf ok)").is_ok());
+        assert!(allow_policy.check_command("cat <(rm -rf /)").is_err());
     }
 
     #[test]
