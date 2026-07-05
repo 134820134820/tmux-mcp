@@ -2249,10 +2249,8 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         let literal = input.0.literal.unwrap_or(false);
-        if !literal {
-            if let Err(e) = self.policy.check_command(&input.0.keys) {
-                return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
-            }
+        if let Err(e) = self.policy.check_command(&input.0.keys) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         let repeat_count = input.0.repeat.unwrap_or(1).max(1);
         for _ in 0..repeat_count {
@@ -4801,6 +4799,54 @@ mod tests {
             .await
             .expect("send keys");
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn send_keys_literal_command_denied() {
+        let server = server_with_policy(
+            "[security]\ncommand_filter = { mode = \"denylist\", patterns = [\"rm -rf\"] }\n",
+        );
+
+        let result = server
+            .send_keys(Parameters(SendKeysInput {
+                pane_id: "%1".into(),
+                keys: "rm -rf /important".into(),
+                literal: Some(true),
+                enter: Some(true),
+                repeat: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("send keys");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("in the denylist"));
+    }
+
+    #[cfg(feature = "interactive")]
+    #[tokio::test]
+    async fn send_keys_literal_command_allowed_when_filter_passes() {
+        let _stub = TmuxStub::new();
+        let server = server_with_policy(
+            "[security]\ncommand_filter = { mode = \"denylist\", patterns = [\"rm -rf\"] }\n",
+        );
+
+        let result = server
+            .send_keys(Parameters(SendKeysInput {
+                pane_id: "%1".into(),
+                keys: "printf ok".into(),
+                literal: Some(true),
+                enter: Some(true),
+                repeat: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("send keys");
+
+        assert_eq!(result.is_error, Some(false));
     }
 
     #[cfg(feature = "interactive")]
