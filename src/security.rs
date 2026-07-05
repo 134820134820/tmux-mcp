@@ -809,7 +809,7 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
         }
 
         match c {
-            '\'' => {
+            '\'' if !in_double => {
                 in_single = true;
                 current.push(c);
                 i += 1;
@@ -1093,6 +1093,35 @@ mod tests {
         // literal text is not a separate statement.
         assert!(policy.check_command("echo 'true; rm -rf /'").is_ok());
         assert!(policy.check_command("echo '$(rm -rf /)'").is_ok());
+    }
+
+    #[test]
+    fn test_command_filter_treats_single_quote_inside_double_quotes_as_literal() {
+        let deny_config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let deny_policy = SecurityPolicy::from_config(deny_config).expect("compile policy");
+
+        assert!(deny_policy.check_command("echo \"'\"; rm -rf /").is_err());
+        assert!(deny_policy.check_command("echo \"'\"; printf ok").is_ok());
+
+        let allow_config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^echo ".to_string(), "^printf ".to_string()],
+            },
+            ..Default::default()
+        };
+        let allow_policy = SecurityPolicy::from_config(allow_config).expect("compile policy");
+
+        assert!(allow_policy.check_command("echo \"'\"; printf ok").is_ok());
+        assert!(allow_policy.check_command("echo \"'\"; rm -rf /").is_err());
     }
 
     #[test]
