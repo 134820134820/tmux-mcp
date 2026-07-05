@@ -714,6 +714,22 @@ impl TmuxMcpServer {
         self.policy.check_session(&session_id)
     }
 
+    async fn enforce_current_session_for_pane(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+    ) -> Result<(), crate::errors::Error> {
+        if !self.policy.has_session_allowlist() {
+            return Ok(());
+        }
+        let info = tmux::pane_info(pane_id, socket).await.map_err(|_| {
+            crate::errors::Error::PolicyDenied {
+                message: format!("unable to resolve session for pane '{pane_id}'"),
+            }
+        })?;
+        self.policy.check_session(&info.session_id)
+    }
+
     async fn enforce_session_for_window(
         &self,
         window_id: &str,
@@ -1617,6 +1633,14 @@ impl TmuxMcpServer {
                 _ => {}
             }
             if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Access denied: {e}"
+                ))]));
+            }
+            if let Err(e) = self
+                .enforce_current_session_for_pane(&cmd.pane_id, socket.as_deref())
+                .await
+            {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Access denied: {e}"
                 ))]));
@@ -3259,6 +3283,17 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         });
                     }
                     if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
+                        return Ok(read_resource_result! {
+                            contents: vec![ResourceContents::text(
+                                format!("Access denied: {e}"),
+                                uri,
+                            )],
+                        });
+                    }
+                    if let Err(e) = self
+                        .enforce_current_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
+                        .await
+                    {
                         return Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
                                 format!("Access denied: {e}"),
@@ -5722,6 +5757,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_command_result_denied_for_unlisted_session() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%2\"]\n");
+
+        let command_id = server
+            .tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        let result = server
+            .get_command_result(Parameters(GetCommandResultInput {
+                command_id,
+                socket: None,
+            }))
+            .await
+            .expect("get command result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("session '%1' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
+    async fn get_command_result_denies_session_changed_after_execute() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .execute_command(Parameters(ExecuteCommandInput {
+                pane_id: "%1".into(),
+                command: "echo hi".into(),
+                raw_mode: None,
+                no_enter: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("execute command");
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_id = payload["commandId"].as_str().unwrap();
+
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%2\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+
+        let result = server
+            .get_command_result(Parameters(GetCommandResultInput {
+                command_id: command_id.to_string(),
+                socket: None,
+            }))
+            .await
+            .expect("get command result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("session '%2' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
     async fn read_resource_pane_denied_by_capture_policy() {
         let _stub = TmuxStub::new();
         let server = server_with_policy("[security]\nallow_capture = false\n");
@@ -5761,6 +5863,77 @@ mod tests {
             .expect("read resource");
         let text = first_text_resource(&result.contents);
         assert!(text.contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn read_resource_command_denied_for_unlisted_session() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%2\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+
+        let command_id = server
+            .tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        let request = read_resource_request! {
+            uri: format!("tmux://command/{command_id}/result"),
+            meta: None,
+        };
+        let result = server
+            .read_resource(request, context)
+            .await
+            .expect("read resource");
+        let text = first_text_resource(&result.contents);
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("session '%1' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
+    async fn read_resource_command_denies_session_changed_after_execute() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+
+        let result = server
+            .execute_command(Parameters(ExecuteCommandInput {
+                pane_id: "%1".into(),
+                command: "echo hi".into(),
+                raw_mode: None,
+                no_enter: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("execute command");
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_id = payload["commandId"].as_str().unwrap();
+
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%2\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+
+        let request = read_resource_request! {
+            uri: format!("tmux://command/{command_id}/result"),
+            meta: None,
+        };
+        let result = server
+            .read_resource(request, context)
+            .await
+            .expect("read resource");
+        let text = first_text_resource(&result.contents);
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("session '%2' is not in allowed sessions list"));
     }
 
     #[tokio::test]
