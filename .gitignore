@@ -10,3 +10,6 @@ tests/fixtures/old-man-and-the-sea.txt
 # Added by cargo
 /target
 bin/*/
+.frigg
+.devana
+.orchid
