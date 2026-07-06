@@ -129,7 +129,7 @@ fn get_ssh_args() -> Result<Option<Vec<String>>> {
     }
 }
 
-fn ssh_enabled() -> Result<bool> {
+pub fn ssh_enabled() -> Result<bool> {
     Ok(get_ssh_args()?.is_some())
 }
 
@@ -161,6 +161,14 @@ fn quote_remote_arg(arg: &str) -> String {
 fn build_remote_tmux_command(socket_args: &[String], args: &[&str]) -> String {
     std::iter::once("tmux")
         .chain(socket_args.iter().map(String::as_str))
+        .chain(args.iter().copied())
+        .map(quote_remote_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn build_remote_command(program: &str, args: &[&str]) -> String {
+    std::iter::once(program)
         .chain(args.iter().copied())
         .map(quote_remote_arg)
         .collect::<Vec<_>>()
@@ -334,6 +342,31 @@ pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Re
 /// Execute a tmux command using the default socket (if configured).
 pub async fn execute_tmux(args: &[&str]) -> Result<String> {
     execute_tmux_with_socket(args, None).await
+}
+
+pub async fn canonicalize_remote_path(path: &str) -> Result<String> {
+    let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
+        message: "remote path canonicalization requires TMUX_MCP_SSH".to_string(),
+    })?;
+    ssh_args.push(build_remote_command("realpath", &["--", path]));
+
+    let output = Command::new("ssh")
+        .args(&ssh_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to spawn ssh for remote path validation: {e}"),
+        })?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(Error::Tmux {
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
 }
 
 /// Check if the tmux server is running.
@@ -2635,6 +2668,21 @@ mod tests {
             .expect("socket test over ssh");
 
         assert_eq!(output, socket);
+    }
+
+    #[tokio::test]
+    async fn canonicalize_remote_path_uses_ssh_host() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let fixture = temp_dir.path().join("fixture.txt");
+        fs::write(&fixture, "fixture").expect("write fixture");
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+
+        let output = canonicalize_remote_path(fixture.to_string_lossy().as_ref())
+            .await
+            .expect("canonicalize remote path");
+
+        assert_eq!(output, fixture.canonicalize().unwrap().to_string_lossy());
     }
 
     #[tokio::test]

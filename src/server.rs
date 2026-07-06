@@ -1128,10 +1128,52 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        if let Err(e) = self.policy.check_buffer_path(&input.0.path) {
-            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
-        }
-        match tmux::load_buffer(&input.0.name, &input.0.path, socket.as_deref()).await {
+        let load_path = match tmux::ssh_enabled() {
+            Ok(true) => {
+                let remote_candidate = match self.policy.remote_buffer_path_candidate(&input.0.path)
+                {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]))
+                    }
+                };
+                let canonical_path = match tmux::canonicalize_remote_path(&remote_candidate).await {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "remote buffer path '{remote_candidate}' is not accessible: {e}"
+                        ))]));
+                    }
+                };
+                let mut canonical_allowed_dirs = Vec::new();
+                for dir in self.policy.remote_buffer_allowlist_candidates() {
+                    match tmux::canonicalize_remote_path(&dir).await {
+                        Ok(path) => canonical_allowed_dirs.push(path),
+                        Err(e) => {
+                            return Ok(CallToolResult::error(vec![Content::text(format!(
+                                "remote allowed buffer path '{dir}' is not accessible: {e}"
+                            ))]));
+                        }
+                    }
+                }
+                match self.policy.resolve_remote_buffer_path(
+                    &input.0.path,
+                    &canonical_path,
+                    &canonical_allowed_dirs,
+                ) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]))
+                    }
+                }
+            }
+            Ok(false) => match self.policy.resolve_local_buffer_path(&input.0.path) {
+                Ok(path) => path,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+            },
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        match tmux::load_buffer(&input.0.name, &load_path, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Buffer {} loaded from {}",
                 input.0.name, input.0.path
@@ -3653,9 +3695,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_buffer_rejects_absolute_path_by_default_policy() {
-        let server = server_with_policy(
-            "[security]\nallow_capture = true\nallowed_sessions = [\"%1\"]\n",
-        );
+        let server =
+            server_with_policy("[security]\nallow_capture = true\nallowed_sessions = [\"%1\"]\n");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
