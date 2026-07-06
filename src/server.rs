@@ -3092,7 +3092,6 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         // Add command result resources
         if self.policy.check_tool("get-command-result").is_ok() {
             for id in self.tracker.get_active_ids().await {
-                let _ = self.tracker.check_status(&id, None).await;
                 if let Some(cmd) = self.tracker.get_command(&id).await {
                     // Skip commands for panes not allowed by policy
                     if self.policy.check_pane(&cmd.pane_id).is_err() {
@@ -5338,6 +5337,43 @@ mod tests {
             .map(|res| res.name.clone())
             .unwrap_or_default();
         assert!(command_name.contains("..."));
+    }
+
+    #[tokio::test]
+    async fn list_resources_does_not_poll_command_status() {
+        let mut stub = TmuxStub::new();
+        let capture_count = NamedTempFile::new().expect("capture count file");
+        stub.set_var("TMUX_STUB_CAPTURE_COUNT_FILE", capture_count.path());
+
+        let server = server_default();
+        let command_id = server
+            .tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+        let (context, _client_transport, _running) = context_for_server(&server);
+
+        let result = server
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+
+        assert!(result
+            .resources
+            .iter()
+            .any(|res| res.uri == format!("tmux://command/{command_id}/result")));
+        let capture_count = std::fs::read_to_string(capture_count.path()).unwrap_or_default();
+        assert!(
+            capture_count.is_empty(),
+            "list_resources must not call capture-pane"
+        );
+        let command = server
+            .tracker
+            .get_command(&command_id)
+            .await
+            .expect("stored command");
+        assert!(matches!(command.status, CommandStatus::Pending));
+        assert!(command.output.is_none());
     }
 
     #[tokio::test]
