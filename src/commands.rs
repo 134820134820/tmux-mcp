@@ -157,7 +157,7 @@ impl CommandTracker {
         } else {
             let end_marker = get_end_marker(&self.shell_type, &command_id);
             let start_marker = get_start_marker(&command_id);
-            let wrapped = format!("echo \"{start_marker}\"; {command}; echo \"{end_marker}\"");
+            let wrapped = wrap_tracked_command(command, &start_marker, &end_marker);
             (wrapped, false)
         };
 
@@ -398,6 +398,14 @@ pub fn get_end_marker(shell: &ShellType, command_id: &str) -> String {
     }
 }
 
+/// Wrap a tracked command with START/DONE markers.
+///
+/// A space precedes the DONE separator so a trailing backslash in `command`
+/// cannot escape the semicolon (`\ ;` → escaped space + statement break).
+fn wrap_tracked_command(command: &str, start_marker: &str, end_marker: &str) -> String {
+    format!("echo \"{start_marker}\"; {command} ; echo \"{end_marker}\"")
+}
+
 /// Parse captured output to extract command output and exit code.
 ///
 /// The DONE marker is authoritative for completion; START only delimits where
@@ -527,6 +535,65 @@ mod tests {
         assert_eq!(START_MARKER_PREFIX, "TMUX_MCP_START_");
         assert_eq!(END_MARKER_PREFIX, "TMUX_MCP_DONE_");
         assert_eq!(get_start_marker("cmd-1"), "TMUX_MCP_START_cmd-1");
+    }
+
+    #[rstest]
+    #[case("grep foo", "echo \"TMUX_MCP_START_cmd-1\"; grep foo ; echo \"TMUX_MCP_DONE_cmd-1_$?\"")]
+    #[case("true", "echo \"TMUX_MCP_START_cmd-1\"; true ; echo \"TMUX_MCP_DONE_cmd-1_$?\"")]
+    #[case(
+        r"grep foo\",
+        r#"echo "TMUX_MCP_START_cmd-1"; grep foo\ ; echo "TMUX_MCP_DONE_cmd-1_$?""#
+    )]
+    #[case(
+        r"grep foo\\",
+        r#"echo "TMUX_MCP_START_cmd-1"; grep foo\\ ; echo "TMUX_MCP_DONE_cmd-1_$?""#
+    )]
+    fn test_wrap_tracked_command_preserves_done_boundary(
+        #[case] command: &str,
+        #[case] expected: &str,
+    ) {
+        let wrapped = wrap_tracked_command(
+            command,
+            &get_start_marker("cmd-1"),
+            &get_end_marker(&ShellType::Bash, "cmd-1"),
+        );
+        assert_eq!(wrapped, expected);
+        assert!(
+            wrapped.contains(" ; echo \""),
+            "DONE separator must be preceded by a space: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains(r"\; echo"),
+            "trailing backslash must not escape DONE separator: {wrapped}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_trailing_backslash_wraps_with_unescapable_done_boundary() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", r"grep foo\", false, false, None, None)
+            .await
+            .expect("execute command with trailing backslash");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains(r"grep foo\ ; echo"),
+            "send-keys payload must guard DONE with space before semicolon, got: {log}"
+        );
+        assert!(
+            !log.contains(r"grep foo\; echo"),
+            "trailing backslash must not escape DONE separator, got: {log}"
+        );
     }
 
     #[rstest]
