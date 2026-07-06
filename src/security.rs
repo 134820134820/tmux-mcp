@@ -1130,12 +1130,6 @@ fn reject_unsupported_shell_filter_syntax(command: &str) -> Result<()> {
         });
     }
 
-    if has_unsupported_shell_grouping(command) {
-        return Err(Error::PolicyDenied {
-            message: "command filter rejects grouped shell commands".to_string(),
-        });
-    }
-
     if has_shell_c_wrapper(command) {
         return Err(Error::PolicyDenied {
             message: "command filter rejects shell -c wrappers".to_string(),
@@ -1181,44 +1175,6 @@ fn has_shell_escape_in_word(input: &str) -> bool {
             '\\' if !in_single => return true,
             _ => {}
         }
-    }
-
-    false
-}
-
-fn has_unsupported_shell_grouping(input: &str) -> bool {
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '\\' if !in_single => {
-                i += 2;
-                continue;
-            }
-            '(' if !in_single && !in_double => {
-                let prev = i.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
-                if !matches!(prev, Some('$' | '<' | '>')) {
-                    return true;
-                }
-            }
-            '{' if !in_single && !in_double => {
-                let prev = i.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
-                if prev
-                    .map(|ch| ch.is_whitespace() || matches!(ch, ';' | '|' | '&'))
-                    .unwrap_or(true)
-                {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
     }
 
     false
@@ -1321,6 +1277,41 @@ fn find_matching_paren(chars: &[char], start: usize) -> usize {
     j
 }
 
+fn find_matching_brace(chars: &[char], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut j = start;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while j < chars.len() {
+        match chars[j] {
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '\\' if !in_single => {
+                j += 2;
+                continue;
+            }
+            '{' if !in_single && !in_double => {
+                depth += 1;
+            }
+            '}' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+
+    j
+}
+
 /// Split a command into the individual shell statements the shell would run.
 ///
 /// Statements are separated on unquoted `;`, `|`, `&`, and newlines. Single
@@ -1329,7 +1320,8 @@ fn find_matching_paren(chars: &[char], start: usize) -> usize {
 /// still active. Command substitutions `$(...)` and backtick `` `...` `` are
 /// recursively extracted so the commands they run are checked too. Bash/zsh
 /// process substitutions `<(...)`/`>(...)` are recursively extracted only when
-/// unquoted.
+/// unquoted. POSIX subshells `( ... )` and brace groups `{ ... ; }` are also
+/// recursively extracted when unquoted.
 fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -1402,6 +1394,24 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 // the substitution early.
                 let start = i + 2;
                 let j = find_matching_paren(&chars, start);
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                collect_shell_statements(&inner, out);
+                i = j + 1;
+            }
+            '(' if !in_double => {
+                // POSIX subshell: extract inner statements, tracking nested
+                // parentheses without letting quoted `)` close the group early.
+                let start = i + 1;
+                let j = find_matching_paren(&chars, start);
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                collect_shell_statements(&inner, out);
+                i = j + 1;
+            }
+            '{' if !in_double => {
+                // Brace group: extract inner statements, tracking nested braces
+                // without letting quoted `}` close the group early.
+                let start = i + 1;
+                let j = find_matching_brace(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
                 collect_shell_statements(&inner, out);
                 i = j + 1;
@@ -1540,6 +1550,45 @@ mod tests {
         assert!(policy.check_command("echo `rm -rf /`").is_err());
         // Plain allowed command still passes.
         assert!(policy.check_command("true; echo ok").is_ok());
+        // Subshell and brace groups must also be screened.
+        assert!(policy.check_command("(rm -rf /)").is_err());
+        assert!(policy.check_command("{ rm -rf /; }").is_err());
+        assert!(policy.check_command("true; (rm -rf /)").is_err());
+    }
+
+    #[test]
+    fn test_command_filter_blocks_subshell_and_brace_group_statements() {
+        let deny_config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let deny_policy = SecurityPolicy::from_config(deny_config).expect("compile policy");
+
+        assert!(deny_policy.check_command("(rm -rf /)").is_err());
+        assert!(deny_policy.check_command("( rm -rf / )").is_err());
+        assert!(deny_policy.check_command("{ rm -rf /; }").is_err());
+        assert!(deny_policy.check_command("true; (rm -rf /)").is_err());
+        assert!(deny_policy.check_command("echo ok; { rm -rf /; }").is_err());
+        assert!(deny_policy.check_command("echo \"(rm -rf /)\"").is_ok());
+        assert!(deny_policy.check_command("echo '{ rm -rf /; }'").is_ok());
+        assert!(deny_policy.check_command("(echo ok)").is_ok());
+
+        let allow_config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^echo ".to_string()],
+            },
+            ..Default::default()
+        };
+        let allow_policy = SecurityPolicy::from_config(allow_config).expect("compile policy");
+
+        assert!(allow_policy.check_command("(echo ok)").is_ok());
+        assert!(allow_policy.check_command("(rm -rf /)").is_err());
     }
 
     #[test]
