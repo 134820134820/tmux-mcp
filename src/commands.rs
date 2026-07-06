@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::errors::Result;
+use crate::errors::{Error, Result};
 use crate::tmux;
 use crate::types::{CommandExecution, CommandStatus, ShellType};
 
@@ -144,6 +144,13 @@ impl CommandTracker {
     ) -> Result<String> {
         let command_id = Uuid::new_v4().to_string();
         let resolved_socket = tmux::resolve_socket(socket.as_deref());
+
+        if !raw_mode && !no_enter && command.contains(['\n', '\r']) {
+            return Err(Error::InvalidArgument {
+                message: "tracked commands cannot contain embedded newlines (\\n or \\r)"
+                    .to_string(),
+            });
+        }
 
         let (wrapped_command, tracking_disabled) = if raw_mode || no_enter {
             (command.to_string(), true)
@@ -569,6 +576,102 @@ mod tests {
             Error::Tmux { message } => assert!(message.contains("stub error")),
             _ => panic!("expected tmux error"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_command_rejects_embedded_newline_in_tracked_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let err = tracker
+            .execute_command("%1", "echo a\necho b", false, false, None, None)
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidArgument { message } => {
+                assert!(message.contains("newline") || message.contains("\\n"));
+            }
+            _ => panic!("expected InvalidArgument, got {err:?}"),
+        }
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(log.is_empty(), "send_keys should not be called, got: {log}");
+    }
+
+    #[tokio::test]
+    async fn execute_command_rejects_embedded_carriage_return_in_tracked_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let err = tracker
+            .execute_command("%1", "echo a\recho b", false, false, None, None)
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidArgument { message } => {
+                assert!(message.contains("newline") || message.contains("\\r"));
+            }
+            _ => panic!("expected InvalidArgument, got {err:?}"),
+        }
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(log.is_empty(), "send_keys should not be called, got: {log}");
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_newline_in_raw_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "echo a\necho b", true, false, None, None)
+            .await
+            .expect("raw mode should allow newlines");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(!log.is_empty(), "raw mode should send keys");
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_newline_in_no_enter_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "echo a\necho b", false, true, None, None)
+            .await
+            .expect("no_enter mode should allow newlines");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(!log.is_empty(), "no_enter mode should send keys");
     }
 
     #[tokio::test]
