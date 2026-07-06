@@ -1101,7 +1101,52 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        match tmux::save_buffer(&input.0.name, &input.0.path, socket.as_deref()).await {
+        let save_path = match tmux::ssh_enabled() {
+            Ok(true) => {
+                let remote_candidate = match self.policy.remote_buffer_path_candidate(&input.0.path)
+                {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]))
+                    }
+                };
+                let canonical_path = match tmux::canonicalize_remote_path(&remote_candidate).await {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "remote buffer path '{remote_candidate}' is not accessible: {e}"
+                        ))]));
+                    }
+                };
+                let mut canonical_allowed_dirs = Vec::new();
+                for dir in self.policy.remote_buffer_allowlist_candidates() {
+                    match tmux::canonicalize_remote_path(&dir).await {
+                        Ok(path) => canonical_allowed_dirs.push(path),
+                        Err(e) => {
+                            return Ok(CallToolResult::error(vec![Content::text(format!(
+                                "remote allowed buffer path '{dir}' is not accessible: {e}"
+                            ))]));
+                        }
+                    }
+                }
+                match self.policy.resolve_remote_buffer_path(
+                    &input.0.path,
+                    &canonical_path,
+                    &canonical_allowed_dirs,
+                ) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]))
+                    }
+                }
+            }
+            Ok(false) => match self.policy.resolve_local_buffer_path(&input.0.path) {
+                Ok(path) => path,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+            },
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        match tmux::save_buffer(&input.0.name, &save_path, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Buffer {} saved to {}",
                 input.0.name, input.0.path
@@ -3542,6 +3587,12 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::io::duplex;
 
+    fn stage_default_buffer_file(name: &str, contents: &str) {
+        let dir = crate::security::default_buffer_dir();
+        std::fs::create_dir_all(&dir).expect("create default buffer dir");
+        std::fs::write(dir.join(name), contents).expect("write buffer file");
+    }
+
     fn policy_from_toml(contents: &str) -> SecurityPolicy {
         let mut file = NamedTempFile::new().expect("create temp config");
         file.write_all(contents.as_bytes()).expect("write config");
@@ -3669,11 +3720,16 @@ mod tests {
     async fn buffer_file_operations_allowed_by_capture_policy() {
         let _stub = TmuxStub::new();
         let server = server_with_policy("[security]\nallow_capture = true\n");
+        stage_default_buffer_file(
+            "old-man-and-the-sea.txt",
+            include_str!("../tests/fixtures/old-man-and-the-sea.txt"),
+        );
+        stage_default_buffer_file("buffer.txt", "");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
                 name: "buffer0".into(),
-                path: "tests/fixtures/old-man-and-the-sea.txt".into(),
+                path: "old-man-and-the-sea.txt".into(),
                 socket: None,
             }))
             .await
@@ -3684,7 +3740,7 @@ mod tests {
         let result = server
             .save_buffer(Parameters(SaveBufferInput {
                 name: "buffer0".into(),
-                path: "/tmp/buffer.txt".into(),
+                path: "buffer.txt".into(),
                 socket: None,
             }))
             .await
@@ -3730,7 +3786,7 @@ mod tests {
         let result = server
             .save_buffer(Parameters(SaveBufferInput {
                 name: "buffer0".into(),
-                path: "/tmp/buffer.txt".into(),
+                path: "buffer.txt".into(),
                 socket: None,
             }))
             .await
@@ -3740,14 +3796,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn save_buffer_rejects_absolute_path_by_default_policy() {
+        let server =
+            server_with_policy("[security]\nallow_capture = true\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .save_buffer(Parameters(SaveBufferInput {
+                name: "exfil".into(),
+                path: "/tmp/evil.sh".into(),
+                socket: None,
+            }))
+            .await
+            .expect("save buffer");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("policy denied"));
+        assert!(first_text(&result).contains("must be relative"));
+    }
+
+    #[tokio::test]
     async fn save_delete_and_detach_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
+        stage_default_buffer_file(
+            "old-man-and-the-sea.txt",
+            include_str!("../tests/fixtures/old-man-and-the-sea.txt"),
+        );
+        stage_default_buffer_file("buffer.txt", "");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
                 name: "buffer0".into(),
-                path: "tests/fixtures/old-man-and-the-sea.txt".into(),
+                path: "old-man-and-the-sea.txt".into(),
                 socket: None,
             }))
             .await
@@ -3758,7 +3838,7 @@ mod tests {
         let result = server
             .save_buffer(Parameters(SaveBufferInput {
                 name: "buffer0".into(),
-                path: "/tmp/buffer.txt".into(),
+                path: "buffer.txt".into(),
                 socket: None,
             }))
             .await
