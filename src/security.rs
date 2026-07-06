@@ -1,12 +1,13 @@
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::commands::TrackingConfig;
 use crate::errors::{Error, Result};
 
 const TOOLS_ENV_VAR: &str = "TMUX_MCP_TOOLS";
+const DEFAULT_BUFFER_DIR_NAME: &str = "tmux-mcp-buffers";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -804,10 +805,10 @@ impl SecurityPolicy {
         self.config.allowed_panes.is_some()
     }
 
-    /// Validate a buffer file path against traversal and allowlist policy.
-    pub fn check_buffer_path(&self, path: &str) -> Result<()> {
+    /// Validate a local buffer file path and return the canonical path to pass to tmux.
+    pub fn resolve_local_buffer_path(&self, path: &str) -> Result<String> {
         if !self.config.enabled {
-            return Ok(());
+            return Ok(path.to_string());
         }
 
         let path_obj = Path::new(path);
@@ -826,27 +827,102 @@ impl SecurityPolicy {
                         ),
                     });
                 }
-                Ok(())
+
+                let default_dir = default_buffer_dir();
+                let candidate = default_dir.join(path_obj);
+                canonical_buffer_path_under_dirs(path, &candidate, &[default_dir])
             }
             Some(allowed_dirs) => {
-                let canonical_path = std::fs::canonicalize(path).map_err(|e| Error::PolicyDenied {
-                    message: format!("buffer path '{path}' is not accessible: {e}"),
-                })?;
-
-                let allowed = allowed_dirs.iter().any(|dir| {
-                    path_is_under_allowed_dir(dir, &canonical_path)
-                });
-
-                if allowed {
-                    Ok(())
-                } else {
-                    Err(Error::PolicyDenied {
-                        message: format!("buffer path '{path}' is not under allowed buffer paths"),
-                    })
-                }
+                let allowed_dirs = allowed_dirs.iter().map(PathBuf::from).collect::<Vec<_>>();
+                canonical_buffer_path_under_dirs(path, path_obj, &allowed_dirs)
             }
         }
     }
+
+    /// Validate a remotely canonicalized buffer path and return the path to pass to remote tmux.
+    pub fn resolve_remote_buffer_path(
+        &self,
+        path: &str,
+        canonical_path: &str,
+        canonical_allowed_dirs: &[String],
+    ) -> Result<String> {
+        if !self.config.enabled {
+            return Ok(path.to_string());
+        }
+
+        let path_obj = Path::new(path);
+        if path_has_parent_traversal(path_obj) {
+            return Err(Error::PolicyDenied {
+                message: format!("buffer path '{path}' contains parent directory traversal ('..')"),
+            });
+        }
+
+        if self.config.allowed_buffer_paths.is_none() && path_obj.is_absolute() {
+            return Err(Error::PolicyDenied {
+                message: format!(
+                    "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
+                ),
+            });
+        }
+
+        let allowed = canonical_allowed_dirs
+            .iter()
+            .any(|dir| remote_path_is_under_allowed_dir(canonical_path, dir));
+
+        if allowed {
+            Ok(canonical_path.to_string())
+        } else {
+            Err(Error::PolicyDenied {
+                message: format!("buffer path '{path}' is not under allowed buffer paths"),
+            })
+        }
+    }
+
+    pub fn remote_buffer_allowlist_candidates(&self) -> Vec<String> {
+        match &self.config.allowed_buffer_paths {
+            Some(paths) => paths.clone(),
+            None => vec![default_remote_buffer_dir()],
+        }
+    }
+
+    pub fn remote_buffer_path_candidate(&self, path: &str) -> Result<String> {
+        if !self.config.enabled {
+            return Ok(path.to_string());
+        }
+
+        let path_obj = Path::new(path);
+        if path_has_parent_traversal(path_obj) {
+            return Err(Error::PolicyDenied {
+                message: format!("buffer path '{path}' contains parent directory traversal ('..')"),
+            });
+        }
+
+        if self.config.allowed_buffer_paths.is_some() {
+            return Ok(path.to_string());
+        }
+
+        if path_obj.is_absolute() {
+            return Err(Error::PolicyDenied {
+                message: format!(
+                    "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
+                ),
+            });
+        }
+
+        Ok(format!(
+            "{}/{}",
+            default_remote_buffer_dir().trim_end_matches('/'),
+            path
+        ))
+    }
+}
+
+pub fn default_buffer_dir() -> PathBuf {
+    std::env::temp_dir().join(DEFAULT_BUFFER_DIR_NAME)
+}
+
+pub fn default_remote_buffer_dir() -> String {
+    format!("/tmp/{DEFAULT_BUFFER_DIR_NAME}")
 }
 
 fn path_has_parent_traversal(path: &Path) -> bool {
@@ -854,14 +930,47 @@ fn path_has_parent_traversal(path: &Path) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
-fn path_is_under_allowed_dir(dir: &str, canonical_path: &Path) -> bool {
-    let dir_path = Path::new(dir);
+fn canonical_buffer_path_under_dirs<P: AsRef<Path>>(
+    original_path: &str,
+    candidate: P,
+    allowed_dirs: &[PathBuf],
+) -> Result<String> {
+    let canonical_path =
+        std::fs::canonicalize(candidate.as_ref()).map_err(|e| Error::PolicyDenied {
+            message: format!("buffer path '{original_path}' is not accessible: {e}"),
+        })?;
+
+    let allowed = allowed_dirs
+        .iter()
+        .any(|dir| path_is_under_allowed_dir(dir, &canonical_path));
+
+    if allowed {
+        Ok(canonical_path.to_string_lossy().into_owned())
+    } else {
+        Err(Error::PolicyDenied {
+            message: format!("buffer path '{original_path}' is not under allowed buffer paths"),
+        })
+    }
+}
+
+fn path_is_under_allowed_dir(dir_path: &Path, canonical_path: &Path) -> bool {
     let canonical_dir = match std::fs::canonicalize(dir_path) {
         Ok(path) => path,
         Err(_) => return false,
     };
 
     canonical_path.starts_with(&canonical_dir)
+}
+
+fn remote_path_is_under_allowed_dir(canonical_path: &str, canonical_dir: &str) -> bool {
+    if canonical_path == canonical_dir {
+        return true;
+    }
+
+    let dir = canonical_dir.trim_end_matches('/');
+    canonical_path
+        .strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn reject_unsupported_shell_filter_syntax(command: &str) -> Result<()> {
@@ -1584,7 +1693,7 @@ mod tests {
     fn test_check_buffer_path_rejects_absolute_path_by_default() {
         let policy = SecurityPolicy::default();
 
-        let err = policy.check_buffer_path("/etc/passwd").unwrap_err();
+        let err = policy.resolve_local_buffer_path("/etc/passwd").unwrap_err();
         assert!(matches!(
             err,
             Error::PolicyDenied { message } if message.contains("/etc/passwd")
@@ -1593,12 +1702,34 @@ mod tests {
     }
 
     #[test]
-    fn test_check_buffer_path_allows_relative_fixture_path() {
+    fn test_check_buffer_path_resolves_default_relative_path_under_safe_dir() {
         let policy = SecurityPolicy::default();
+        let default_dir = default_buffer_dir();
+        std::fs::create_dir_all(&default_dir).expect("create default buffer dir");
+        let fixture = default_dir.join(format!("tmux-mcp-test-{}-fixture.txt", std::process::id()));
+        std::fs::write(&fixture, "fixture").expect("write fixture");
 
-        assert!(policy
-            .check_buffer_path("tests/fixtures/old-man-and-the-sea.txt")
-            .is_ok());
+        let resolved = policy
+            .resolve_local_buffer_path(fixture.file_name().unwrap().to_string_lossy().as_ref())
+            .expect("resolve default buffer path");
+        assert_eq!(resolved, fixture.canonicalize().unwrap().to_string_lossy());
+
+        std::fs::remove_file(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn test_check_buffer_path_rejects_default_relative_path_outside_safe_dir() {
+        let dir = TempDir::new().expect("temp dir");
+        let nested = dir.path().join("etc");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        std::fs::write(nested.join("passwd"), "not real passwd").expect("write fixture");
+
+        let policy = SecurityPolicy::default();
+        let err = policy.resolve_local_buffer_path("etc/passwd").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("etc/passwd")
+        ));
     }
 
     #[test]
@@ -1606,7 +1737,7 @@ mod tests {
         let policy = SecurityPolicy::default();
 
         let err = policy
-            .check_buffer_path("tests/fixtures/../old-man-and-the-sea.txt")
+            .resolve_local_buffer_path("tests/fixtures/../old-man-and-the-sea.txt")
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1629,14 +1760,136 @@ mod tests {
         };
         let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
-        assert!(policy
-            .check_buffer_path(fixture.to_string_lossy().as_ref())
-            .is_ok());
+        let resolved = policy
+            .resolve_local_buffer_path(fixture.to_string_lossy().as_ref())
+            .expect("resolve allowed path");
+        assert_eq!(resolved, fixture.canonicalize().unwrap().to_string_lossy());
 
-        let err = policy.check_buffer_path("/etc/passwd").unwrap_err();
+        let err = policy.resolve_local_buffer_path("/etc/passwd").unwrap_err();
         assert!(matches!(
             err,
             Error::PolicyDenied { message } if message.contains("not under allowed buffer paths")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_buffer_path_rejects_allowed_symlink_escape() {
+        let dir = TempDir::new().expect("temp dir");
+        let allowed_dir = dir.path().join("allowed");
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        let outside_file = outside_dir.join("secret.txt");
+        std::fs::write(&outside_file, "secret").expect("write outside file");
+        let link = allowed_dir.join("link.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).expect("create symlink");
+
+        let config = SecurityConfig {
+            enabled: true,
+            allowed_buffer_paths: Some(vec![allowed_dir.to_string_lossy().into_owned()]),
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        let err = policy
+            .resolve_local_buffer_path(link.to_string_lossy().as_ref())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("not under allowed buffer paths")
+        ));
+    }
+
+    #[test]
+    fn test_remote_buffer_path_uses_remote_canonical_allowlist() {
+        let config = SecurityConfig {
+            enabled: true,
+            allowed_buffer_paths: Some(vec!["/remote/allowed".to_string()]),
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        let resolved = policy
+            .resolve_remote_buffer_path(
+                "/remote/allowed/file.txt",
+                "/remote/allowed/file.txt",
+                &["/remote/allowed".to_string()],
+            )
+            .expect("resolve remote path");
+        assert_eq!(resolved, "/remote/allowed/file.txt");
+    }
+
+    #[test]
+    fn test_remote_buffer_path_rejects_remote_symlink_escape() {
+        let config = SecurityConfig {
+            enabled: true,
+            allowed_buffer_paths: Some(vec!["/remote/allowed".to_string()]),
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        let err = policy
+            .resolve_remote_buffer_path(
+                "/remote/allowed/link.txt",
+                "/remote/secret.txt",
+                &["/remote/allowed".to_string()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("not under allowed buffer paths")
+        ));
+    }
+
+    #[test]
+    fn test_remote_default_buffer_path_is_anchored_to_safe_dir() {
+        let policy = SecurityPolicy::default();
+        assert_eq!(
+            policy.remote_buffer_path_candidate("fixture.txt").unwrap(),
+            "/tmp/tmux-mcp-buffers/fixture.txt"
+        );
+
+        let resolved = policy
+            .resolve_remote_buffer_path(
+                "fixture.txt",
+                "/tmp/tmux-mcp-buffers/fixture.txt",
+                &["/tmp/tmux-mcp-buffers".to_string()],
+            )
+            .expect("resolve remote default path");
+        assert_eq!(resolved, "/tmp/tmux-mcp-buffers/fixture.txt");
+
+        let err = policy
+            .resolve_remote_buffer_path(
+                "fixture.txt",
+                "/home/user/.ssh/id_rsa",
+                &["/tmp/tmux-mcp-buffers".to_string()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("not under allowed buffer paths")
+        ));
+    }
+
+    #[test]
+    fn test_remote_default_buffer_path_rejects_unsafe_input_before_canonicalization() {
+        let policy = SecurityPolicy::default();
+
+        let absolute = policy
+            .remote_buffer_path_candidate("/etc/passwd")
+            .unwrap_err();
+        assert!(matches!(
+            absolute,
+            Error::PolicyDenied { message } if message.contains("must be relative")
+        ));
+
+        let traversal = policy
+            .remote_buffer_path_candidate("../secret")
+            .unwrap_err();
+        assert!(matches!(
+            traversal,
+            Error::PolicyDenied { message } if message.contains("parent directory traversal")
         ));
     }
 
@@ -1648,6 +1901,9 @@ mod tests {
         };
         let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
-        assert!(policy.check_buffer_path("/etc/passwd").is_ok());
+        assert_eq!(
+            policy.resolve_local_buffer_path("/etc/passwd").unwrap(),
+            "/etc/passwd"
+        );
     }
 }
