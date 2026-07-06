@@ -1128,6 +1128,9 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self.policy.check_buffer_path(&input.0.path) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::load_buffer(&input.0.name, &input.0.path, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Buffer {} loaded from {}",
@@ -3646,6 +3649,26 @@ mod tests {
             .expect("save buffer");
         assert_eq!(result.is_error, Some(false));
         assert!(first_text(&result).contains("saved"));
+    }
+
+    #[tokio::test]
+    async fn load_buffer_rejects_absolute_path_by_default_policy() {
+        let server = server_with_policy(
+            "[security]\nallow_capture = true\nallowed_sessions = [\"%1\"]\n",
+        );
+
+        let result = server
+            .load_buffer(Parameters(LoadBufferInput {
+                name: "exfil".into(),
+                path: "/etc/passwd".into(),
+                socket: None,
+            }))
+            .await
+            .expect("load buffer");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("policy denied"));
+        assert!(first_text(&result).contains("must be relative"));
     }
 
     #[tokio::test]
