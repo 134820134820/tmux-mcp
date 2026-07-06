@@ -1312,6 +1312,23 @@ fn find_matching_brace(chars: &[char], start: usize) -> usize {
     j
 }
 
+fn is_shell_group_open_brace(chars: &[char], index: usize) -> bool {
+    if index > 0 && chars[index - 1] == '$' {
+        return false;
+    }
+
+    let mut j = index;
+    while j > 0 {
+        j -= 1;
+        if chars[j].is_whitespace() {
+            continue;
+        }
+        return matches!(chars[j], ';' | '|' | '&' | '(' | ')');
+    }
+
+    true
+}
+
 /// Split a command into the individual shell statements the shell would run.
 ///
 /// Statements are separated on unquoted `;`, `|`, `&`, and newlines. Single
@@ -1407,7 +1424,7 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 collect_shell_statements(&inner, out);
                 i = j + 1;
             }
-            '{' if !in_double => {
+            '{' if !in_double && is_shell_group_open_brace(&chars, i) => {
                 // Brace group: extract inner statements, tracking nested braces
                 // without letting quoted `}` close the group early.
                 let start = i + 1;
@@ -1526,6 +1543,25 @@ mod tests {
 
         assert!(policy.check_command("echo ok\nprintf done").is_ok());
         assert!(policy.check_command("echo ok\nrm -rf /").is_err());
+    }
+
+    #[test]
+    fn test_command_allowlist_preserves_parameter_expansions() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^echo ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_command("echo ${HOME}").is_ok());
+        assert!(policy.check_command("echo ${HOME:-/tmp}").is_ok());
+        assert!(policy
+            .check_command("echo ${HOME/path/replacement}")
+            .is_ok());
     }
 
     #[test]
