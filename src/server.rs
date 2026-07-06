@@ -1110,14 +1110,14 @@ impl TmuxMcpServer {
                         return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]))
                     }
                 };
-                let canonical_path = match tmux::canonicalize_remote_path(&remote_candidate).await {
-                    Ok(path) => path,
-                    Err(e) => {
+                if self.policy.uses_default_buffer_dir() {
+                    let dir = crate::security::default_remote_buffer_dir();
+                    if let Err(e) = tmux::create_remote_dir(&dir).await {
                         return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "remote buffer path '{remote_candidate}' is not accessible: {e}"
+                            "remote default buffer path '{dir}' is not accessible: {e}"
                         ))]));
                     }
-                };
+                }
                 let mut canonical_allowed_dirs = Vec::new();
                 for dir in self.policy.remote_buffer_allowlist_candidates() {
                     match tmux::canonicalize_remote_path(&dir).await {
@@ -1129,18 +1129,74 @@ impl TmuxMcpServer {
                         }
                     }
                 }
-                match self.policy.resolve_remote_buffer_path(
-                    &input.0.path,
-                    &canonical_path,
-                    &canonical_allowed_dirs,
-                ) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]))
+                match tmux::canonicalize_remote_path(&remote_candidate).await {
+                    Ok(canonical_path) => {
+                        match self.policy.resolve_remote_buffer_path(
+                            &input.0.path,
+                            &canonical_path,
+                            &canonical_allowed_dirs,
+                        ) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "{e}"
+                                ))]));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        match tmux::remote_path_is_symlink(&remote_candidate).await {
+                            Ok(true) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "remote buffer path '{remote_candidate}' is not accessible"
+                                ))]));
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "remote buffer path '{remote_candidate}' could not be validated: {e}"
+                                ))]));
+                            }
+                        }
+                        let (parent, filename) = match self
+                            .policy
+                            .remote_buffer_destination_path_candidate(&input.0.path)
+                        {
+                            Ok(parts) => parts,
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "{e}"
+                                ))]));
+                            }
+                        };
+                        let canonical_parent = match tmux::canonicalize_remote_path(&parent).await {
+                            Ok(path) => path,
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "remote buffer path parent '{parent}' is not accessible: {e}"
+                                ))]));
+                            }
+                        };
+                        match self.policy.resolve_remote_buffer_destination_path(
+                            &input.0.path,
+                            &canonical_parent,
+                            &filename,
+                            &canonical_allowed_dirs,
+                        ) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                return Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "{e}"
+                                ))]));
+                            }
+                        }
                     }
                 }
             }
-            Ok(false) => match self.policy.resolve_local_buffer_path(&input.0.path) {
+            Ok(false) => match self
+                .policy
+                .resolve_local_buffer_destination_path(&input.0.path)
+            {
                 Ok(path) => path,
                 Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
             },
@@ -3593,6 +3649,11 @@ mod tests {
         std::fs::write(dir.join(name), contents).expect("write buffer file");
     }
 
+    fn remove_default_buffer_file(name: &str) {
+        let path = crate::security::default_buffer_dir().join(name);
+        let _ = std::fs::remove_file(path);
+    }
+
     fn policy_from_toml(contents: &str) -> SecurityPolicy {
         let mut file = NamedTempFile::new().expect("create temp config");
         file.write_all(contents.as_bytes()).expect("write config");
@@ -3724,7 +3785,7 @@ mod tests {
             "old-man-and-the-sea.txt",
             include_str!("../tests/fixtures/old-man-and-the-sea.txt"),
         );
-        stage_default_buffer_file("buffer.txt", "");
+        remove_default_buffer_file("buffer.txt");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
@@ -3822,7 +3883,7 @@ mod tests {
             "old-man-and-the-sea.txt",
             include_str!("../tests/fixtures/old-man-and-the-sea.txt"),
         );
-        stage_default_buffer_file("buffer.txt", "");
+        remove_default_buffer_file("buffer.txt");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {

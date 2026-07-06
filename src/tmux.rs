@@ -369,6 +369,50 @@ pub async fn canonicalize_remote_path(path: &str) -> Result<String> {
     }
 }
 
+pub async fn remote_path_is_symlink(path: &str) -> Result<bool> {
+    let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
+        message: "remote symlink check requires TMUX_MCP_SSH".to_string(),
+    })?;
+    ssh_args.push(build_remote_command("test", &["-L", path]));
+
+    let output = Command::new("ssh")
+        .args(&ssh_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to spawn ssh for remote symlink validation: {e}"),
+        })?;
+
+    Ok(output.status.success())
+}
+
+pub async fn create_remote_dir(path: &str) -> Result<()> {
+    let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
+        message: "remote directory creation requires TMUX_MCP_SSH".to_string(),
+    })?;
+    ssh_args.push(build_remote_command("mkdir", &["-p", "--", path]));
+
+    let output = Command::new("ssh")
+        .args(&ssh_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to spawn ssh for remote directory creation: {e}"),
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Tmux {
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+}
+
 /// Check if the tmux server is running.
 pub async fn is_tmux_running() -> Result<bool> {
     match execute_tmux(&["list-sessions", "-F", "#{session_name}"]).await {
@@ -2683,6 +2727,39 @@ mod tests {
             .expect("canonicalize remote path");
 
         assert_eq!(output, fixture.canonicalize().unwrap().to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_path_is_symlink_uses_ssh_host() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let target = temp_dir.path().join("target.txt");
+        let link = temp_dir.path().join("link.txt");
+        fs::write(&target, "target").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+
+        assert!(remote_path_is_symlink(link.to_string_lossy().as_ref())
+            .await
+            .expect("check symlink"));
+        assert!(!remote_path_is_symlink(target.to_string_lossy().as_ref())
+            .await
+            .expect("check regular file"));
+    }
+
+    #[tokio::test]
+    async fn create_remote_dir_uses_ssh_host() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let nested = temp_dir.path().join("nested").join("buffer-dir");
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+
+        create_remote_dir(nested.to_string_lossy().as_ref())
+            .await
+            .expect("create remote dir");
+
+        assert!(nested.is_dir());
     }
 
     #[tokio::test]
