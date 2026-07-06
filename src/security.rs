@@ -463,6 +463,8 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_panes: Option<Vec<String>>,
     #[serde(default)]
+    pub allowed_buffer_paths: Option<Vec<String>>,
+    #[serde(default)]
     pub command_filter: CommandFilter,
     #[serde(default)]
     pub tools: ToolFilter,
@@ -489,6 +491,7 @@ impl Default for SecurityConfig {
             allowed_sockets: None,
             allowed_sessions: None,
             allowed_panes: None,
+            allowed_buffer_paths: None,
             command_filter: CommandFilter::default(),
             tools: ToolFilter::default(),
         }
@@ -800,6 +803,65 @@ impl SecurityPolicy {
     pub fn has_pane_allowlist(&self) -> bool {
         self.config.allowed_panes.is_some()
     }
+
+    /// Validate a buffer file path against traversal and allowlist policy.
+    pub fn check_buffer_path(&self, path: &str) -> Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+
+        let path_obj = Path::new(path);
+        if path_has_parent_traversal(path_obj) {
+            return Err(Error::PolicyDenied {
+                message: format!("buffer path '{path}' contains parent directory traversal ('..')"),
+            });
+        }
+
+        match &self.config.allowed_buffer_paths {
+            None => {
+                if path_obj.is_absolute() {
+                    return Err(Error::PolicyDenied {
+                        message: format!(
+                            "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Some(allowed_dirs) => {
+                let canonical_path = std::fs::canonicalize(path).map_err(|e| Error::PolicyDenied {
+                    message: format!("buffer path '{path}' is not accessible: {e}"),
+                })?;
+
+                let allowed = allowed_dirs.iter().any(|dir| {
+                    path_is_under_allowed_dir(dir, &canonical_path)
+                });
+
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(Error::PolicyDenied {
+                        message: format!("buffer path '{path}' is not under allowed buffer paths"),
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn path_has_parent_traversal(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn path_is_under_allowed_dir(dir: &str, canonical_path: &Path) -> bool {
+    let dir_path = Path::new(dir);
+    let canonical_dir = match std::fs::canonicalize(dir_path) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+
+    canonical_path.starts_with(&canonical_dir)
 }
 
 fn reject_unsupported_shell_filter_syntax(command: &str) -> Result<()> {
@@ -1516,5 +1578,76 @@ mod tests {
             err,
             Error::Config { message } if message.contains("failed to parse config file")
         ));
+    }
+
+    #[test]
+    fn test_check_buffer_path_rejects_absolute_path_by_default() {
+        let policy = SecurityPolicy::default();
+
+        let err = policy.check_buffer_path("/etc/passwd").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("/etc/passwd")
+                && message.contains("must be relative")
+        ));
+    }
+
+    #[test]
+    fn test_check_buffer_path_allows_relative_fixture_path() {
+        let policy = SecurityPolicy::default();
+
+        assert!(policy
+            .check_buffer_path("tests/fixtures/old-man-and-the-sea.txt")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_check_buffer_path_rejects_parent_traversal() {
+        let policy = SecurityPolicy::default();
+
+        let err = policy
+            .check_buffer_path("tests/fixtures/../old-man-and-the-sea.txt")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("parent directory traversal")
+        ));
+    }
+
+    #[test]
+    fn test_check_buffer_path_honors_allowed_buffer_paths() {
+        let dir = TempDir::new().expect("temp dir");
+        let allowed_dir = dir.path().join("allowed");
+        std::fs::create_dir_all(&allowed_dir).expect("create allowed dir");
+        let fixture = allowed_dir.join("fixture.txt");
+        std::fs::write(&fixture, "fixture").expect("write fixture");
+
+        let config = SecurityConfig {
+            enabled: true,
+            allowed_buffer_paths: Some(vec![allowed_dir.to_string_lossy().into_owned()]),
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy
+            .check_buffer_path(fixture.to_string_lossy().as_ref())
+            .is_ok());
+
+        let err = policy.check_buffer_path("/etc/passwd").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::PolicyDenied { message } if message.contains("not under allowed buffer paths")
+        ));
+    }
+
+    #[test]
+    fn test_disabled_security_allows_absolute_buffer_path() {
+        let config = SecurityConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_buffer_path("/etc/passwd").is_ok());
     }
 }
