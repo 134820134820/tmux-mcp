@@ -748,12 +748,12 @@ impl SecurityPolicy {
                 {
                     Ok(())
                 } else {
-                    let target = match session_name {
-                        Some(name) => format!("session '{session_id}' (name '{name}')"),
-                        None => format!("session '{session_id}'"),
-                    };
+                    let target = format!("session '{session_id}'");
+                    let detail = session_name
+                        .map(|name| format!(" (name '{name}')"))
+                        .unwrap_or_default();
                     Err(Error::PolicyDenied {
-                        message: format!("{target} is not in allowed sessions list"),
+                        message: format!("{target} is not in allowed sessions list{detail}"),
                     })
                 }
             }
@@ -1124,12 +1124,6 @@ fn reject_unsupported_shell_filter_syntax(command: &str) -> Result<()> {
         });
     }
 
-    if has_shell_escape_in_word(command) {
-        return Err(Error::PolicyDenied {
-            message: "command filter rejects backslash escapes in command words".to_string(),
-        });
-    }
-
     if has_shell_c_wrapper(command) {
         return Err(Error::PolicyDenied {
             message: "command filter rejects shell -c wrappers".to_string(),
@@ -1158,23 +1152,6 @@ fn has_ansi_c_quote(input: &str) -> bool {
             _ => {}
         }
         i += 1;
-    }
-
-    false
-}
-
-fn has_shell_escape_in_word(input: &str) -> bool {
-    let chars: Vec<char> = input.chars().collect();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    for c in chars {
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '\\' if !in_single => return true,
-            _ => {}
-        }
     }
 
     false
@@ -1331,8 +1308,8 @@ fn is_shell_group_open_brace(chars: &[char], index: usize) -> bool {
 
 /// Split a command into the individual shell statements the shell would run.
 ///
-/// Statements are separated on unquoted `;`, `|`, `&`, and newlines. Single
-/// quotes are treated as literal (no splitting or substitution inside them).
+/// Statements are separated on unquoted `;`, `|`, shell-control `&`, and
+/// newlines. Single quotes are treated as literal (no splitting or substitution inside them).
 /// Inside double quotes, separators do not split but command substitutions are
 /// still active. Command substitutions `$(...)` and backtick `` `...` `` are
 /// recursively extracted so the commands they run are checked too. Bash/zsh
@@ -1433,7 +1410,11 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 collect_shell_statements(&inner, out);
                 i = j + 1;
             }
-            ';' | '|' | '&' | '\n' | '\r' if !in_double => {
+            ';' | '|' | '\n' | '\r' if !in_double => {
+                flush_statement(&mut current, out);
+                i += 1;
+            }
+            '&' if !in_double && is_shell_control_ampersand(&chars, i) => {
                 flush_statement(&mut current, out);
                 i += 1;
             }
@@ -1445,6 +1426,13 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
     }
 
     flush_statement(&mut current, out);
+}
+
+fn is_shell_control_ampersand(chars: &[char], index: usize) -> bool {
+    let prev = index.checked_sub(1).and_then(|idx| chars.get(idx)).copied();
+    let next = chars.get(index + 1).copied();
+
+    !matches!(prev, Some('>')) && !matches!(next, Some('>'))
 }
 
 #[cfg(test)]
@@ -1675,6 +1663,42 @@ mod tests {
         // A disallowed statement chained after an allowed prefix is rejected.
         assert!(policy.check_command("git status; rm -rf /").is_err());
         assert!(policy.check_command("git status && curl evil").is_err());
+    }
+
+    #[test]
+    fn test_command_allowlist_keeps_redirection_ampersands_in_statement() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^git ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_command("git status 2>&1").is_ok());
+        assert!(policy.check_command("git status >& log.txt").is_ok());
+        assert!(policy.check_command("git status &> log.txt").is_ok());
+        assert!(policy.check_command("git status & curl evil").is_err());
+        assert!(policy.check_command("git status && curl evil").is_err());
+    }
+
+    #[test]
+    fn test_command_allowlist_allows_escaped_spaces_and_separators() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Allowlist,
+                patterns: vec!["^cd ".to_string(), "^echo ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_command(r"cd foo\ bar").is_ok());
+        assert!(policy.check_command(r"echo ok\; still echo").is_ok());
+        assert!(policy.check_command(r"echo ok; rm -rf /").is_err());
     }
 
     #[test]
