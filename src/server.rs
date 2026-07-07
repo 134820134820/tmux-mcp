@@ -4365,6 +4365,14 @@ mod tests {
             .await
             .expect("get current session");
         assert_eq!(result.is_error, Some(true));
+
+        let result = server
+            .socket_for_path(Parameters(SocketForPathInput {
+                path: "/workspace".into(),
+            }))
+            .await
+            .expect("socket-for-path");
+        assert_eq!(result.is_error, Some(true));
     }
 
     #[tokio::test]
