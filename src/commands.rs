@@ -198,20 +198,53 @@ impl CommandTracker {
 
         self.cleanup_completed().await;
 
+        async fn rollback_on_send_error(
+            active_commands: &Arc<RwLock<HashMap<String, CommandExecution>>>,
+            command_id: &str,
+            result: Result<()>,
+        ) -> Result<()> {
+            if result.is_err() {
+                let mut commands = active_commands.write().await;
+                commands.remove(command_id);
+            }
+            result
+        }
+
         if let Some(delay) = delay_ms {
             for ch in wrapped_command.chars() {
-                tmux::send_keys(pane_id, &ch.to_string(), true, resolved_socket.as_deref()).await?;
+                rollback_on_send_error(
+                    &self.active_commands,
+                    &command_id,
+                    tmux::send_keys(pane_id, &ch.to_string(), true, resolved_socket.as_deref())
+                        .await,
+                )
+                .await?;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             if !no_enter {
-                tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await?;
+                rollback_on_send_error(
+                    &self.active_commands,
+                    &command_id,
+                    tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await,
+                )
+                .await?;
             }
         } else {
             // Send command as a whole (not literal/per-character)
-            tmux::send_keys(pane_id, &wrapped_command, false, resolved_socket.as_deref()).await?;
+            rollback_on_send_error(
+                &self.active_commands,
+                &command_id,
+                tmux::send_keys(pane_id, &wrapped_command, false, resolved_socket.as_deref()).await,
+            )
+            .await?;
             // Send Enter if needed
             if !no_enter {
-                tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await?;
+                rollback_on_send_error(
+                    &self.active_commands,
+                    &command_id,
+                    tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await,
+                )
+                .await?;
             }
         }
 
@@ -576,6 +609,17 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
+    async fn assert_tracker_empty(tracker: &CommandTracker, context: &str) {
+        assert!(
+            tracker.get_active_ids().await.is_empty(),
+            "{context} must not leave active command ids"
+        );
+        assert!(
+            tracker.active_commands.read().await.is_empty(),
+            "{context} must not leave stored commands"
+        );
+    }
+
     #[rstest]
     #[case(ShellType::Bash, "TMUX_MCP_DONE_cmd-1_$?")]
     #[case(ShellType::Zsh, "TMUX_MCP_DONE_cmd-1_$?")]
@@ -805,6 +849,27 @@ mod tests {
             Error::Tmux { message } => assert!(message.contains("stub error")),
             _ => panic!("expected tmux error"),
         }
+
+        assert_tracker_empty(&tracker, "failed dispatch").await;
+    }
+
+    #[tokio::test]
+    async fn execute_command_with_delay_rolls_back_when_send_keys_fails() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_ERROR_CMD", "send-keys");
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let err = tracker
+            .execute_command("%1", "echo hi", false, false, Some(0), None)
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::Tmux { message } => assert!(message.contains("stub error")),
+            _ => panic!("expected tmux error"),
+        }
+
+        assert_tracker_empty(&tracker, "delayed send failure").await;
     }
 
     #[tokio::test]
