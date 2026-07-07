@@ -4621,6 +4621,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enforce_session_for_pane_re_resolves_after_ssh_target_changes() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        server
+            .enforce_session_for_pane("%1", None)
+            .await
+            .expect("initial pane session allowed");
+
+        stub.set_var("TMUX_MCP_SSH", "user@example.test");
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@9\t%2\t1\tremote-pane\t/tmp\tbash\t80\t24\t1234\t0",
+        );
+
+        let err = server
+            .enforce_session_for_pane("%1", None)
+            .await
+            .expect_err("changed ssh target re-resolves pane session");
+        assert!(err
+            .to_string()
+            .contains("session '%2' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
     async fn window_tools_deny_unlisted_sessions() {
         let mut stub = TmuxStub::new();
         stub.set_var(
