@@ -4416,6 +4416,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_denied_across_tools() {
+        let _stub = TmuxStub::new();
         let server = server_with_policy("[security]\nallowed_sessions = []\n");
 
         let result = server
@@ -4436,6 +4437,16 @@ mod tests {
             .await
             .expect("create window");
         assert_eq!(result.is_error, Some(true));
+
+        let result = server
+            .create_session(Parameters(CreateSessionInput {
+                name: "agent-sandbox".into(),
+                socket: None,
+            }))
+            .await
+            .expect("create session");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("allowed sessions"));
 
         let result = server
             .kill_session(Parameters(SessionIdInput {
