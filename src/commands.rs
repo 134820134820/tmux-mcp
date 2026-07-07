@@ -157,6 +157,12 @@ impl CommandTracker {
                     .to_string(),
             });
         }
+        if !raw_mode && !no_enter && has_unquoted_shell_background_operator(command) {
+            return Err(Error::InvalidArgument {
+                message: "tracked commands cannot contain unquoted shell background operators (&)"
+                    .to_string(),
+            });
+        }
 
         let (wrapped_command, tracking_disabled) = if raw_mode || no_enter {
             (command.to_string(), true)
@@ -453,6 +459,71 @@ fn has_unquoted_shell_comment_marker(command: &str) -> bool {
     false
 }
 
+fn has_unquoted_shell_background_operator(command: &str) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut iter = command.chars().peekable();
+    let mut prev_unquoted: Option<char> = None;
+
+    while let Some(ch) = iter.next() {
+        if escaped {
+            escaped = false;
+            prev_unquoted = Some(ch);
+            continue;
+        }
+
+        match ch {
+            '\\' if !in_single_quote => {
+                escaped = true;
+                prev_unquoted = Some(ch);
+            }
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                prev_unquoted = Some(ch);
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                prev_unquoted = Some(ch);
+            }
+            '&' if !in_single_quote && !in_double_quote => {
+                let next = iter.peek().copied();
+                if matches!(next, Some('&')) {
+                    iter.next();
+                    prev_unquoted = Some('&');
+                    continue;
+                }
+                if matches!(next, Some('>')) {
+                    prev_unquoted = Some(ch);
+                    continue;
+                }
+
+                let prev_is_word = prev_unquoted
+                    .map(|prev| !prev.is_whitespace() && !is_shell_separator_char(prev))
+                    .unwrap_or(false);
+                let next_is_word = next
+                    .map(|next| !next.is_whitespace() && !is_shell_separator_char(next))
+                    .unwrap_or(false);
+
+                if !(prev_is_word && next_is_word) {
+                    return true;
+                }
+
+                prev_unquoted = Some(ch);
+            }
+            _ => {
+                prev_unquoted = Some(ch);
+            }
+        }
+    }
+
+    false
+}
+
+fn is_shell_separator_char(ch: char) -> bool {
+    matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+}
+
 /// Parse captured output to extract command output and exit code.
 ///
 /// The DONE marker is authoritative for completion; START only delimits where
@@ -635,6 +706,30 @@ mod tests {
         assert!(!has_unquoted_shell_comment_marker(command));
     }
 
+    #[rstest]
+    #[case("sleep 60 &")]
+    #[case("sleep 60&")]
+    #[case("true; & echo bad")]
+    #[case("(sleep 60 &)")]
+    fn test_has_unquoted_shell_background_operator_rejects_background_ampersand(
+        #[case] command: &str,
+    ) {
+        assert!(has_unquoted_shell_background_operator(command));
+    }
+
+    #[rstest]
+    #[case("echo 'R&D'")]
+    #[case(r#"echo "R&D""#)]
+    #[case(r"echo R\&D")]
+    #[case("echo R&D")]
+    #[case("true && echo ok")]
+    #[case("echo hi &> out.txt")]
+    fn test_has_unquoted_shell_background_operator_allows_data_ampersand(
+        #[case] command: &str,
+    ) {
+        assert!(!has_unquoted_shell_background_operator(command));
+    }
+
     #[tokio::test]
     async fn execute_command_trailing_backslash_wraps_with_unescapable_done_boundary() {
         let mut stub = TmuxStub::new();
@@ -767,6 +862,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_command_rejects_unquoted_background_operator_in_tracked_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let err = tracker
+            .execute_command("%1", "sleep 60 &", false, false, None, None)
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidArgument { message } => {
+                assert!(message.contains("unquoted shell background operators (&)"));
+            }
+            _ => panic!("expected InvalidArgument, got {err:?}"),
+        }
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(log.is_empty(), "send_keys should not be called, got: {log}");
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_quoted_escaped_and_intraword_ampersand_in_tracked_mode() {
+        for command in [r#"echo "R&D""#, r"echo R\&D", "echo R&D"] {
+            let mut stub = TmuxStub::new();
+            let temp_dir = tempdir().expect("tempdir");
+            let log_path = temp_dir.path().join("send-keys.log");
+            stub.set_var(
+                "TMUX_STUB_SEND_KEYS_LOG",
+                log_path.to_str().expect("log path"),
+            );
+            let tracker = CommandTracker::new(ShellType::Bash);
+
+            let id = tracker
+                .execute_command("%1", command, false, false, None, None)
+                .await
+                .expect("ampersand used as data should be allowed");
+
+            assert!(!id.is_empty());
+            let log = std::fs::read_to_string(&log_path).expect("read log");
+            assert!(
+                log.contains(command),
+                "tracked ampersand data command should be sent, got: {log}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn execute_command_allows_quoted_hash_in_tracked_mode() {
         let mut stub = TmuxStub::new();
         let temp_dir = tempdir().expect("tempdir");
@@ -787,6 +935,54 @@ mod tests {
         assert!(
             log.contains(r##"echo "# not a comment" ; echo"##),
             "tracked quoted hash command should be sent, got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_background_operator_in_raw_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "sleep 60 &", true, false, None, None)
+            .await
+            .expect("raw mode should allow background operators");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("sleep 60 &"),
+            "raw mode should send command as provided, got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_background_operator_in_no_enter_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "sleep 60 &", false, true, None, None)
+            .await
+            .expect("no_enter mode should allow background operators");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("sleep 60 &"),
+            "no_enter mode should send command as provided, got: {log}"
         );
     }
 
