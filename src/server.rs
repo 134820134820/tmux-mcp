@@ -5364,6 +5364,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_resources_hides_pane_uris_when_capture_denied() {
+        let _stub = TmuxStub::new();
+
+        let server =
+            server_with_policy("[security]\nallow_capture = false\nallowed_panes = [\"%1\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let result = server
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+
+        assert!(!result
+            .resources
+            .iter()
+            .any(|res| res.uri.starts_with("tmux://pane/")));
+    }
+
+    #[tokio::test]
     async fn list_resources_skips_command_for_denied_pane_and_truncates() {
         let _stub = TmuxStub::new();
 
