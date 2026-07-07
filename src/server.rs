@@ -3726,6 +3726,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_discovery_respects_allowed_sessions() {
+        let _stub = TmuxStub::new();
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .list_sessions(Parameters(SocketInput { socket: None }))
+            .await
+            .expect("list sessions");
+        assert_eq!(result.is_error, Some(false));
+
+        let payload: ListSessionsOutput = serde_json::from_str(&first_text(&result)).unwrap();
+        assert_eq!(payload.sessions.len(), 1);
+        assert_eq!(payload.sessions[0].id, "%1");
+        assert_eq!(payload.sessions[0].name, "alpha");
+        assert!(!payload.sessions.iter().any(|session| session.id == "%2"));
+        assert!(!payload
+            .sessions
+            .iter()
+            .any(|session| session.name == "beta"));
+
+        let result = server
+            .find_session(Parameters(FindSessionInput {
+                name: "beta".into(),
+                socket: None,
+            }))
+            .await
+            .expect("find session");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("session '%2' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
     async fn list_clients_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
