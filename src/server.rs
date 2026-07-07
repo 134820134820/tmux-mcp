@@ -5620,6 +5620,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_panes_respects_allowed_panes() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_LIST_PANES",
+            "%1\tpane-one\t1\n%2\tpane-two\t0\n%3\tpane-three\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_panes = [\"%1\"]\n");
+        let input = Parameters(WindowIdInput {
+            window_id: "@1".into(),
+            socket: None,
+        });
+
+        let result = server.list_panes(input).await.expect("list panes");
+
+        assert_eq!(result.is_error, Some(false));
+        let payload: ListPanesOutput = serde_json::from_str(&first_text(&result)).unwrap();
+        let pane_ids: Vec<&str> = payload.panes.iter().map(|pane| pane.id.as_str()).collect();
+        assert_eq!(pane_ids, vec!["%1"]);
+    }
+
+    #[tokio::test]
     async fn capture_pane_happy_path_with_colors() {
         let _stub = TmuxStub::new();
         let server = server_default();
