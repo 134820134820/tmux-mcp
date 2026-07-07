@@ -3080,106 +3080,98 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         // Add pane, window, and session resources dynamically
         let can_capture_pane = self.policy.check_tool("capture-pane").is_ok();
         let mut has_pane_resources = false;
-        if let Ok(sessions) = tmux::list_sessions(socket.as_deref()).await {
-            for session in sessions {
-                // Skip sessions not allowed by policy
-                if self
-                    .policy
-                    .check_session_identity(&session.id, Some(&session.name))
-                    .is_err()
-                {
-                    continue;
-                }
-                let mut session_has_allowed_panes = false;
-                if let Ok(windows) = tmux::list_windows(&session.id, socket.as_deref()).await {
-                    for window in windows {
-                        let mut window_has_allowed_panes = false;
-                        if let Ok(panes) = tmux::list_panes(&window.id, socket.as_deref()).await {
-                            let all_window_panes_allowed = panes
-                                .iter()
-                                .all(|pane| self.policy.check_pane(&pane.id).is_ok());
-                            for pane in panes {
-                                // Skip panes not allowed by policy
-                                if self.policy.check_pane(&pane.id).is_err() {
-                                    continue;
-                                }
-                                has_pane_resources = true;
-                                window_has_allowed_panes = true;
-                                session_has_allowed_panes = true;
-                                if can_capture_pane {
-                                    resources.push(Annotated::new(
-                                        RawResource {
-                                            uri: format!("tmux://pane/{}", pane.id),
-                                            name: format!(
-                                                "Pane: {} - {} - {}",
-                                                session.name, pane.id, pane.title
-                                            ),
-                                            title: None,
-                                            description: Some(format!(
-                                                "Pane output for state checks or log monitoring in session {} (pane {}).",
-                                                session.name, pane.id
-                                            )),
-                                            mime_type: Some("text/plain".into()),
-                                            size: None,
-                                            icons: None,
-                                            meta: None,
-                                        },
-                                        None,
-                                    ));
-                                    resources.push(Annotated::new(
-                                        RawResource {
-                                            uri: format!("tmux://pane/{}/info", pane.id),
-                                            name: format!(
-                                                "Pane Info: {} - {} - {}",
-                                                session.name, pane.id, pane.title
-                                            ),
-                                            title: None,
-                                            description: Some(format!(
-                                                "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
-                                                session.name, pane.id
-                                            )),
-                                            mime_type: Some("application/json".into()),
-                                            size: None,
-                                            icons: None,
-                                            meta: None,
-                                        },
-                                        None,
-                                    ));
-                                }
-                            }
-                            if window_has_allowed_panes && all_window_panes_allowed {
-                                resources.push(Annotated::new(
-                                    RawResource {
-                                        uri: format!("tmux://window/{}/info", window.id),
-                                        name: format!(
-                                            "Window Info: {} - {}",
-                                            session.name, window.name
-                                        ),
-                                        title: None,
-                                        description: Some(format!(
-                                            "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
-                                            session.name, window.name
-                                        )),
-                                        mime_type: Some("application/json".into()),
-                                        size: None,
-                                        icons: None,
-                                        meta: None,
-                                    },
-                                    None,
-                                ));
-                            }
-                        }
+        let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
+            McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
+        })?;
+        for session in sessions {
+            // Skip sessions not allowed by policy
+            if self
+                .policy
+                .check_session_identity(&session.id, Some(&session.name))
+                .is_err()
+            {
+                continue;
+            }
+            let mut session_has_allowed_panes = false;
+            let windows = tmux::list_windows(&session.id, socket.as_deref())
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!("Error listing tmux windows for session {}: {e}", session.id),
+                        None,
+                    )
+                })?;
+            for window in windows {
+                let mut window_has_allowed_panes = false;
+                let panes = tmux::list_panes(&window.id, socket.as_deref())
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("Error listing tmux panes for window {}: {e}", window.id),
+                            None,
+                        )
+                    })?;
+                let all_window_panes_allowed = panes
+                    .iter()
+                    .all(|pane| self.policy.check_pane(&pane.id).is_ok());
+                for pane in panes {
+                    // Skip panes not allowed by policy
+                    if self.policy.check_pane(&pane.id).is_err() {
+                        continue;
+                    }
+                    has_pane_resources = true;
+                    window_has_allowed_panes = true;
+                    session_has_allowed_panes = true;
+                    if can_capture_pane {
+                        resources.push(Annotated::new(
+                            RawResource {
+                                uri: format!("tmux://pane/{}", pane.id),
+                                name: format!(
+                                    "Pane: {} - {} - {}",
+                                    session.name, pane.id, pane.title
+                                ),
+                                title: None,
+                                description: Some(format!(
+                                    "Pane output for state checks or log monitoring in session {} (pane {}).",
+                                    session.name, pane.id
+                                )),
+                                mime_type: Some("text/plain".into()),
+                                size: None,
+                                icons: None,
+                                meta: None,
+                            },
+                            None,
+                        ));
+                        resources.push(Annotated::new(
+                            RawResource {
+                                uri: format!("tmux://pane/{}/info", pane.id),
+                                name: format!(
+                                    "Pane Info: {} - {} - {}",
+                                    session.name, pane.id, pane.title
+                                ),
+                                title: None,
+                                description: Some(format!(
+                                    "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
+                                    session.name, pane.id
+                                )),
+                                mime_type: Some("application/json".into()),
+                                size: None,
+                                icons: None,
+                                meta: None,
+                            },
+                            None,
+                        ));
                     }
                 }
-                if session_has_allowed_panes {
+                if window_has_allowed_panes && all_window_panes_allowed {
                     resources.push(Annotated::new(
                         RawResource {
-                            uri: format!("tmux://session/{}/tree", session.id),
-                            name: format!("Session Tree: {}", session.name),
+                            uri: format!("tmux://window/{}/info", window.id),
+                            name: format!("Window Info: {} - {}", session.name, window.name),
                             title: None,
                             description: Some(format!(
-                                "Session snapshot to plan multi-pane workflows and choose targets in {}.",
-                                session.name
+                                "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
+                                session.name, window.name
                             )),
                             mime_type: Some("application/json".into()),
                             size: None,
@@ -3189,6 +3181,24 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         None,
                     ));
                 }
+            }
+            if session_has_allowed_panes {
+                resources.push(Annotated::new(
+                    RawResource {
+                        uri: format!("tmux://session/{}/tree", session.id),
+                        name: format!("Session Tree: {}", session.name),
+                        title: None,
+                        description: Some(format!(
+                            "Session snapshot to plan multi-pane workflows and choose targets in {}.",
+                            session.name
+                        )),
+                        mime_type: Some("application/json".into()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                ));
             }
         }
 
@@ -5506,6 +5516,49 @@ mod tests {
             .expect("list resources");
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].uri, "tmux://server/info");
+    }
+
+    #[tokio::test]
+    async fn list_resources_returns_error_when_sessions_fail() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_ERROR_CMD", "list-sessions");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "sessions-fail");
+        let server = server_default();
+        let (context, _client_transport, _running) = context_for_server(&server);
+
+        let error = server
+            .list_resources(None, context)
+            .await
+            .expect_err("list resources should fail");
+
+        assert!(error.message.contains("Error listing tmux sessions"));
+        assert!(error.message.contains("sessions-fail"));
+    }
+
+    #[tokio::test]
+    async fn list_resources_returns_error_when_nested_windows_or_panes_fail() {
+        let mut stub = TmuxStub::new();
+        let server = server_default();
+
+        stub.set_var("TMUX_STUB_ERROR_CMD", "list-windows");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "windows-fail");
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let error = server
+            .list_resources(None, context)
+            .await
+            .expect_err("list resources should fail");
+        assert!(error.message.contains("Error listing tmux windows"));
+        assert!(error.message.contains("windows-fail"));
+
+        stub.set_var("TMUX_STUB_ERROR_CMD", "list-panes");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "panes-fail");
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let error = server
+            .list_resources(None, context)
+            .await
+            .expect_err("list resources should fail");
+        assert!(error.message.contains("Error listing tmux panes"));
+        assert!(error.message.contains("panes-fail"));
     }
 
     #[tokio::test]
