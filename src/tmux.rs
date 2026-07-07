@@ -457,7 +457,7 @@ pub fn parse_sessions(output: &str) -> Vec<Session> {
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 4 {
+            if parts.len() == 4 {
                 Some(Session {
                     id: parts[0].to_string(),
                     name: parts[1].to_string(),
@@ -481,7 +481,7 @@ pub fn parse_windows(output: &str, session_id: &str) -> Vec<Window> {
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 3 {
+            if parts.len() == 3 {
                 Some(Window {
                     id: parts[0].to_string(),
                     name: parts[1].to_string(),
@@ -505,7 +505,7 @@ pub fn parse_panes(output: &str, window_id: &str) -> Vec<Pane> {
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 3 {
+            if parts.len() == 3 {
                 Some(Pane {
                     id: parts[0].to_string(),
                     title: parts[1].to_string(),
@@ -529,7 +529,7 @@ pub fn parse_clients(output: &str) -> Vec<ClientInfo> {
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 5 {
+            if parts.len() == 5 {
                 Some(ClientInfo {
                     tty: parts[0].to_string(),
                     name: parts[1].to_string(),
@@ -555,7 +555,7 @@ pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
         .enumerate()
         .filter_map(|(idx, line)| {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 3 {
+            if parts.len() == 3 {
                 let size_u64: u64 = parts[1].parse().unwrap_or(0);
                 let size = std::cmp::min(size_u64, u32::MAX as u64) as u32;
                 Some(BufferInfo {
@@ -2514,6 +2514,18 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].title, "bash");
         assert_eq!(result[1].title, "htop");
+    }
+
+    #[test]
+    fn list_parsers_reject_extra_tab_fields() {
+        assert_eq!(parse_sessions("$2\tfoo\tbar\t1\t3"), Vec::new());
+        assert_eq!(parse_windows("@2\tfoo\tbar\t1", "$2"), Vec::new());
+        assert_eq!(parse_panes("%2\tfoo\tbar\t1", "@2"), Vec::new());
+        assert_eq!(
+            parse_clients("/dev/ttys001\tclient\tx\ty\t123\t1"),
+            Vec::new()
+        );
+        assert_eq!(parse_buffers("buffer\tname\t42\t1700000000"), Vec::new());
     }
 
     #[tokio::test]
