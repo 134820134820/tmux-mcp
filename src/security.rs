@@ -1452,6 +1452,42 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_unknown_fields() {
+        let cases = [
+            (
+                "misspelled security allowlist key",
+                r#"
+                    [security]
+                    allowed_session = ["work"]
+                "#,
+            ),
+            (
+                "misspelled nested command filter key",
+                r#"
+                    [security.command_filter]
+                    moed = "denylist"
+                "#,
+            ),
+            (
+                "misspelled root security table",
+                r#"
+                    [secrity]
+                    allowed_sessions = ["work"]
+                "#,
+            ),
+        ];
+
+        for (name, config) in cases {
+            let err = toml::from_str::<ConfigFile>(config)
+                .expect_err(&format!("{name} should fail to parse"));
+            assert!(
+                err.to_string().contains("unknown field"),
+                "{name} should reject an unknown field, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_tool_denial() {
         let config = SecurityConfig {
             enabled: true,
