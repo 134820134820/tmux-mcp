@@ -44,6 +44,15 @@ fn structured_output<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+fn structured_error_output<T: Serialize>(value: &T) -> CallToolResult {
+    match serde_json::to_value(value) {
+        Ok(json) => CallToolResult::structured_error(json),
+        Err(e) => CallToolResult::error(vec![Content::text(format!(
+            "Error serializing output: {e}"
+        ))]),
+    }
+}
+
 fn truncate_command_label(command: &str) -> String {
     let mut chars = command.chars();
     let label: String = chars.by_ref().take(30).collect();
@@ -1953,7 +1962,11 @@ impl TmuxMcpServer {
                         None
                     },
                 };
-                Ok(structured_output(&result))
+                if matches!(cmd.status, CommandStatus::Error) {
+                    Ok(structured_error_output(&result))
+                } else {
+                    Ok(structured_output(&result))
+                }
             }
             Ok(None) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Command not found: {}",
@@ -6179,6 +6192,51 @@ mod tests {
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["exitCode"], 0);
         assert_eq!(payload["output"], "stub-output");
+    }
+
+    #[tokio::test]
+    async fn execute_and_get_command_result_error_status_is_mcp_error() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "prompt\nTMUX_MCP_START_default\nstub-failure\nTMUX_MCP_DONE_default_7\n",
+        );
+        let server = server_default();
+        let input = Parameters(ExecuteCommandInput {
+            pane_id: "%1".into(),
+            command: "false".into(),
+            raw_mode: None,
+            no_enter: None,
+            delay_ms: None,
+            socket: None,
+        });
+
+        let result = server
+            .execute_command(input)
+            .await
+            .expect("execute command");
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_id = payload["commandId"].as_str().unwrap();
+        let captured = format!(
+            "prompt\nTMUX_MCP_START_{command_id}\nstub-failure\nTMUX_MCP_DONE_{command_id}_7\n"
+        );
+        stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", captured);
+
+        let result = server
+            .get_command_result(Parameters(GetCommandResultInput {
+                command_id: command_id.to_string(),
+                socket: None,
+            }))
+            .await
+            .expect("get command result");
+
+        assert_eq!(result.is_error, Some(true));
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        assert_eq!(payload["status"], "error");
+        assert_eq!(payload["exitCode"], 7);
+        assert_eq!(payload["command"], "false");
+        assert_eq!(payload["output"], "stub-failure");
+        assert_eq!(result.structured_content, Some(payload));
     }
 
     #[tokio::test]
