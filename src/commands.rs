@@ -151,6 +151,12 @@ impl CommandTracker {
                     .to_string(),
             });
         }
+        if !raw_mode && !no_enter && has_unquoted_shell_comment_marker(command) {
+            return Err(Error::InvalidArgument {
+                message: "tracked commands cannot contain unquoted shell comment markers (#)"
+                    .to_string(),
+            });
+        }
 
         let (wrapped_command, tracking_disabled) = if raw_mode || no_enter {
             (command.to_string(), true)
@@ -408,6 +414,45 @@ fn wrap_tracked_command(command: &str, start_marker: &str, end_marker: &str) -> 
     format!("echo \"{start_marker}\"; {command} ; echo \"{end_marker}\"")
 }
 
+fn has_unquoted_shell_comment_marker(command: &str) -> bool {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut at_word_start = true;
+
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            at_word_start = false;
+            continue;
+        }
+
+        match ch {
+            '\\' if !in_single_quote => escaped = true,
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                at_word_start = false;
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                at_word_start = false;
+            }
+            '#' if !in_single_quote && !in_double_quote && at_word_start => return true,
+            ch if !in_single_quote
+                && !in_double_quote
+                && (ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>')) =>
+            {
+                at_word_start = true;
+            }
+            _ => {
+                at_word_start = false;
+            }
+        }
+    }
+
+    false
+}
+
 /// Parse captured output to extract command output and exit code.
 ///
 /// The DONE marker is authoritative for completion; START only delimits where
@@ -570,6 +615,26 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case("grep pattern # notes")]
+    #[case("# all comment")]
+    #[case("true;# notes")]
+    #[case("true && # notes")]
+    #[case("(# subshell comment")]
+    fn test_has_unquoted_shell_comment_marker_rejects_unquoted_hash(#[case] command: &str) {
+        assert!(has_unquoted_shell_comment_marker(command));
+    }
+
+    #[rstest]
+    #[case("echo before#after")]
+    #[case("echo '# literal'")]
+    #[case(r##"echo "# literal""##)]
+    #[case(r"echo \# literal")]
+    #[case(r#"printf "%s\n" "value # still data""#)]
+    fn test_has_unquoted_shell_comment_marker_allows_quoted_or_escaped_hash(#[case] command: &str) {
+        assert!(!has_unquoted_shell_comment_marker(command));
+    }
+
     #[tokio::test]
     async fn execute_command_trailing_backslash_wraps_with_unescapable_done_boundary() {
         let mut stub = TmuxStub::new();
@@ -675,6 +740,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_command_rejects_unquoted_hash_comment_in_tracked_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let err = tracker
+            .execute_command("%1", "grep pattern # notes", false, false, None, None)
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::InvalidArgument { message } => {
+                assert!(message.contains("unquoted shell comment markers (#)"));
+            }
+            _ => panic!("expected InvalidArgument, got {err:?}"),
+        }
+
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(log.is_empty(), "send_keys should not be called, got: {log}");
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_quoted_hash_in_tracked_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", r##"echo "# not a comment""##, false, false, None, None)
+            .await
+            .expect("quoted hash should be allowed");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains(r##"echo "# not a comment" ; echo"##),
+            "tracked quoted hash command should be sent, got: {log}"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_command_rejects_embedded_carriage_return_in_tracked_mode() {
         let mut stub = TmuxStub::new();
         let temp_dir = tempdir().expect("tempdir");
@@ -720,6 +836,54 @@ mod tests {
         assert!(!id.is_empty());
         let log = std::fs::read_to_string(&log_path).expect("read log");
         assert!(!log.is_empty(), "raw mode should send keys");
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_hash_in_raw_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "grep pattern # notes", true, false, None, None)
+            .await
+            .expect("raw mode should allow hash comments");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("grep pattern # notes"),
+            "raw mode should send command as provided, got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_allows_hash_in_no_enter_mode() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "grep pattern # notes", false, true, None, None)
+            .await
+            .expect("no_enter mode should allow hash comments");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("grep pattern # notes"),
+            "no_enter mode should send command as provided, got: {log}"
+        );
     }
 
     #[tokio::test]
