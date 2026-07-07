@@ -857,7 +857,13 @@ impl TmuxMcpServer {
         })?;
 
         for pane in panes {
-            self.policy.check_pane(&pane.id)?;
+            if self.policy.check_pane(&pane.id).is_err() {
+                return Err(crate::errors::Error::PolicyDenied {
+                    message: format!(
+                        "window '{window_id}' contains panes outside allowed panes list"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -4343,6 +4349,32 @@ mod tests {
             .expect("list resource templates");
 
         assert!(result.resource_templates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_window_info_respects_allowed_panes() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_LIST_PANES", "%99\tdisallowed\t1");
+        stub.set_var(
+            "TMUX_STUB_WINDOW_INFO_OUTPUT",
+            "@2\tsecond\t%1\t0\tlayout\t1\t80\t24\t0\t%99",
+        );
+        let server = server_with_policy("[security]\nallowed_panes = [\"%1\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+
+        let result = server
+            .read_resource(
+                read_resource_request!(uri: "tmux://window/@2/info".to_string(), meta: None),
+                context,
+            )
+            .await
+            .expect("read window info resource");
+
+        let text = first_text_resource(&result.contents);
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("allowed panes"));
+        assert!(!text.contains("%99"));
+        assert!(!text.contains("active_pane_id"));
     }
 
     #[test]
