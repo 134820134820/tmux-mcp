@@ -10,7 +10,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     Annotated, CallToolResult, Content, RawResource, RawResourceTemplate, Resource,
-    ResourceContents, ServerCapabilities, ServerInfo,
+    ResourceContents, ResourceTemplate, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::JsonSchema;
 use rmcp::serde::{Deserialize, Serialize};
@@ -681,6 +681,105 @@ impl TmuxMcpServer {
                 router.remove_route(&tool_name);
             }
         }
+    }
+
+    fn resource_template(
+        uri_template: &str,
+        name: &str,
+        description: &str,
+        mime_type: &str,
+    ) -> ResourceTemplate {
+        Annotated::new(
+            RawResourceTemplate {
+                uri_template: uri_template.into(),
+                name: name.into(),
+                title: None,
+                description: Some(description.into()),
+                mime_type: Some(mime_type.into()),
+                icons: None,
+            },
+            None,
+        )
+    }
+
+    fn policy_filtered_resource_templates(&self) -> Vec<ResourceTemplate> {
+        let socket = tmux::resolve_socket(None);
+        if self.policy.check_socket(socket.as_deref()).is_err() {
+            return Vec::new();
+        }
+
+        let mut templates = Vec::new();
+        templates.push(Self::resource_template(
+            "tmux://server/info",
+            "Tmux Server Info",
+            "Default socket and SSH context for selecting the right tmux target.",
+            "application/json",
+        ));
+
+        if self.policy.check_tool("capture-pane").is_ok() {
+            templates.push(Self::resource_template(
+                "tmux://pane/{paneId}",
+                "Tmux Pane Content",
+                "Capture pane content for state checks or log monitoring; use when polling output without sending input.",
+                "text/plain",
+            ));
+            templates.push(Self::resource_template(
+                "tmux://pane/{paneId}/info",
+                "Tmux Pane Info",
+                "Detailed metadata for a pane (cwd, command, size). Use to decide where to run commands or how to resize/layout.",
+                "application/json",
+            ));
+            templates.push(Self::resource_template(
+                "tmux://pane/{paneId}/tail/{lines}",
+                "Tmux Pane Tail",
+                "Tail N lines from a pane for lightweight log polling without full scrollback.",
+                "text/plain",
+            ));
+            templates.push(Self::resource_template(
+                "tmux://pane/{paneId}/tail/{lines}/ansi",
+                "Tmux Pane Tail (ANSI)",
+                "Tail N lines with ANSI colors when formatting or highlighting matters.",
+                "text/plain",
+            ));
+        }
+
+        if self.policy.check_tool("list-windows").is_ok() {
+            templates.push(Self::resource_template(
+                "tmux://window/{windowId}/info",
+                "Tmux Window Info",
+                "Window metadata (layout, active pane, size). Use to normalize layouts or decide where to focus.",
+                "application/json",
+            ));
+        }
+
+        if self.policy.check_tool("list-sessions").is_ok() {
+            templates.push(Self::resource_template(
+                "tmux://session/{sessionId}/tree",
+                "Tmux Session Tree",
+                "Snapshot of session, windows, and panes for planning multi-pane workflows.",
+                "application/json",
+            ));
+        }
+
+        if self.policy.check_tool("list-clients").is_ok() {
+            templates.push(Self::resource_template(
+                "tmux://clients",
+                "Tmux Clients",
+                "List of tmux clients to detect observers before detaching or resizing.",
+                "application/json",
+            ));
+        }
+
+        if self.policy.check_tool("get-command-result").is_ok() {
+            templates.push(Self::resource_template(
+                "tmux://command/{commandId}/result",
+                "Command Execution Result",
+                "Get the result of an executed command; use for polling without re-running.",
+                "text/plain",
+            ));
+        }
+
+        templates
     }
 
     async fn enforce_session_for_pane(
@@ -3138,110 +3237,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
         Ok(rmcp::model::ListResourceTemplatesResult {
-            resource_templates: vec![
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://server/info".into(),
-                        name: "Tmux Server Info".into(),
-                        title: None,
-                        description: Some(
-                            "Default socket and SSH context for selecting the right tmux target."
-                                .into(),
-                        ),
-                        mime_type: Some("application/json".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://pane/{paneId}".into(),
-                        name: "Tmux Pane Content".into(),
-                        title: None,
-                        description: Some("Capture pane content for state checks or log monitoring; use when polling output without sending input.".into()),
-                        mime_type: Some("text/plain".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://pane/{paneId}/info".into(),
-                        name: "Tmux Pane Info".into(),
-                        title: None,
-                        description: Some("Detailed metadata for a pane (cwd, command, size). Use to decide where to run commands or how to resize/layout.".into()),
-                        mime_type: Some("application/json".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://pane/{paneId}/tail/{lines}".into(),
-                        name: "Tmux Pane Tail".into(),
-                        title: None,
-                        description: Some("Tail N lines from a pane for lightweight log polling without full scrollback.".into()),
-                        mime_type: Some("text/plain".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://pane/{paneId}/tail/{lines}/ansi".into(),
-                        name: "Tmux Pane Tail (ANSI)".into(),
-                        title: None,
-                        description: Some("Tail N lines with ANSI colors when formatting or highlighting matters.".into()),
-                        mime_type: Some("text/plain".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://window/{windowId}/info".into(),
-                        name: "Tmux Window Info".into(),
-                        title: None,
-                        description: Some("Window metadata (layout, active pane, size). Use to normalize layouts or decide where to focus.".into()),
-                        mime_type: Some("application/json".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://session/{sessionId}/tree".into(),
-                        name: "Tmux Session Tree".into(),
-                        title: None,
-                        description: Some("Snapshot of session, windows, and panes for planning multi-pane workflows.".into()),
-                        mime_type: Some("application/json".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://clients".into(),
-                        name: "Tmux Clients".into(),
-                        title: None,
-                        description: Some("List of tmux clients to detect observers before detaching or resizing.".into()),
-                        mime_type: Some("application/json".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-                Annotated::new(
-                    RawResourceTemplate {
-                        uri_template: "tmux://command/{commandId}/result".into(),
-                        name: "Command Execution Result".into(),
-                        title: None,
-                        description: Some("Get the result of an executed command; use for polling without re-running.".into()),
-                        mime_type: Some("text/plain".into()),
-                        icons: None,
-                    },
-                    None,
-                ),
-            ],
+            resource_templates: self.policy_filtered_resource_templates(),
             next_cursor: None,
             meta: None,
         })
@@ -4305,7 +4301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_resource_templates_returns_defaults() {
+    async fn list_resource_templates_respect_policy() {
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
 
@@ -4315,6 +4311,38 @@ mod tests {
             .expect("list resource templates");
 
         assert_eq!(result.resource_templates.len(), 9);
+
+        let server = server_with_policy("[security]\nallow_capture = false\nallow_list = false\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let result = server
+            .list_resource_templates(None, context)
+            .await
+            .expect("list resource templates");
+        let templates = result
+            .resource_templates
+            .iter()
+            .map(|template| template.raw.uri_template.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(templates.contains("tmux://server/info"));
+        assert!(templates.contains("tmux://command/{commandId}/result"));
+        assert!(!templates.contains("tmux://pane/{paneId}"));
+        assert!(!templates.contains("tmux://pane/{paneId}/info"));
+        assert!(!templates.contains("tmux://pane/{paneId}/tail/{lines}"));
+        assert!(!templates.contains("tmux://pane/{paneId}/tail/{lines}/ansi"));
+        assert!(!templates.contains("tmux://window/{windowId}/info"));
+        assert!(!templates.contains("tmux://session/{sessionId}/tree"));
+        assert!(!templates.contains("tmux://clients"));
+
+        let server =
+            server_with_policy("[security]\nallowed_sockets = [\"/tmp/not-default.sock\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let result = server
+            .list_resource_templates(None, context)
+            .await
+            .expect("list resource templates");
+
+        assert!(result.resource_templates.is_empty());
     }
 
     #[test]
