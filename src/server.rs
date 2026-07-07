@@ -5077,6 +5077,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_current_session_respects_allowed_sessions() {
+        let _stub = TmuxStub::new();
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%2\"]\n");
+
+        let result = server
+            .get_current_session(Parameters(SocketInput { socket: None }))
+            .await
+            .expect("get current session");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("session '%1' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
     async fn rename_tools_denied_by_policy() {
         let server = server_with_policy("[security]\nallow_rename = false\n");
 
