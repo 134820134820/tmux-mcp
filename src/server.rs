@@ -3197,36 +3197,37 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         // Add command result resources
         if self.policy.check_tool("get-command-result").is_ok() {
             for id in self.tracker.get_active_ids().await {
-                if let Some(cmd) = self.tracker.get_command(&id).await {
-                    // Skip commands for panes not allowed by policy
-                    if self.policy.check_pane(&cmd.pane_id).is_err() {
-                        continue;
-                    }
-                    if self
-                        .enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
-                        .await
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    let truncated_cmd = truncate_command_label(&cmd.command);
-                    resources.push(Annotated::new(
-                        RawResource {
-                            uri: format!("tmux://command/{id}/result"),
-                            name: format!("Command: {truncated_cmd}"),
-                            title: None,
-                            description: Some(format!(
-                                "Tracked command status: {:?}. Poll to avoid re-running.",
-                                cmd.status
-                            )),
-                            mime_type: Some("text/plain".into()),
-                            size: None,
-                            icons: None,
-                            meta: None,
-                        },
-                        None,
-                    ));
+                let Ok(Some(cmd)) = self.tracker.check_status(&id, None).await else {
+                    continue;
+                };
+                // Skip commands for panes not allowed by policy
+                if self.policy.check_pane(&cmd.pane_id).is_err() {
+                    continue;
                 }
+                if self
+                    .enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let truncated_cmd = truncate_command_label(&cmd.command);
+                resources.push(Annotated::new(
+                    RawResource {
+                        uri: format!("tmux://command/{id}/result"),
+                        name: format!("Command: {truncated_cmd}"),
+                        title: None,
+                        description: Some(format!(
+                            "Tracked command status: {:?}. Poll to avoid re-running.",
+                            cmd.status
+                        )),
+                        mime_type: Some("text/plain".into()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                ));
             }
         }
 
@@ -5512,7 +5513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_resources_does_not_poll_command_status() {
+    async fn list_resources_refreshes_command_status() {
         let mut stub = TmuxStub::new();
         let capture_count = NamedTempFile::new().expect("capture count file");
         stub.set_var("TMUX_STUB_CAPTURE_COUNT_FILE", capture_count.path());
@@ -5530,22 +5531,24 @@ mod tests {
             .await
             .expect("list resources");
 
-        assert!(result
+        let resource = result
             .resources
             .iter()
-            .any(|res| res.uri == format!("tmux://command/{command_id}/result")));
-        let capture_count = std::fs::read_to_string(capture_count.path()).unwrap_or_default();
-        assert!(
-            capture_count.is_empty(),
-            "list_resources must not call capture-pane"
+            .find(|res| res.uri == format!("tmux://command/{command_id}/result"))
+            .expect("command resource");
+        assert_eq!(
+            resource.description.as_deref(),
+            Some("Tracked command status: Completed. Poll to avoid re-running.")
         );
+        let capture_count = std::fs::read_to_string(capture_count.path()).unwrap_or_default();
+        assert_eq!(capture_count, "1", "list_resources should refresh once");
         let command = server
             .tracker
             .get_command(&command_id)
             .await
             .expect("stored command");
-        assert!(matches!(command.status, CommandStatus::Pending));
-        assert!(command.output.is_none());
+        assert!(matches!(command.status, CommandStatus::Completed));
+        assert_eq!(command.output.as_deref(), Some("stub-output"));
     }
 
     #[tokio::test]
