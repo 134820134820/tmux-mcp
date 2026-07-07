@@ -272,19 +272,21 @@ impl CommandTracker {
                 break;
             }
 
-            // START visible but no DONE yet: still running. Stay Pending (caching
-            // an Error here would be sticky via the early-return above).
-            if captured_output.contains(&get_start_marker(&execution.id)) {
-                break;
-            }
+            let start_visible = captured_output.contains(&get_start_marker(&execution.id));
 
-            // START absent: it may have scrolled out of the window. Widen and
-            // retry; fall through once the window can no longer grow (so a
-            // backoff factor of 1 cannot spin forever).
+            // DONE may still be outside the initial capture window, even when
+            // START is visible. Widen before concluding the command is Pending.
             let widened = (capture_lines.saturating_mul(backoff)).min(max_lines);
             if widened > capture_lines {
                 capture_lines = widened;
                 continue;
+            }
+
+            // START visible but no DONE even at the widest capture: still
+            // running. Stay Pending (caching an Error here would be sticky via
+            // the early-return above).
+            if start_visible {
+                break;
             }
 
             // No marker even at the widest window: could be a high-output command
@@ -888,6 +890,70 @@ mod tests {
             .parse::<u32>()
             .expect("parse count");
         assert!(count >= 2);
+    }
+
+    #[tokio::test]
+    async fn check_status_widens_when_start_visible_without_done() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let count_path = temp_dir.path().join("capture-count");
+        let id = "start-visible-widen-cmd".to_string();
+
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_COUNT_FILE",
+            count_path.to_str().expect("count path"),
+        );
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER", "2");
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_BEFORE",
+            format!("TMUX_MCP_START_{id}\npartial output\n"),
+        );
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_AFTER_OUTPUT",
+            format!("TMUX_MCP_START_{id}\nwidened ok\nTMUX_MCP_DONE_{id}_0\n"),
+        );
+
+        let tracking = TrackingConfig {
+            capture_initial_lines: 2,
+            capture_max_lines: 8,
+            capture_backoff_factor: 2,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let execution = CommandExecution {
+            id: id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "echo widened".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: Instant::now(),
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.clone(), execution);
+        }
+
+        let command = tracker
+            .check_status(&id, None)
+            .await
+            .expect("check status")
+            .expect("command");
+        assert_eq!(command.status, CommandStatus::Completed);
+        assert_eq!(command.exit_code, Some(0));
+        assert_eq!(command.output.as_deref(), Some("widened ok"));
+
+        let count = std::fs::read_to_string(&count_path)
+            .expect("read count")
+            .trim()
+            .parse::<u32>()
+            .expect("parse count");
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]
