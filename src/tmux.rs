@@ -2448,6 +2448,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_buffer_bytes_returns_load_error_for_binary_content() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_ERROR_CMD", "load-buffer");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "load-buffer failed");
+
+        let err = set_buffer_bytes("b", &[0xff, 0x00, 0x41], None)
+            .await
+            .expect_err("load-buffer failure should be returned");
+
+        assert!(
+            matches!(err, Error::Tmux { ref message } if message.contains("load-buffer failed"))
+        );
+    }
+
+    #[tokio::test]
     async fn send_keys_literal_uses_separator_for_leading_dash_payload() {
         let mut stub = TmuxStub::new();
         let temp_dir = tempdir().expect("tempdir");
