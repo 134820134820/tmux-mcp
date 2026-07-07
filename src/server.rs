@@ -5499,6 +5499,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_server_info_denied_by_socket_policy() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SOCKET", "/tmp/disallowed.sock");
+        let server = server_with_policy("[security]\nallowed_sockets = [\"/tmp/allowed.sock\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let request = read_resource_request! {
+            uri: "tmux://server/info".into(),
+            meta: None,
+        };
+
+        let result = server
+            .read_resource(request, context)
+            .await
+            .expect("read resource");
+        let text = first_text_resource(&result.contents);
+        assert!(text.contains("Access denied"));
+        assert!(!text.contains("\"default_socket\""));
+        assert!(!text.contains("\"ssh\""));
+    }
+
+    #[tokio::test]
     async fn read_resource_command_pending_and_error() {
         let mut stub = TmuxStub::new();
         let server = server_default();
