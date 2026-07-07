@@ -369,6 +369,14 @@ impl CommandTracker {
         commands.keys().cloned().collect()
     }
 
+    /// Remove all tracked commands for a pane and return the number purged.
+    pub async fn purge_pane(&self, pane_id: &str) -> usize {
+        let mut commands = self.active_commands.write().await;
+        let before = commands.len();
+        commands.retain(|_, exec| exec.pane_id != pane_id);
+        before - commands.len()
+    }
+
     /// Remove completed commands outside the configured retention window and count.
     async fn cleanup_completed(&self) {
         let retention_minutes = self.tracking.completed_retention_minutes;
@@ -1224,6 +1232,39 @@ mod tests {
             .await
             .expect("check status");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_pane_removes_only_matching_pane_entries() {
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        for (id, pane_id) in [
+            ("matching-1", "%1"),
+            ("other", "%2"),
+            ("matching-2", "%1"),
+        ] {
+            let execution = CommandExecution {
+                id: id.into(),
+                pane_id: pane_id.into(),
+                socket: None,
+                command: format!("echo {id}"),
+                status: CommandStatus::Pending,
+                exit_code: None,
+                output: None,
+                started_at: Instant::now(),
+                completed_at: None,
+                raw_mode: false,
+                tracking_disabled: false,
+            };
+
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.into(), execution);
+        }
+
+        assert_eq!(tracker.purge_pane("%1").await, 2);
+        assert!(tracker.get_command("matching-1").await.is_none());
+        assert!(tracker.get_command("matching-2").await.is_none());
+        assert!(tracker.get_command("other").await.is_some());
     }
 
     #[tokio::test]

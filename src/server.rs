@@ -1814,10 +1814,13 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::kill_pane(&input.0.pane_id, socket.as_deref()).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Pane {} has been killed",
-                input.0.pane_id
-            ))])),
+            Ok(()) => {
+                self.tracker.purge_pane(&input.0.pane_id).await;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Pane {} has been killed",
+                    input.0.pane_id
+                ))]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error killing pane: {e}"
             ))])),
@@ -4971,6 +4974,59 @@ mod tests {
             .await
             .expect("kill pane");
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn kill_pane_success_purges_tracked_commands_for_pane() {
+        let _stub = TmuxStub::new();
+        let server = server_default();
+
+        let killed_id = server
+            .tracker
+            .execute_command("%1", "echo killed", false, false, None, None)
+            .await
+            .expect("track command for killed pane");
+        let kept_id = server
+            .tracker
+            .execute_command("%2", "echo kept", false, false, None, None)
+            .await
+            .expect("track command for other pane");
+
+        let result = server
+            .kill_pane(Parameters(PaneIdInput {
+                pane_id: "%1".into(),
+                socket: None,
+            }))
+            .await
+            .expect("kill pane");
+
+        assert_eq!(result.is_error, Some(false));
+        assert!(server.tracker.get_command(&killed_id).await.is_none());
+        assert!(server.tracker.get_command(&kept_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn kill_pane_tmux_failure_does_not_purge_tracked_commands() {
+        let mut stub = TmuxStub::new();
+        let server = server_default();
+        let id = server
+            .tracker
+            .execute_command("%1", "echo still tracked", false, false, None, None)
+            .await
+            .expect("track command");
+
+        stub.set_var("TMUX_STUB_ERROR_CMD", "kill-pane");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "kill-pane-fail");
+        let result = server
+            .kill_pane(Parameters(PaneIdInput {
+                pane_id: "%1".into(),
+                socket: None,
+            }))
+            .await
+            .expect("kill pane");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(server.tracker.get_command(&id).await.is_some());
     }
 
     #[tokio::test]
