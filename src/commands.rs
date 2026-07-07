@@ -167,7 +167,8 @@ impl CommandTracker {
         let (wrapped_command, tracking_disabled) = if raw_mode || no_enter {
             (command.to_string(), true)
         } else {
-            let end_marker = get_end_marker(&self.shell_type, &command_id);
+            let marker_shell = self.marker_shell_type(pane_id, resolved_socket.as_deref()).await;
+            let end_marker = get_end_marker(&marker_shell, &command_id);
             let start_marker = get_start_marker(&command_id);
             let wrapped = wrap_tracked_command(command, &start_marker, &end_marker);
             (wrapped, false)
@@ -375,6 +376,13 @@ impl CommandTracker {
         let before = commands.len();
         commands.retain(|_, exec| exec.pane_id != pane_id);
         before - commands.len()
+    }
+
+    async fn marker_shell_type(&self, pane_id: &str, socket: Option<&str>) -> ShellType {
+        match tmux::pane_info(pane_id, socket).await {
+            Ok(info) if info.current_command == "fish" => ShellType::Fish,
+            _ => self.shell_type,
+        }
     }
 
     /// Remove completed commands outside the configured retention window and count.
@@ -807,6 +815,95 @@ mod tests {
         assert!(
             !log.contains(r"grep foo\; echo"),
             "trailing backslash must not escape DONE separator, got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_uses_fish_done_marker_when_pane_is_fish() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tfish\t80\t24\t1234\t0",
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("$status"),
+            "fish pane should use fish DONE marker, got: {log}"
+        );
+        assert!(
+            !log.contains("$?"),
+            "fish pane should not use bash DONE marker, got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_uses_configured_done_marker_when_pane_is_not_fish() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        stub.set_var(
+            "TMUX_STUB_PANE_INFO_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/tmp\tzsh\t80\t24\t1234\t0",
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id = tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("$?"),
+            "non-fish pane should use configured DONE marker, got: {log}"
+        );
+        assert!(
+            !log.contains("$status"),
+            "non-fish pane should not force fish DONE marker, got: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_falls_back_to_configured_marker_when_pane_info_fails() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+        stub.set_var("TMUX_STUB_ERROR_CMD", "display-message");
+        let tracker = CommandTracker::new(ShellType::Fish);
+
+        let id = tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command despite pane-info failure");
+
+        assert!(!id.is_empty());
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            log.contains("$status"),
+            "pane-info failure should fall back to configured marker, got: {log}"
         );
     }
 
