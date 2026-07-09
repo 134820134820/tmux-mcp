@@ -185,14 +185,102 @@ pub enum ShellType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
-    Pending,
+    /// Accepted but waiting for the pane's tracked-command queue head.
+    Queued,
+    /// Keys sent / side-channel watcher active (or tracking disabled after send).
+    Running,
+    /// Side channel reported exit code 0.
     Completed,
-    Error,
+    /// Side channel reported non-zero exit code.
+    Failed,
+    /// Explicitly cancelled or pane purged while active.
+    Cancelled,
+    /// Side channel lost, send failure after accept, or tracking deadline exceeded.
+    TrackingError,
 }
 
-/// In-memory record of a command sent to a pane, including tracking markers state.
+impl CommandStatus {
+    /// True when the command will not change status further (except eviction).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::TrackingError
+        )
+    }
+
+    /// Wire string for tools/resources (lowercase serde name).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TrackingError => "tracking_error",
+        }
+    }
+}
+
+/// Canonical MCP resource URI for a tracked command result.
+pub fn command_resource_uri(command_id: &str) -> String {
+    format!("tmux://command/{command_id}/result")
+}
+
+/// Shared tool/resource snapshot for a tracked command (schemaVersion 1).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandSnapshot {
+    pub command_id: String,
+    pub resource_uri: String,
+    pub status: CommandStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub command: String,
+    pub pane_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    pub output_truncated: bool,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Present on get-command-result when a wait budget expired while still non-terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_timed_out: Option<bool>,
+    pub schema_version: u32,
+}
+
+impl CommandSnapshot {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn from_execution(exec: &CommandExecution, wait_timed_out: Option<bool>) -> Self {
+        let elapsed = exec
+            .completed_at
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(exec.started_at);
+        Self {
+            command_id: exec.id.clone(),
+            resource_uri: command_resource_uri(&exec.id),
+            status: exec.status,
+            exit_code: exec.exit_code,
+            command: exec.command.clone(),
+            pane_id: exec.pane_id.clone(),
+            socket: exec.socket.clone(),
+            output: exec.output.clone(),
+            output_truncated: exec.output_truncated,
+            elapsed_ms: elapsed.as_millis() as u64,
+            reason: exec.reason.clone(),
+            wait_timed_out,
+            schema_version: Self::SCHEMA_VERSION,
+        }
+    }
+}
+
+/// In-memory record of a command sent to a pane.
 ///
 /// Not serialized on the wire as-is; MCP tools project selected fields into tool output.
+/// Side-channel secrets are stored separately and never appear here.
 #[derive(Debug, Clone)]
 pub struct CommandExecution {
     pub id: String,
@@ -202,6 +290,8 @@ pub struct CommandExecution {
     pub status: CommandStatus,
     pub exit_code: Option<i32>,
     pub output: Option<String>,
+    pub output_truncated: bool,
+    pub reason: Option<String>,
     pub started_at: Instant,
     pub completed_at: Option<Instant>,
     pub raw_mode: bool,

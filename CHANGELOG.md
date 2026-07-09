@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Tracked commands return a stable `resourceUri` (`tmux://command/{commandId}/result`) from `execute-command`.
+- MCP resource subscribe / `resources/updated` / `list_changed` for command lifecycle (preferred completion path).
+- Optional `waitMs` on `execute-command` and `get-command-result` (timeout does not force a terminal status).
+- Per-pane queue for tracked executes (`queued` → `running`).
+- Shared `CommandSnapshot` JSON schema for tools and command resources (`schemaVersion: 1`).
+
+### Changed
+- Command completion is side-channel based (`tmux set-buffer` + `wait-for`); scrollback START/DONE markers are debug/bracketing only and no longer authorize completion.
+- Command statuses are now `queued`, `running`, `completed`, `failed`, `cancelled`, `tracking_error` (replacing `pending` / sticky `error` from marker parsing).
+- Server instructions and skills prefer subscribe → notify → read over client poll loops.
+
+### Security
+- Closed DONE-marker spoof early completion: forging `TMUX_MCP_DONE_<id>_<code>` in pane text cannot complete a tracked command.
+
 ## [0.5.0] - 2026-06-10
 ### Added
 - Added `[security.tools]` and `TMUX_MCP_TOOLS` allow/deny filters for hiding and denying exact tools or tool groups at runtime.
