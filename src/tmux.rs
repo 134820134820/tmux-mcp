@@ -530,6 +530,54 @@ pub fn parse_panes(output: &str, window_id: &str) -> Vec<Pane> {
         .collect()
 }
 
+/// Parse `split-window -P -F` output (`pane_id`, `title`, `active`, optional `window_id`).
+fn parse_created_pane_line(output: &str, fallback_window_id: &str) -> Option<Pane> {
+    let line = output.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = line.split('\t').collect();
+    match parts.as_slice() {
+        [id, title, active] => Some(Pane {
+            id: (*id).to_string(),
+            title: (*title).to_string(),
+            active: *active == "1",
+            window_id: fallback_window_id.to_string(),
+        }),
+        [id, title, active, window_id] => Some(Pane {
+            id: (*id).to_string(),
+            title: (*title).to_string(),
+            active: *active == "1",
+            window_id: (*window_id).to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Parse `break-pane -P -F` output (`window_id`, `name`, `active`, optional `session_id`).
+fn parse_created_window_line(output: &str, fallback_session_id: &str) -> Option<Window> {
+    let line = output.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = line.split('\t').collect();
+    match parts.as_slice() {
+        [id, name, active] => Some(Window {
+            id: (*id).to_string(),
+            name: (*name).to_string(),
+            active: *active == "1",
+            session_id: fallback_session_id.to_string(),
+        }),
+        [id, name, active, session_id] => Some(Window {
+            id: (*id).to_string(),
+            name: (*name).to_string(),
+            active: *active == "1",
+            session_id: (*session_id).to_string(),
+        }),
+        _ => None,
+    }
+}
+
 /// Parse `list-clients -F '#{client_tty}\t#{client_name}\t#{client_session}\t#{client_pid}\t#{?client_attached,1,0}'`
 pub fn parse_clients(output: &str) -> Vec<ClientInfo> {
     if output.is_empty() {
@@ -1945,10 +1993,8 @@ pub async fn split_pane(
 
     let output = execute_tmux_with_socket(&args, socket).await?;
 
-    if let Some(pane) = parse_panes(output.trim(), &source_pane.window_id)
-        .into_iter()
-        .next()
-    {
+    // split-window -P -F includes window_id as a 4th field; list-panes format is 3 fields.
+    if let Some(pane) = parse_created_pane_line(output.trim(), &source_pane.window_id) {
         return Ok(pane);
     }
 
@@ -1991,6 +2037,89 @@ pub async fn kill_window(window_id: &str, socket: Option<&str>) -> Result<()> {
 pub async fn kill_pane(pane_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["kill-pane", "-t", pane_id], socket).await?;
     Ok(())
+}
+
+/// Name of the private paste buffer that holds a tracked command's exit code.
+pub fn exit_code_buffer_name(secret: &str) -> String {
+    format!("tmux-mcp-ec-{secret}")
+}
+
+/// Channel name used with `tmux wait-for` for a tracked command.
+pub fn wait_signal_name(secret: &str) -> String {
+    format!("tmux-mcp-{secret}")
+}
+
+/// Block until a pane signals `tmux wait-for -S <channel>` (or the server errors).
+///
+/// Does **not** use the global tmux semaphore so long waits do not stall other ops.
+pub async fn wait_for_signal(channel: &str, socket: Option<&str>) -> Result<()> {
+    let mut command = build_tmux_command(&["wait-for", channel], socket)?;
+    let output = command.output().await.map_err(|e| Error::Tmux {
+        message: format!("failed to run tmux wait-for: {e}"),
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(Error::Tmux {
+            message: if stderr.is_empty() {
+                format!("tmux wait-for failed for channel {channel}")
+            } else {
+                stderr
+            },
+        })
+    }
+}
+
+/// Read a private exit-code buffer written by a tracked command wrapper.
+pub async fn read_exit_code_buffer(secret: &str, socket: Option<&str>) -> Result<i32> {
+    let name = exit_code_buffer_name(secret);
+    let raw = show_buffer(Some(&name), socket).await?;
+    let trimmed = raw.trim();
+    trimmed.parse::<i32>().map_err(|_| Error::Tmux {
+        message: format!("invalid exit code in side-channel buffer: {trimmed:?}"),
+    })
+}
+
+/// Delete a private exit-code buffer if present (best-effort).
+pub async fn delete_exit_code_buffer(secret: &str, socket: Option<&str>) -> Result<()> {
+    let name = exit_code_buffer_name(secret);
+    match delete_buffer(&name, socket).await {
+        Ok(()) => Ok(()),
+        Err(Error::Tmux { message })
+            if message.contains("buffer")
+                || message.contains("not found")
+                || message.contains("can't find") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Build `tmux -S <socket>` argv fragment for embedding in a pane shell command.
+///
+/// Returns an empty string when no socket is resolved (caller uses default tmux).
+pub fn shell_tmux_prefix(socket: Option<&str>) -> String {
+    match resolve_socket(socket) {
+        Some(path) => format!("tmux -S {}", shell_single_quote(&path)),
+        None => "tmux".to_string(),
+    }
+}
+
+/// Single-quote a string for POSIX/fish shell embedding.
+pub fn shell_single_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Send keys to a pane.
@@ -2219,10 +2348,7 @@ pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>)
     }
     let output = execute_tmux_with_socket(&args, socket).await?;
 
-    if let Some(window) = parse_windows(output.trim(), &source_pane.session_id)
-        .into_iter()
-        .next()
-    {
+    if let Some(window) = parse_created_window_line(output.trim(), &source_pane.session_id) {
         return Ok(window);
     }
 

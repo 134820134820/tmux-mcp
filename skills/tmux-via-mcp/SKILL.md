@@ -12,8 +12,13 @@ Use this skill when a task needs a real TTY, persistent shell state, or multiple
 - Start with discovery. Call `list-sessions`, then `list-windows(sessionId)`, then `list-panes(windowId)` to get stable IDs before you act.
 - Prefer IDs over names. Names are for humans; IDs are for tooling. If you need clarity, use `rename-session`, `rename-window`, or `rename-pane`.
 - Isolate by socket when possible. Use `socket-for-path(path=<project-root>)` and pass the returned `socket` on every call that supports it.
-- For non-interactive commands, use tracked execution. Call `execute-command(paneId, command, socket?)`, then poll `get-command-result(commandId, socket?)`.
-- Avoid the fragile loop of send-keys -> send-enter -> capture-pane for routine command output. Use `execute-command` + `get-command-result` instead.
+- For non-interactive commands, use tracked execution. Call `execute-command(paneId, command, socket?)` and use the returned `resourceUri`.
+- **Preferred completion path:** `resources/subscribe` on `resourceUri`, wait for `notifications/resources/updated`, then `resources/read`.
+- **Fallback:** `get-command-result(commandId, waitMs=N, socket?)` — do not invent sleep-poll loops.
+- Tracked commands queue one-at-a-time per pane; a second execute on a busy pane starts as `queued`.
+- Do not trust `TMUX_MCP_DONE_*` lines in pane text; completion is side-channel based.
+- Avoid the fragile loop of send-keys -> send-enter -> capture-pane for routine command output.
+- Do not send interactive keys into a pane while a tracked command is running on it.
 - Use `send-keys` only for interactive programs (REPLs, prompts, TUIs, ssh). Pair it with `capture-pane` in a read-act loop.
 - When key names cannot express a key (escape sequences like CSI-u Shift+Enter), use `send-hex` with raw byte tokens instead of `send-keys`.
 - For multi-line input, use `paste-text` so capable shells/REPLs hold embedded newlines instead of submitting line-by-line. If support is uncertain, `capture-pane` afterward to confirm the block was held.
@@ -56,16 +61,23 @@ Use this for builds, tests, and scripts that do not require interactivity.
 
    `execute-command(paneId="<paneId>", command="sh -lc '<cmd>'", socket="<socket>")`
 
-2. Poll for completion and collect the result:
+   Response includes `commandId` and `resourceUri` (`tmux://command/{id}/result`).
 
-   `get-command-result(commandId="<commandId>", socket="<socket>")`
+2. Prefer subscribe + read:
 
-3. If you need live progress while the command is still pending, probe the pane:
+   - `resources/subscribe` on `resourceUri`
+   - on `notifications/resources/updated`, `resources/read` the URI for the CommandSnapshot JSON
+
+3. Fallback without resource subscribe:
+
+   `get-command-result(commandId="<commandId>", waitMs=120000, socket="<socket>")`
+
+4. If you need live progress while still `running`, probe the pane (does not complete tracking):
 
    `capture-pane(paneId="<paneId>", lines=200, join=true, socket="<socket>")`
 
 Notes:
-- Prefer the default tracking mode. `rawMode=true` or `noEnter=true` disables marker-based tracking.
+- Prefer the default tracking mode. `rawMode=true` or `noEnter=true` disables side-channel tracking.
 - For pipes, quoting, or shell features, wrapping with `sh -lc '...'` is usually the least error-prone.
 
 ### 3) Drive an interactive terminal safely
@@ -114,9 +126,9 @@ Use this when you need multiple concurrent runners with periodic summaries.
    - `execute-command(paneId="<paneA>", command="sh -lc '<cmdA>'", socket="<socket>")`
    - `execute-command(paneId="<paneB>", command="sh -lc '<cmdB>'", socket="<socket>")`
 
-3. Poll tracked commands first, then probe panes for live context:
+3. Prefer resource subscriptions per `resourceUri`, or `get-command-result(..., waitMs=...)` per command; probe panes only for live context:
 
-   - `get-command-result(commandId="<idA>", socket="<socket>")`
+   - `get-command-result(commandId="<idA>", waitMs=60000, socket="<socket>")`
    - `capture-pane(paneId="<paneA>", lines=120, join=true, socket="<socket>")`
 
 4. Broadcast a one-off command to every pane in a window:

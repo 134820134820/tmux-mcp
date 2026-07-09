@@ -34,7 +34,7 @@ Use it when an agent needs a real TTY, long-running commands, parallel panes, re
 ## What the server provides
 
 - Session, window, pane, client, and buffer tools with structured inputs and outputs.
-- `execute-command` and `get-command-result` for shell commands with command IDs, status, output, and exit-code tracking.
+- `execute-command` and `get-command-result` for shell commands with command IDs, resource URIs, status, output, and side-channel exit-code tracking (optional `waitMs`; prefer resource subscribe for completion).
 - Pane and tmux-buffer resources for lightweight state checks without re-running commands.
 - Optional raw input tools for interactive programs, prompts, REPLs, and TUIs.
 - Runtime policy controls for tool filtering, command filtering, socket/session/pane scoping, and coarse operation groups.
@@ -289,7 +289,7 @@ streaming_threshold_bytes = 262144
 | `security.tools.mode` | `deny`, `allow` | `deny` | Runtime tool-surface filter mode. |
 | `security.tools.items` | string array | `[]` | Exact tool names or groups such as `@raw-input`. |
 
-`security.command_filter` checks each non-empty shell statement for `execute-command`, non-literal `send-keys`, `paste-text`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, newlines, and command substitutions before matching. It does not screen literal `send-keys` content or special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
+`security.command_filter` checks each non-empty shell statement for `execute-command`, `send-keys` (literal and non-literal), `paste-text`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, newlines, and command substitutions before matching. It does not screen special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
 
 ### Tracking options
 
@@ -299,8 +299,8 @@ streaming_threshold_bytes = 262144
 | `tracking.capture_max_lines` | `16000` | Maximum pane lines captured before the tracker stops expanding the search window. |
 | `tracking.capture_backoff_factor` | `2` | Multiplier used when retrying larger capture windows. |
 | `tracking.completed_retention_minutes` | `240` | Age limit for completed command history retained in memory. |
-| `tracking.completed_max_entries` | `1000` | Maximum completed command entries retained in memory. |
-| `tracking.tracking_deadline_seconds` | `600` | Time a command can stay pending after its start marker scrolls out of reach before it is declared expired. |
+| `tracking.completed_max_entries` | `1000` | Maximum completed command entries retained in memory. Set to `0` to disable entry-count pruning and rely on retention time only. |
+| `tracking.tracking_deadline_seconds` | `600` | How long the side-channel watcher waits for `tmux wait-for` before marking `tracking_error`. |
 
 ### Search options
 
@@ -416,13 +416,13 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 | Session management | `list-sessions`, `find-session`, `create-session`, `kill-session`, `get-current-session`, `rename-session`. |
 | Window management | `list-windows`, `create-window`, `kill-window`, `rename-window`, `move-window`, `select-window`, `select-layout`, `set-synchronize-panes`. |
 | Pane management | `list-panes`, `split-pane`, `kill-pane`, `rename-pane`, `capture-pane`, `select-pane`, `resize-pane`, `zoom-pane`, `join-pane`, `break-pane`, `swap-pane`. |
-| Command execution | `execute-command` sends a shell command and returns a `commandId`; `get-command-result` polls status, output, and exit code. |
+| Command execution | `execute-command` returns `commandId` + `resourceUri`; prefer `resources/subscribe` then read on `resources/updated`, or `get-command-result` with `waitMs`. |
 | Client management | `list-clients`, `detach-client`. |
 | Buffer inspection | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer`. |
 | Buffer mutation | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer`. |
 | Raw input | `send-keys`, `paste-text`, `send-hex`, `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, arrow keys, page keys, home, end. |
 
-Prefer `execute-command` plus `get-command-result` for non-interactive commands. Use `capture-pane` for live progress or terminal state. Use raw input tools only for prompts, REPLs, editors, pagers, and TUIs.
+Prefer `execute-command` with resource subscribe/read (or `get-command-result` + `waitMs`) for non-interactive commands. Tracked commands queue per pane. Use `capture-pane` for live progress only; do not treat pane DONE markers as authoritative. Use raw input tools only for prompts, REPLs, editors, pagers, and TUIs—and not while a tracked command is running on that pane.
 
 ## MCP resource reference
 
@@ -565,6 +565,8 @@ Release notes and release packaging details live in [CHANGELOG.md](CHANGELOG.md)
 - `paste-text` uses bracketed paste markers. Shells and programs that do not support bracketed paste may treat embedded newlines as Enter. On macOS, the default `/bin/bash` 3.2 does not support modern bracketed paste behavior; zsh or a newer bash is safer for multi-line input that should not submit line by line.
 - `save-buffer` writes to the server filesystem, and `load-buffer` reads from it. Both are governed by `allow_capture` and `[security.tools]`.
 - Command results are socket-bound. `get-command-result` must use the same effective socket as the original `execute-command` call.
+- Tracked command completion uses a private tmux exit buffer + `wait-for` signal, not forgeable pane scrollback. Optional START/DONE lines are for humans/debug only.
+- Interactive `send-keys`/`paste-text` during a tracked run on the same pane is undefined; wait for the command to finish or use another pane.
 - End-to-end SSH behavior is manually verified because CI does not provide a remote host.
 
 ## Source anchors

@@ -1192,32 +1192,87 @@ fn has_shell_c_wrapper(command: &str) -> bool {
         let Some(shell_idx) = shell_command_index(&args) else {
             return false;
         };
-        args.iter()
-            .skip(shell_idx + 1)
-            .take_while(|arg| arg.starts_with('-'))
-            .any(|arg| arg.chars().skip(1).any(|ch| ch == 'c'))
+        shell_args_include_c_option(&args[shell_idx + 1..])
     })
 }
 
 fn shell_command_index(args: &[String]) -> Option<usize> {
-    let first = args.first()?;
-    if is_shell_command(first) {
-        return Some(0);
-    }
-
-    if command_basename(first) != "env" {
-        return None;
-    }
-
-    args.iter().enumerate().skip(1).find_map(|(idx, arg)| {
-        if arg.starts_with('-') || arg.contains('=') {
-            None
-        } else if is_shell_command(arg) {
-            Some(idx)
-        } else {
-            None
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if is_shell_command(arg) {
+            return Some(idx);
         }
-    })
+
+        match command_basename(arg) {
+            "env" => {
+                idx += 1;
+                while idx < args.len() {
+                    let arg = &args[idx];
+                    if arg == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if arg.contains('=') {
+                        idx += 1;
+                        continue;
+                    }
+                    if !arg.starts_with('-') {
+                        break;
+                    }
+                    idx += env_option_arity(arg) + 1;
+                }
+            }
+            "command" => {
+                idx += 1;
+                while idx < args.len() {
+                    let arg = &args[idx];
+                    if arg == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    if !arg.starts_with('-') {
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn env_option_arity(arg: &str) -> usize {
+    match arg {
+        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string" => 1,
+        _ => 0,
+    }
+}
+
+fn shell_args_include_c_option(args: &[String]) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            return false;
+        }
+        if !arg.starts_with('-') {
+            return false;
+        }
+        if arg.chars().skip(1).any(|ch| ch == 'c') {
+            return true;
+        }
+        idx += shell_option_arity(arg) + 1;
+    }
+    false
+}
+
+fn shell_option_arity(arg: &str) -> usize {
+    match arg {
+        "-O" | "+O" | "-o" | "+o" => 1,
+        _ => 0,
+    }
 }
 
 fn is_shell_command(command: &str) -> bool {
@@ -1635,6 +1690,29 @@ mod tests {
         assert!(policy.check_command("(rm -rf /)").is_err());
         assert!(policy.check_command("{ rm -rf /; }").is_err());
         assert!(policy.check_command("true; (rm -rf /)").is_err());
+    }
+
+    #[test]
+    fn test_command_filter_rejects_shell_c_wrappers() {
+        let config = SecurityConfig {
+            enabled: true,
+            command_filter: CommandFilter {
+                mode: CommandFilterMode::Denylist,
+                patterns: vec!["^rm ".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        assert!(policy.check_command("bash -c 'rm -rf /'").is_err());
+        assert!(policy
+            .check_command("bash -O extglob -c 'rm -rf /'")
+            .is_err());
+        assert!(policy.check_command("command bash -c 'rm -rf /'").is_err());
+        assert!(policy
+            .check_command("env FOO=bar command bash -c 'rm -rf /'")
+            .is_err());
+        assert!(policy.check_command("bash ./script.sh").is_ok());
     }
 
     #[test]

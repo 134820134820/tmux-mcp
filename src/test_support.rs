@@ -60,7 +60,25 @@ case "$cmd" in
     printf '%b' "${TMUX_STUB_LIST_BUFFERS:-buffer0\t10\t1700000000}"
     ;;
   show-buffer)
+    # Side-channel exit buffers use -b tmux-mcp-ec-<secret>
+    for arg in "$@"; do
+      case "$arg" in
+        tmux-mcp-ec-*)
+          printf '%s' "${TMUX_STUB_EXIT_CODE:-0}"
+          exit 0
+          ;;
+      esac
+    done
     printf '%b' "${TMUX_STUB_SHOW_BUFFER:-stub-buffer}"
+    ;;
+  wait-for)
+    if [ -n "${TMUX_STUB_WAIT_FOR_SLEEP_SECS:-}" ]; then
+      sleep "${TMUX_STUB_WAIT_FOR_SLEEP_SECS}"
+    fi
+    if [ "${TMUX_STUB_WAIT_FOR_FAIL:-}" = "1" ]; then
+      echo "${TMUX_STUB_ERROR_MSG:-wait-for failed}" 1>&2
+      exit 1
+    fi
     ;;
   capture-pane)
     if [ "${TMUX_STUB_CAPTURE_OUTPUT+x}" = "x" ]; then
@@ -137,7 +155,7 @@ case "$cmd" in
       printf '%s\n' "delete-buffer $*" >> "$TMUX_STUB_DELETE_BUFFER_LOG"
     fi
     ;;
-  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|set-buffer|load-buffer)
+  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|set-buffer|load-buffer|delete-buffer)
     ;;
   *)
     echo "unknown command: $cmd" 1>&2
