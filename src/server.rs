@@ -1,6 +1,8 @@
-//! MCP server implementation for tmux-mcp-rs.
+//! stdio MCP server: tool router, input/output schemas, and dynamic resources.
 //!
-//! This module registers all tools and resources using the rmcp crate.
+//! `TmuxMcpServer` wires `CommandTracker`, `SecurityPolicy`, and the tmux adapter
+//! into rmcp tools. Policy removes disallowed routes at construction and is
+//! re-checked per call for sockets, sessions, panes, commands, and buffer paths.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use crate::types::{
     BufferInfo, BufferSearchOutput, ClientInfo, CommandStatus, Pane, SearchMode, Session, Window,
 };
 
-/// The main MCP server for tmux operations.
+/// MCP server holding command tracking state, compiled policy, and the tool router.
 #[derive(Clone)]
 pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
@@ -653,12 +655,13 @@ fn hash_path_for_socket(path: &str) -> String {
 
 #[tool_router]
 impl TmuxMcpServer {
-    /// Create a new MCP server with a command tracker and security policy.
+    /// Build a server with default search streaming thresholds.
     #[allow(dead_code)]
     pub fn new(tracker: CommandTracker, policy: SecurityPolicy) -> Self {
         Self::new_with_search(tracker, policy, SearchConfig::default())
     }
 
+    /// Build a server, merge feature-gated tool routers, and drop routes denied by policy.
     pub fn new_with_search(
         tracker: CommandTracker,
         policy: SecurityPolicy,
@@ -2610,7 +2613,6 @@ impl TmuxMcpServer {
         for _ in 0..repeat_count {
             if let Some(delay) = input.0.delay_ms {
                 if literal {
-                    // Literal mode delays between characters.
                     for ch in input.0.keys.chars() {
                         if let Err(e) = tmux::send_keys(
                             &input.0.pane_id,
@@ -2627,7 +2629,6 @@ impl TmuxMcpServer {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 } else {
-                    // Non-literal mode delays between repeats.
                     if let Err(e) =
                         tmux::send_keys(&input.0.pane_id, &input.0.keys, false, socket.as_deref())
                             .await
@@ -3077,14 +3078,12 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             });
         }
 
-        // Add pane, window, and session resources dynamically
         let can_capture_pane = self.policy.check_tool("capture-pane").is_ok();
         let mut has_pane_resources = false;
         let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
             McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
         })?;
         for session in sessions {
-            // Skip sessions not allowed by policy
             if self
                 .policy
                 .check_session_identity(&session.id, Some(&session.name))
@@ -3115,7 +3114,6 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     .iter()
                     .all(|pane| self.policy.check_pane(&pane.id).is_ok());
                 for pane in panes {
-                    // Skip panes not allowed by policy
                     if self.policy.check_pane(&pane.id).is_err() {
                         continue;
                     }
@@ -3220,13 +3218,11 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             ));
         }
 
-        // Add command result resources
         if self.policy.check_tool("get-command-result").is_ok() {
             for id in self.tracker.get_active_ids().await {
                 let Ok(Some(cmd)) = self.tracker.check_status(&id, None).await else {
                     continue;
                 };
-                // Skip commands for panes not allowed by policy
                 if self.policy.check_pane(&cmd.pane_id).is_err() {
                     continue;
                 }

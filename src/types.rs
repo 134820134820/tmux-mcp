@@ -1,3 +1,8 @@
+//! Shared DTOs for tmux topology, paste buffers, buffer search, and tracked commands.
+//!
+//! These types cross the MCP tool/resource boundary as JSON (camelCase fields where
+//! noted) and also back in-process tracking state that is not serialized.
+
 #![allow(dead_code)]
 
 use schemars::JsonSchema;
@@ -5,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-/// Summary of a tmux session.
+/// tmux session summary returned by list/find tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Session {
     pub id: String,
@@ -14,7 +19,7 @@ pub struct Session {
     pub windows: u32,
 }
 
-/// Summary of a tmux window.
+/// tmux window summary returned by list tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Window {
     pub id: String,
@@ -23,7 +28,7 @@ pub struct Window {
     pub session_id: String,
 }
 
-/// Summary of a tmux pane.
+/// tmux pane summary returned by list tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Pane {
     pub id: String,
@@ -32,7 +37,7 @@ pub struct Pane {
     pub title: String,
 }
 
-/// Detailed metadata for a tmux pane.
+/// Detailed pane metadata (cwd, command, size, pid) for targeting and layout tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PaneInfo {
     pub id: String,
@@ -48,7 +53,7 @@ pub struct PaneInfo {
     pub in_mode: bool,
 }
 
-/// Detailed metadata for a tmux window.
+/// Detailed window metadata (layout, zoom, active pane) for focus and layout tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WindowInfo {
     pub id: String,
@@ -63,7 +68,7 @@ pub struct WindowInfo {
     pub active_pane_id: String,
 }
 
-/// Information about an attached tmux client.
+/// Attached tmux client (TTY/session/pid) used for observer-aware operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientInfo {
     pub tty: String,
@@ -73,7 +78,7 @@ pub struct ClientInfo {
     pub attached: bool,
 }
 
-/// Information about a tmux paste buffer.
+/// Paste-buffer listing entry with size and creation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BufferInfo {
     pub name: String,
@@ -85,7 +90,7 @@ pub struct BufferInfo {
     pub created: Option<i64>,
 }
 
-/// Search modes for buffer search tools.
+/// Match strategy for `search-buffer` / `subsearch-buffer` tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
@@ -93,7 +98,7 @@ pub enum SearchMode {
     Regex,
 }
 
-/// A single buffer search match with context.
+/// One buffer search hit with byte offsets, context window, and optional similarity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BufferSearchMatch {
     #[serde(rename = "matchId")]
@@ -111,7 +116,10 @@ pub struct BufferSearchMatch {
     pub similarity: Option<f32>,
 }
 
-/// Structured output for search-buffer and subsearch-buffer tools.
+/// Structured result of a multi-buffer or anchor-scoped buffer search.
+///
+/// Includes scan budgets, truncation/resume cursors, and optional fuzzy stats so
+/// clients can page large buffers without re-scanning completed ranges.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BufferSearchOutput {
     pub query: String,
@@ -148,21 +156,21 @@ pub struct BufferSearchOutput {
     pub fuzzy_skipped_bytes: u64,
 }
 
-/// Window with its panes for tree snapshots.
+/// Window node in a session tree snapshot (window plus its panes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WindowTree {
     pub window: Window,
     pub panes: Vec<Pane>,
 }
 
-/// Session tree with windows and panes.
+/// Session tree snapshot used by session resources and multi-pane planning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionTree {
     pub session: Session,
     pub windows: Vec<WindowTree>,
 }
 
-/// Supported shell types for command tracking.
+/// Shell dialect used when wrapping tracked commands with START/DONE markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellType {
@@ -173,7 +181,7 @@ pub enum ShellType {
     Unknown,
 }
 
-/// Execution status for a tracked command.
+/// Lifecycle status of a tracked command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
@@ -182,7 +190,9 @@ pub enum CommandStatus {
     Error,
 }
 
-/// Tracked command execution record.
+/// In-memory record of a command sent to a pane, including tracking markers state.
+///
+/// Not serialized on the wire as-is; MCP tools project selected fields into tool output.
 #[derive(Debug, Clone)]
 pub struct CommandExecution {
     pub id: String,

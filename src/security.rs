@@ -1,3 +1,10 @@
+//! Security policy for the MCP tool surface, tmux targets, and shell commands.
+//!
+//! Loads `config.toml` / `TMUX_MCP_TOOLS` into a compiled `SecurityPolicy` that
+//! gates tools by capability flags and allow/deny groups, restricts sockets/
+//! sessions/panes, sandboxes buffer filesystem paths, and regex-filters shell
+//! statements after splitting on `;`/`|`/`&` and command substitutions.
+
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -9,6 +16,7 @@ use crate::errors::{Error, Result};
 const TOOLS_ENV_VAR: &str = "TMUX_MCP_TOOLS";
 const DEFAULT_BUFFER_DIR_NAME: &str = "tmux-mcp-buffers";
 
+/// Whether `ToolFilter` items disable tools or form an exclusive allow set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolFilterMode {
@@ -401,7 +409,7 @@ pub struct SshConfig {
     pub remote: Option<String>,
 }
 
-/// Search configuration loaded from config.toml.
+/// `[search]` section: when paste-buffer scans spill from memory to temp files.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
@@ -431,7 +439,10 @@ pub struct CommandFilter {
     pub patterns: Vec<String>,
 }
 
-/// Security policy configuration loaded from config.toml.
+/// `[security]` section of config.toml: capability flags, target allowlists, filters.
+///
+/// When `enabled` is false, enforcement methods short-circuit to allow. Optional
+/// allowlists (`None`) mean unrestricted for that dimension; `Some(empty)` denies all.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
@@ -499,7 +510,7 @@ impl Default for SecurityConfig {
     }
 }
 
-/// Root configuration file schema for config.toml.
+/// Full config.toml schema (shell, ssh, security, tracking, search sections).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
@@ -515,7 +526,7 @@ pub struct ConfigFile {
     pub search: SearchConfig,
 }
 
-/// Enforces security rules derived from configuration.
+/// Compiled runtime enforcer for tool, target, path, and command policy checks.
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
     config: SecurityConfig,
@@ -530,10 +541,12 @@ impl Default for SecurityPolicy {
 }
 
 impl SecurityPolicy {
+    /// Compile a policy from a deserialized `SecurityConfig` (no env overlay).
     pub fn from_config(config: SecurityConfig) -> Result<Self> {
         Self::compile(config)
     }
 
+    /// Compile a policy, letting `TMUX_MCP_TOOLS` override the tool filter when set.
     pub fn from_config_with_env(mut config: SecurityConfig) -> Result<Self> {
         if let Some(filter) = tool_filter_from_env()? {
             config.tools = filter;
@@ -541,11 +554,12 @@ impl SecurityPolicy {
         Self::compile(config)
     }
 
+    /// Default-permissive capability flags with optional `TMUX_MCP_TOOLS` overlay.
     pub fn default_with_env() -> Result<Self> {
         Self::from_config_with_env(SecurityConfig::default())
     }
 
-    /// Load and compile policy configuration from a TOML file.
+    /// Load `config.toml`, take the `[security]` section, and apply env overlays.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| Error::Config {
             message: format!("failed to read config file: {e}"),
@@ -915,6 +929,7 @@ impl SecurityPolicy {
         }
     }
 
+    /// Remote dirs that must pass SSH path checks when validating buffer paths.
     pub fn remote_buffer_allowlist_candidates(&self) -> Vec<String> {
         match &self.config.allowed_buffer_paths {
             Some(paths) => paths.clone(),
@@ -922,10 +937,12 @@ impl SecurityPolicy {
         }
     }
 
+    /// True when policy is on and buffer IO defaults to the temp sandbox directory.
     pub fn uses_default_buffer_dir(&self) -> bool {
         self.config.enabled && self.config.allowed_buffer_paths.is_none()
     }
 
+    /// Map a caller buffer path into a remote candidate before SSH realpath.
     pub fn remote_buffer_path_candidate(&self, path: &str) -> Result<String> {
         if !self.config.enabled {
             return Ok(path.to_string());
@@ -957,6 +974,7 @@ impl SecurityPolicy {
         ))
     }
 
+    /// Split a remote buffer path into parent directory and filename for staged writes.
     pub fn remote_buffer_destination_path_candidate(&self, path: &str) -> Result<(String, String)> {
         let candidate = self.remote_buffer_path_candidate(path)?;
         let candidate_path = Path::new(&candidate);
@@ -980,6 +998,7 @@ impl SecurityPolicy {
         Ok((parent, filename))
     }
 
+    /// Finalize a remote buffer write path after the parent has been canonicalized over SSH.
     pub fn resolve_remote_buffer_destination_path(
         &self,
         path: &str,
@@ -1024,10 +1043,12 @@ impl SecurityPolicy {
     }
 }
 
+/// Local default sandbox directory for buffer save/load when no allowlist is set.
 pub fn default_buffer_dir() -> PathBuf {
     std::env::temp_dir().join(DEFAULT_BUFFER_DIR_NAME)
 }
 
+/// Remote default sandbox directory for buffer paths under SSH (`/tmp/...`).
 pub fn default_remote_buffer_dir() -> String {
     format!("/tmp/{DEFAULT_BUFFER_DIR_NAME}")
 }

@@ -1,3 +1,9 @@
+//! CLI entrypoint for the tmux-mcp-rs stdio MCP server.
+//!
+//! Loads optional `config.toml`, applies socket/SSH overrides via env, gates on
+//! tmux 3.x when the version is detectable, then serves tools over stdio until
+//! Ctrl-C / SIGTERM.
+
 mod commands;
 mod errors;
 mod security;

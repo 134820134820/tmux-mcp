@@ -1,7 +1,9 @@
-//! Command execution tracking with markers for tmux-mcp.
+//! Marker-based command execution tracking for agent-driven shell work in panes.
 //!
-//! This module provides the `CommandTracker` struct that manages command execution
-//! in tmux panes, using special markers to track command start/completion and exit codes.
+//! `CommandTracker` wraps user commands with START/DONE markers, sends them via
+//! `send-keys`, then polls pane history (with capture backoff) until a DONE exit
+//! code appears, markers scroll off past a deadline, or tracking is disabled
+//! (`raw_mode` / `no_enter`).
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -50,7 +52,7 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Tracking configuration for command capture retries.
+/// Capture backoff, completion retention, and expiry budgets for tracked commands.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackingConfig {
@@ -107,7 +109,7 @@ impl Default for TrackingConfig {
     }
 }
 
-/// Tracks active and recently completed commands across tmux panes.
+/// In-process registry of pending and recently completed pane commands.
 #[derive(Debug)]
 pub struct CommandTracker {
     active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
@@ -116,12 +118,12 @@ pub struct CommandTracker {
 }
 
 impl CommandTracker {
-    /// Create a new CommandTracker for the given shell type.
+    /// Build a tracker with default capture/retention budgets for `shell_type`.
     pub fn new(shell_type: ShellType) -> Self {
         Self::with_tracking(shell_type, TrackingConfig::default())
     }
 
-    /// Create a new CommandTracker with custom tracking configuration.
+    /// Build a tracker with caller-supplied capture/retention budgets.
     pub fn with_tracking(shell_type: ShellType, tracking: TrackingConfig) -> Self {
         Self {
             active_commands: Arc::new(RwLock::new(HashMap::new())),
@@ -130,9 +132,10 @@ impl CommandTracker {
         }
     }
 
-    /// Execute a command in a tmux pane with optional tracking markers.
+    /// Send a command into a pane, optionally wrapping it with START/DONE markers.
     ///
-    /// Returns the command ID that can be used to check status.
+    /// Returns a command id for later `check_status` polls. Tracking is disabled
+    /// for `raw_mode` or `no_enter` (markers would not complete reliably).
     pub async fn execute_command(
         &self,
         pane_id: &str,
@@ -167,7 +170,9 @@ impl CommandTracker {
         let (wrapped_command, tracking_disabled) = if raw_mode || no_enter {
             (command.to_string(), true)
         } else {
-            let marker_shell = self.marker_shell_type(pane_id, resolved_socket.as_deref()).await;
+            let marker_shell = self
+                .marker_shell_type(pane_id, resolved_socket.as_deref())
+                .await;
             let end_marker = get_end_marker(&marker_shell, &command_id);
             let start_marker = get_start_marker(&command_id);
             let wrapped = wrap_tracked_command(command, &start_marker, &end_marker);
@@ -231,14 +236,12 @@ impl CommandTracker {
                 .await?;
             }
         } else {
-            // Send command as a whole (not literal/per-character)
             rollback_on_send_error(
                 &self.active_commands,
                 &command_id,
                 tmux::send_keys(pane_id, &wrapped_command, false, resolved_socket.as_deref()).await,
             )
             .await?;
-            // Send Enter if needed
             if !no_enter {
                 rollback_on_send_error(
                     &self.active_commands,
@@ -252,10 +255,10 @@ impl CommandTracker {
         Ok(command_id)
     }
 
-    /// Check the status of a command by its ID.
+    /// Poll pane history for markers and return the latest execution snapshot.
     ///
-    /// Returns `None` if the command ID is not found.
-    /// Updates the command status based on captured pane output.
+    /// Returns `None` if the id is unknown. Terminal statuses are sticky; Pending
+    /// entries re-capture with line backoff until DONE, expiry, or retention cleanup.
     pub async fn check_status(
         &self,
         command_id: &str,
@@ -358,19 +361,19 @@ impl CommandTracker {
         Ok(Some(execution))
     }
 
-    /// Get a command by ID without updating its status.
+    /// Snapshot a tracked command without re-capturing the pane.
     pub async fn get_command(&self, id: &str) -> Option<CommandExecution> {
         let commands = self.active_commands.read().await;
         commands.get(id).cloned()
     }
 
-    /// Get all active command IDs.
+    /// List ids currently held in the tracker map (pending and retained completed).
     pub async fn get_active_ids(&self) -> Vec<String> {
         let commands = self.active_commands.read().await;
         commands.keys().cloned().collect()
     }
 
-    /// Remove all tracked commands for a pane and return the number purged.
+    /// Drop every tracked entry bound to `pane_id` (e.g. after the pane is killed).
     pub async fn purge_pane(&self, pane_id: &str) -> usize {
         let mut commands = self.active_commands.write().await;
         let before = commands.len();
@@ -453,6 +456,9 @@ fn end_marker_prefix(command_id: &str) -> String {
     format!("{END_MARKER_PREFIX}{command_id}_")
 }
 
+/// Build the shell snippet that prints the DONE marker with exit code.
+///
+/// Fish uses `$status`; bash/zsh use `$?`.
 pub fn get_end_marker(shell: &ShellType, command_id: &str) -> String {
     let prefix = end_marker_prefix(command_id);
     match shell {
@@ -495,7 +501,8 @@ fn has_unquoted_shell_comment_marker(command: &str) -> bool {
             '#' if !in_single_quote && !in_double_quote && at_word_start => return true,
             ch if !in_single_quote
                 && !in_double_quote
-                && (ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>')) =>
+                && (ch.is_whitespace()
+                    || matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>')) =>
             {
                 at_word_start = true;
             }
@@ -716,8 +723,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case("grep foo", "echo \"TMUX_MCP_START_cmd-1\"; grep foo ; echo \"TMUX_MCP_DONE_cmd-1_$?\"")]
-    #[case("true", "echo \"TMUX_MCP_START_cmd-1\"; true ; echo \"TMUX_MCP_DONE_cmd-1_$?\"")]
+    #[case(
+        "grep foo",
+        "echo \"TMUX_MCP_START_cmd-1\"; grep foo ; echo \"TMUX_MCP_DONE_cmd-1_$?\""
+    )]
+    #[case(
+        "true",
+        "echo \"TMUX_MCP_START_cmd-1\"; true ; echo \"TMUX_MCP_DONE_cmd-1_$?\""
+    )]
     #[case(
         r"grep foo\",
         r#"echo "TMUX_MCP_START_cmd-1"; grep foo\ ; echo "TMUX_MCP_DONE_cmd-1_$?""#
@@ -784,9 +797,7 @@ mod tests {
     #[case("echo R&D")]
     #[case("true && echo ok")]
     #[case("echo hi &> out.txt")]
-    fn test_has_unquoted_shell_background_operator_allows_data_ampersand(
-        #[case] command: &str,
-    ) {
+    fn test_has_unquoted_shell_background_operator_allows_data_ampersand(#[case] command: &str) {
         assert!(!has_unquoted_shell_background_operator(command));
     }
 
@@ -1096,7 +1107,14 @@ mod tests {
         let tracker = CommandTracker::new(ShellType::Bash);
 
         let id = tracker
-            .execute_command("%1", r##"echo "# not a comment""##, false, false, None, None)
+            .execute_command(
+                "%1",
+                r##"echo "# not a comment""##,
+                false,
+                false,
+                None,
+                None,
+            )
             .await
             .expect("quoted hash should be allowed");
 
@@ -1335,11 +1353,7 @@ mod tests {
     async fn purge_pane_removes_only_matching_pane_entries() {
         let tracker = CommandTracker::new(ShellType::Bash);
 
-        for (id, pane_id) in [
-            ("matching-1", "%1"),
-            ("other", "%2"),
-            ("matching-2", "%1"),
-        ] {
+        for (id, pane_id) in [("matching-1", "%1"), ("other", "%2"), ("matching-2", "%1")] {
             let execution = CommandExecution {
                 id: id.into(),
                 pane_id: pane_id.into(),
@@ -1891,6 +1905,45 @@ mod tests {
         assert!(commands.contains_key(&middle_id));
         assert!(commands.contains_key(&newest_id));
         assert!(commands.contains_key(&pending_id));
+    }
+
+    #[tokio::test]
+    async fn cleanup_completed_zero_max_entries_keeps_fresh_completed_within_retention() {
+        let tracking = TrackingConfig {
+            completed_retention_minutes: 10,
+            completed_max_entries: 0,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let id = "fresh-completed".to_string();
+        let now = Instant::now();
+        let execution = CommandExecution {
+            id: id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "echo fresh".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            output: Some("fresh".into()),
+            started_at: now,
+            completed_at: Some(now),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(id.clone(), execution);
+        }
+
+        tracker.cleanup_completed().await;
+
+        let command = tracker
+            .get_command(&id)
+            .await
+            .expect("fresh completed command should remain within retention");
+        assert_eq!(command.status, CommandStatus::Completed);
+        assert_eq!(command.output.as_deref(), Some("fresh"));
     }
 
     #[tokio::test]

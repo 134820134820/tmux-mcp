@@ -1,3 +1,10 @@
+//! Local and SSH-wrapped tmux process adapter, output parsers, and buffer search.
+//!
+//! Owns socket/SSH resolution, bounded concurrency for tmux spawns, tabular
+//! list parsers, create/split/send operations, paste-buffer IO, and windowed
+//! buffer search used by MCP tools. Prefer isolated sockets via
+//! `TMUX_MCP_SOCKET` or per-call overrides when running multi-agent workloads.
+
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,6 +136,7 @@ fn get_ssh_args() -> Result<Option<Vec<String>>> {
     }
 }
 
+/// True when `TMUX_MCP_SSH` is set to a non-empty connection string.
 pub fn ssh_enabled() -> Result<bool> {
     Ok(get_ssh_args()?.is_some())
 }
@@ -344,6 +352,7 @@ pub async fn execute_tmux(args: &[&str]) -> Result<String> {
     execute_tmux_with_socket(args, None).await
 }
 
+/// Resolve a remote path with `realpath` over SSH (requires `TMUX_MCP_SSH`).
 pub async fn canonicalize_remote_path(path: &str) -> Result<String> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
         message: "remote path canonicalization requires TMUX_MCP_SSH".to_string(),
@@ -369,6 +378,7 @@ pub async fn canonicalize_remote_path(path: &str) -> Result<String> {
     }
 }
 
+/// Check whether a remote path is a symlink (`test -L`) over SSH.
 pub async fn remote_path_is_symlink(path: &str) -> Result<bool> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
         message: "remote symlink check requires TMUX_MCP_SSH".to_string(),
@@ -388,6 +398,7 @@ pub async fn remote_path_is_symlink(path: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
+/// Create a remote directory with `mkdir -p` over SSH.
 pub async fn create_remote_dir(path: &str) -> Result<()> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
         message: "remote directory creation requires TMUX_MCP_SSH".to_string(),
@@ -1652,6 +1663,10 @@ async fn load_buffer_window(
     }
 }
 
+/// Search one or more paste buffers with literal/regex matching and optional fuzzy scoring.
+///
+/// Loads windowed slices (streaming large buffers to disk when over the threshold),
+/// respects per-buffer resume offsets, and returns match metadata plus truncation cursors.
 #[allow(clippy::too_many_arguments)]
 pub async fn search_buffers(
     names: Option<Vec<String>>,
@@ -1721,6 +1736,7 @@ pub async fn search_buffers(
     search_texts(buffer_texts, query, mode, options)
 }
 
+/// Search within a byte window around a prior match anchor in one paste buffer.
 #[allow(clippy::too_many_arguments)]
 pub async fn subsearch_buffer(
     buffer: &str,
