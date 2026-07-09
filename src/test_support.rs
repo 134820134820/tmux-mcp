@@ -1,3 +1,8 @@
+//! Process stubs for unit tests that must not call a real tmux or ssh binary.
+//!
+//! Installs temporary `tmux` and `ssh` scripts on `PATH` and restores env on drop.
+//! Responses are driven by `TMUX_STUB_*` environment variables.
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -157,6 +162,7 @@ fi
 exec sh -c "$remote_command"
 "#;
 
+/// RAII fixture that serializes env mutation and injects stub `tmux`/`ssh` binaries.
 pub struct TmuxStub {
     _lock: MutexGuard<'static, ()>,
     _dir: TempDir,
@@ -164,6 +170,7 @@ pub struct TmuxStub {
 }
 
 impl TmuxStub {
+    /// Acquire the global env lock, write stubs into a temp dir, and prepend them to `PATH`.
     pub fn new() -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("create temp dir");
@@ -189,11 +196,13 @@ impl TmuxStub {
         stub
     }
 
+    /// Set an env var, restoring the prior value when this stub is dropped.
     pub fn set_var(&mut self, key: &str, value: impl AsRef<OsStr>) {
         self.record_original(key);
         env::set_var(key, value);
     }
 
+    /// Unset an env var, restoring the prior value when this stub is dropped.
     pub fn remove_var(&mut self, key: &str) {
         self.record_original(key);
         env::remove_var(key);

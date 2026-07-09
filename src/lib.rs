@@ -1,14 +1,17 @@
-//! Public API surface for the tmux-mcp-rs library.
+//! Library surface for embedding the tmux MCP control plane.
+//!
+//! Modules cover marker-based command tracking, security policy, the tmux process
+//! adapter, and shared DTO types. The binary crate owns the stdio MCP server loop.
 
-/// Command execution tracking helpers and markers.
+/// Marker-based command execution tracking across tmux panes.
 pub mod commands;
-/// Error types and Result alias for the library.
+/// Domain errors and the crate-wide `Result` alias.
 pub mod errors;
-/// Security policy configuration and enforcement.
+/// Security policy: tool surface, allowlists, command filters, buffer path sandbox.
 pub mod security;
-/// Low-level tmux command wrappers and parsers.
+/// Local/SSH tmux process adapter, parsers, and buffer search.
 pub mod tmux;
-/// Shared data types used across tools and responses.
+/// Shared session/window/pane/buffer/search DTOs used by tools and resources.
 pub mod types;
 
 #[cfg(test)]

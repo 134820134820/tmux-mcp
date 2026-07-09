@@ -1,3 +1,5 @@
+//! Domain error taxonomy for policy, tmux process, and parse failures.
+
 #![allow(dead_code)]
 
 use thiserror::Error;
@@ -5,26 +7,26 @@ use thiserror::Error;
 /// Convenience result type for tmux-mcp-rs operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Error variants returned by tmux-mcp-rs APIs.
+/// Error variants returned across the library and MCP tool boundary.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Configuration parsing or IO failure.
+    /// Configuration file IO or TOML/schema failure.
     #[error("config error: {message}")]
     Config { message: String },
 
-    /// Security policy denied the requested operation.
+    /// Security policy denied the requested tool, target, path, or command.
     #[error("policy denied: {message}")]
     PolicyDenied { message: String },
 
-    /// tmux command execution failed.
+    /// tmux (or SSH-wrapped tmux) process failed or returned a non-zero status.
     #[error("tmux error: {message}")]
     Tmux { message: String },
 
-    /// Output parsing failed.
+    /// Tabular or marker output from tmux could not be parsed.
     #[error("parse error: {message}")]
     Parse { message: String },
 
-    /// Invalid arguments were provided.
+    /// Caller-supplied arguments failed validation before execution.
     #[error("invalid argument: {message}")]
     InvalidArgument { message: String },
 }
