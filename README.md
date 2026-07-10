@@ -344,7 +344,7 @@ streaming_threshold_bytes = 262144
 | `security.tools.mode` | `deny`, `allow` | `deny` | Runtime tool-surface filter mode. |
 | `security.tools.items` | string array | `[]` | Exact tool names or groups such as `@raw-input`. |
 
-`security.command_filter` checks each non-empty shell statement for `execute-command`, `send-keys` (literal and non-literal), `paste-text`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, and newlines, then recursively checks command substitutions, process substitutions, subshells, and brace groups. It rejects shell forms it cannot safely analyze, including ANSI-C `$'...'` quoting and shell `-c` wrappers. It does not screen special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
+`security.command_filter` checks each non-empty shell statement for `execute-command`, `send-keys` (literal and non-literal), `paste-text`, `set-buffer`, `append-buffer`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, and newlines, then recursively checks command substitutions, process substitutions, subshells, and brace groups. It rejects shell forms it cannot safely analyze, including ANSI-C `$'...'` quoting and shell `-c` wrappers. It does not screen special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
 
 ### Tracking options
 
@@ -479,7 +479,7 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 
 Prefer `execute-command` with resource subscribe/read (or `get-command-result` + `waitMs`) for non-interactive commands. Tracked commands queue per pane. Use `capture-pane` for live progress only; do not treat pane DONE markers as authoritative. Use raw input tools only for prompts, REPLs, editors, pagers, and TUIs—and not while a tracked command is running on that pane.
 
-Tracked command snapshots use `schemaVersion: 1` and move through `queued`, `running`, then `completed`, `failed`, `cancelled`, or `tracking_error`. Normal tracked commands reject embedded newlines, unquoted shell comment markers (`#`), and unquoted background operators (`&`) because those forms can bypass the tracking epilogue. Set `rawMode=true` or `noEnter=true` only when you intentionally want to disable side-channel completion tracking; those records remain `running`.
+Tracked command snapshots use `schemaVersion: 1` and currently move through `queued`, `running`, then `completed`, `failed`, or `tracking_error`. The schema also reserves `cancelled`, but the current tracker does not emit it. Normal tracked commands reject embedded newlines, unquoted shell comment markers (`#`), and unquoted background operators (`&`) because those forms can bypass the tracking epilogue. Set `rawMode=true` or `noEnter=true` only when you intentionally want to disable side-channel completion tracking; those records remain `running`.
 
 `show-buffer` reads at most 65,536 bytes by default. `search-buffer` defaults to 40 context bytes, 50 matches, and 65,536 scanned bytes per buffer; it returns byte offsets and resume cursors when results are truncated. Literal and regex search are always available. Fuzzy matching and similarity scores require the `rapidfuzz` Cargo feature, which is enabled by default.
 
