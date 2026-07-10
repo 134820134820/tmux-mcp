@@ -1,5 +1,13 @@
 #!/usr/bin/env node
-// npm distribution shim: downloads the platform release binary into a local cache and forwards argv.
+/**
+ * npm distribution entry for `@bnomei/tmux-mcp-rs`.
+ *
+ * Resolves the matching GitHub Release asset into a versioned local cache
+ * (or uses `TMUX_MCP_RS_LOCAL_BIN`), then execs the native binary with the
+ * original argv. Override version/repo with `TMUX_MCP_RS_VERSION` /
+ * `TMUX_MCP_RS_REPOSITORY`; set `TMUX_MCP_RS_SKIP_DOWNLOAD=1` to fail closed
+ * when the binary is not already cached.
+ */
 "use strict";
 
 const childProcess = require("child_process");

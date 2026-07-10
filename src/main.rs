@@ -46,6 +46,7 @@ struct Cli {
     ssh: Option<String>,
 }
 
+/// Map CLI/`config.toml` shell names to the tracker dialect (case-insensitive).
 fn parse_shell_type(s: &str) -> Result<ShellType, String> {
     match s.to_lowercase().as_str() {
         "bash" => Ok(ShellType::Bash),
@@ -177,10 +178,6 @@ async fn main() {
         }
     }
 
-    // This server targets tmux 3.x; older releases differ in output formats and
-    // flags (e.g. tmux 3.4 needs `-l <pct>%` rather than `-p <pct>` for splits).
-    // Fail fast on tmux 2.x so the failure is legible instead of mysterious
-    // mid-operation errors. If the version can't be determined, proceed.
     if let Some((major, minor)) = crate::tmux::tmux_version().await {
         if major < 3 {
             eprintln!("Error: tmux-mcp-rs requires tmux 3.0 or newer; found tmux {major}.{minor}");

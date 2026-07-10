@@ -27,12 +27,16 @@ pub enum ToolFilterMode {
     Allow,
 }
 
-/// Runtime tool-surface filtering configuration.
+/// Runtime tool-surface filtering configuration (`[security.tools]` / `TMUX_MCP_TOOLS`).
+///
+/// `items` accept tool names or group labels from the internal tool manifest
+/// (for example `read`, `execute`, `interactive`).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ToolFilter {
     #[serde(default)]
     pub mode: ToolFilterMode,
+    /// Tool names or group labels expanded against the tool manifest.
     #[serde(default)]
     pub items: Vec<String>,
 }
@@ -393,18 +397,20 @@ pub enum CommandFilterMode {
     Denylist,
 }
 
-/// Shell configuration loaded from config.toml.
+/// `[shell]` section: default dialect for tracked-command marker wrapping.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ShellConfig {
+    /// One of `bash`, `zsh`, or `fish` (CLI `--shell-type` wins when unset).
     #[serde(rename = "type")]
     pub shell_type: Option<String>,
 }
 
-/// SSH configuration loaded from config.toml.
+/// `[ssh]` section: optional remote tmux control via OpenSSH.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SshConfig {
+    /// Connection string accepted by `parse_ssh_args` (for example `user@host`).
     #[serde(default)]
     pub remote: Option<String>,
 }
@@ -413,6 +419,7 @@ pub struct SshConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchConfig {
+    /// Buffer size above which search streams `show-buffer` to a temp file first.
     #[serde(default = "default_streaming_threshold_bytes")]
     pub streaming_threshold_bytes: u64,
 }
@@ -429,12 +436,13 @@ impl Default for SearchConfig {
     }
 }
 
-/// Regex-based command filtering configuration.
+/// Regex-based command filtering configuration for `execute-command` statements.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CommandFilter {
     #[serde(default)]
     pub mode: CommandFilterMode,
+    /// Rust regex patterns applied per split shell statement (not the raw line alone).
     #[serde(default)]
     pub patterns: Vec<String>,
 }
@@ -446,6 +454,7 @@ pub struct CommandFilter {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
+    /// Master switch; when false every check short-circuits to allow.
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_true")]
@@ -464,16 +473,20 @@ pub struct SecurityConfig {
     pub allow_rename: bool,
     #[serde(default = "default_true")]
     pub allow_move: bool,
+    /// Also gates buffer-read tools (show/search/save/load/…).
     #[serde(default = "default_true")]
     pub allow_capture: bool,
     #[serde(default = "default_true")]
     pub allow_list: bool,
+    /// `None` = unrestricted; `Some([])` denies every socket.
     #[serde(default)]
     pub allowed_sockets: Option<Vec<String>>,
+    /// Match by session id or session name when present.
     #[serde(default)]
     pub allowed_sessions: Option<Vec<String>>,
     #[serde(default)]
     pub allowed_panes: Option<Vec<String>>,
+    /// Absolute dirs for buffer save/load; unset uses the process temp sandbox.
     #[serde(default)]
     pub allowed_buffer_paths: Option<Vec<String>>,
     #[serde(default)]
@@ -1384,14 +1397,13 @@ fn is_shell_group_open_brace(chars: &[char], index: usize) -> bool {
 
 /// Split a command into the individual shell statements the shell would run.
 ///
-/// Statements are separated on unquoted `;`, `|`, shell-control `&`, and
-/// newlines. Single quotes are treated as literal (no splitting or substitution inside them).
-/// Inside double quotes, separators do not split but command substitutions are
-/// still active. Command substitutions `$(...)` and backtick `` `...` `` are
-/// recursively extracted so the commands they run are checked too. Bash/zsh
-/// process substitutions `<(...)`/`>(...)` are recursively extracted only when
-/// unquoted. POSIX subshells `( ... )` and brace groups `{ ... ; }` are also
-/// recursively extracted when unquoted.
+/// Separators are unquoted `;`, `|`, shell-control `&`, and newlines. Escapes
+/// (`\;`) keep the next character literal so they are not treated as separators.
+/// Single quotes are fully literal (no split/substitution). Inside double quotes,
+/// separators do not split but command substitutions still run. Nested `$(...)`,
+/// backticks, unquoted `<(...)`/`>(...)`, subshells, and brace groups are
+/// extracted recursively; matching uses quote-aware paren/brace walkers so a
+/// quoted closer cannot end the group early.
 fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
@@ -1423,8 +1435,6 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 i += 1;
             }
             '\\' => {
-                // Preserve an escaped character verbatim so `\;` etc. are not
-                // mistaken for statement separators.
                 current.push(c);
                 if i + 1 < chars.len() {
                     current.push(chars[i + 1]);
@@ -1434,7 +1444,6 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 }
             }
             '`' => {
-                // Backtick command substitution: extract inner statements.
                 let start = i + 1;
                 let mut j = start;
                 while j < chars.len() && chars[j] != '`' {
@@ -1449,9 +1458,6 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 i = j + 1;
             }
             '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
-                // `$(...)` command substitution: extract inner statements,
-                // tracking nested parentheses without letting quoted `)` close
-                // the substitution early.
                 let start = i + 2;
                 let j = find_matching_paren(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
@@ -1459,9 +1465,6 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 i = j + 1;
             }
             '<' | '>' if !in_double && i + 1 < chars.len() && chars[i + 1] == '(' => {
-                // Bash/zsh process substitution: extract inner statements,
-                // tracking nested parentheses without letting quoted `)` close
-                // the substitution early.
                 let start = i + 2;
                 let j = find_matching_paren(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
@@ -1469,8 +1472,6 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 i = j + 1;
             }
             '(' if !in_double => {
-                // POSIX subshell: extract inner statements, tracking nested
-                // parentheses without letting quoted `)` close the group early.
                 let start = i + 1;
                 let j = find_matching_paren(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
@@ -1478,8 +1479,6 @@ fn collect_shell_statements(input: &str, out: &mut Vec<String>) {
                 i = j + 1;
             }
             '{' if !in_double && is_shell_group_open_brace(&chars, i) => {
-                // Brace group: extract inner statements, tracking nested braces
-                // without letting quoted `}` close the group early.
                 let start = i + 1;
                 let j = find_matching_brace(&chars, start);
                 let inner: String = chars[start..j.min(chars.len())].iter().collect();
@@ -1676,17 +1675,13 @@ mod tests {
         };
         let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
-        // Semicolon, pipe, and ampersand chaining must not smuggle past the filter.
         assert!(policy.check_command("true; rm -rf /").is_err());
         assert!(policy.check_command("true | rm -rf /").is_err());
         assert!(policy.check_command("true && rm -rf /").is_err());
         assert!(policy.check_command("true & rm -rf /").is_err());
-        // Command substitution must also be screened.
         assert!(policy.check_command("echo $(rm -rf /)").is_err());
         assert!(policy.check_command("echo `rm -rf /`").is_err());
-        // Plain allowed command still passes.
         assert!(policy.check_command("true; echo ok").is_ok());
-        // Subshell and brace groups must also be screened.
         assert!(policy.check_command("(rm -rf /)").is_err());
         assert!(policy.check_command("{ rm -rf /; }").is_err());
         assert!(policy.check_command("true; (rm -rf /)").is_err());
@@ -1795,7 +1790,6 @@ mod tests {
 
         assert!(policy.check_command("git status").is_ok());
         assert!(policy.check_command("git status; git log").is_ok());
-        // A disallowed statement chained after an allowed prefix is rejected.
         assert!(policy.check_command("git status; rm -rf /").is_err());
         assert!(policy.check_command("git status && curl evil").is_err());
     }
@@ -1848,8 +1842,6 @@ mod tests {
         };
         let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
-        // Inside single quotes the shell does not split or substitute, so the
-        // literal text is not a separate statement.
         assert!(policy.check_command("echo 'true; rm -rf /'").is_ok());
         assert!(policy.check_command("echo '$(rm -rf /)'").is_ok());
     }

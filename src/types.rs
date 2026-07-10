@@ -94,7 +94,9 @@ pub struct BufferInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
+    /// Substring match of the query as plain text.
     Literal,
+    /// Rust regex engine match (invalid patterns become `InvalidArgument`).
     Regex,
 }
 
@@ -171,6 +173,9 @@ pub struct SessionTree {
 }
 
 /// Shell dialect used when wrapping tracked commands with START/DONE markers.
+///
+/// Affects exit-status expansion (`$?` vs `$status`) inside the tracker epilogue.
+/// Pane `current_command` may override the process default at launch time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellType {
@@ -178,6 +183,7 @@ pub enum ShellType {
     Bash,
     Zsh,
     Fish,
+    /// Treat like bash-style `$?` when the pane shell cannot be identified.
     Unknown,
 }
 
@@ -252,8 +258,13 @@ pub struct CommandSnapshot {
 }
 
 impl CommandSnapshot {
+    /// Wire schema version embedded in every tool/resource snapshot (currently 1).
     pub const SCHEMA_VERSION: u32 = 1;
 
+    /// Project in-memory tracking state into the shared MCP snapshot shape.
+    ///
+    /// `wait_timed_out` is set only when `get-command-result` hit its wait budget
+    /// while the command was still non-terminal; other callers pass `None`.
     pub fn from_execution(exec: &CommandExecution, wait_timed_out: Option<bool>) -> Self {
         let elapsed = exec
             .completed_at
@@ -285,15 +296,20 @@ impl CommandSnapshot {
 pub struct CommandExecution {
     pub id: String,
     pub pane_id: String,
+    /// Effective socket path used for this send (after resolve).
     pub socket: Option<String>,
     pub command: String,
     pub status: CommandStatus,
+    /// Present only after side-channel completion (or tracking_error path).
     pub exit_code: Option<i32>,
+    /// Optional partial or final pane text between START/DONE markers.
     pub output: Option<String>,
     pub output_truncated: bool,
+    /// Human-readable explanation for cancelled/tracking_error terminals.
     pub reason: Option<String>,
     pub started_at: Instant,
     pub completed_at: Option<Instant>,
     pub raw_mode: bool,
+    /// True when raw_mode/no_enter skipped side-channel tracking entirely.
     pub tracking_disabled: bool,
 }

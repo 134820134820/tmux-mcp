@@ -1,7 +1,8 @@
 //! Library surface for embedding the tmux MCP control plane.
 //!
 //! Modules cover side-channel command tracking, security policy, the tmux process
-//! adapter, and shared DTO types. The binary crate owns the stdio MCP server loop.
+//! adapter, and shared DTO types. The binary crate owns the stdio MCP server loop
+//! (`src/main.rs` + private `server` module) and is not re-exported here.
 
 /// Side-channel command execution tracking across tmux panes.
 pub mod commands;

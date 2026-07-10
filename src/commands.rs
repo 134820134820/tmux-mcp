@@ -24,7 +24,10 @@ pub const START_MARKER_PREFIX: &str = "TMUX_MCP_START_";
 /// Prefix for the end marker, followed by command id and exit code.
 pub const END_MARKER_PREFIX: &str = "TMUX_MCP_DONE_";
 
-/// Events emitted after durable state commits (Created/Updated/Terminal/Evicted).
+/// Lifecycle event published after a durable tracker commit.
+///
+/// The MCP server maps these to resource list-changed / resource-updated
+/// notifications for subscribed `tmux://command/{id}/result` URIs.
 #[derive(Debug, Clone)]
 pub struct CommandEvent {
     #[allow(dead_code)]
@@ -35,30 +38,40 @@ pub struct CommandEvent {
     pub status: CommandStatus,
 }
 
+/// Kind of durable commit that produced a [`CommandEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandEventKind {
+    /// Command accepted and inserted into the tracker map.
     Created,
+    /// Non-terminal field refresh (for example partial pane output).
     Updated,
+    /// Status reached a terminal state (completed/failed/cancelled/tracking_error).
     Terminal,
+    /// Record removed by retention, pane purge, or abandon window.
     Evicted,
 }
 
-/// Capture, retention, and deadline budgets for tracked commands.
+/// Capture, retention, and deadline budgets for tracked commands (`[tracking]` in config.toml).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackingConfig {
+    /// Lines of scrollback captured when refreshing partial output for running commands.
     #[serde(default = "default_capture_initial_lines")]
     pub capture_initial_lines: u32,
+    /// Upper bound on lines used when bracketing START/DONE markers for output only.
     #[serde(default = "default_capture_max_lines")]
     pub capture_max_lines: u32,
     /// Retained for config compatibility; side-channel completion no longer uses capture backoff.
     #[serde(default = "default_capture_backoff_factor")]
     #[allow(dead_code)]
     pub capture_backoff_factor: u32,
+    /// How long terminal command records stay queryable before eviction.
     #[serde(default = "default_completed_retention_minutes")]
     pub completed_retention_minutes: u64,
+    /// Cap on retained terminal records (oldest completed first when over budget).
     #[serde(default = "default_completed_max_entries")]
     pub completed_max_entries: u32,
+    /// Max wait for the side-channel `wait-for` signal before `tracking_error`.
     #[serde(default = "default_tracking_deadline_seconds")]
     pub tracking_deadline_seconds: u64,
 }
@@ -262,7 +275,6 @@ impl CommandTracker {
                 &command_id,
             )
             .await?;
-            // raw/no_enter never leaves Running via side channel
             return Ok(command_id);
         }
 
@@ -464,6 +476,9 @@ impl CommandTracker {
     }
 
     /// Drop every tracked entry bound to a pane on one tmux socket.
+    ///
+    /// Queue/running maps are keyed by `socket|pane_id` because pane ids are
+    /// only unique within a tmux server—do not purge other sockets' queues.
     pub async fn purge_pane(&self, pane_id: &str, socket: Option<&str>) -> usize {
         let mut commands = self.active_commands.write().await;
         let mut secrets = self.secrets.write().await;
@@ -485,7 +500,6 @@ impl CommandTracker {
                 });
             }
         }
-        // Pane ids repeat across tmux servers, so only remove this socket's key.
         {
             let key = Self::pane_key(pane_id, socket);
             let mut queues = self.pane_queues.write().await;
@@ -886,7 +900,9 @@ fn extract_output_between_markers(captured: &str, command_id: &str) -> Option<St
     }
 }
 
-/// Get the end marker text for debug echo (not completion authority).
+/// START marker text echoed into pane scrollback for human/debug bracketing.
+///
+/// Not completion authority—exit status comes only from the private side channel.
 pub fn get_start_marker(command_id: &str) -> String {
     format!("{START_MARKER_PREFIX}{command_id}")
 }
@@ -895,7 +911,7 @@ fn end_marker_prefix(command_id: &str) -> String {
     format!("{END_MARKER_PREFIX}{command_id}_")
 }
 
-/// Build the shell snippet that prints the DONE marker with exit code.
+/// DONE marker body (prefix + shell exit-status expansion) for debug echo only.
 #[allow(dead_code)]
 pub fn get_end_marker(shell: &ShellType, command_id: &str) -> String {
     let prefix = end_marker_prefix(command_id);
@@ -934,6 +950,10 @@ fn wrap_tracked_command_side_channel(
     }
 }
 
+/// Prefer the pane's live shell binary over the process-wide default when wrapping markers.
+///
+/// Login shells (`-bash`) and absolute paths are normalized; unknown binaries keep
+/// `configured_shell` so fish/zsh exit-status expansions stay correct when detectable.
 fn shell_type_for_pane_command(configured_shell: ShellType, current_command: &str) -> ShellType {
     let command = current_command
         .rsplit('/')
@@ -954,6 +974,7 @@ fn wrap_tracked_command(command: &str, start_marker: &str, end_marker: &str) -> 
     format!("echo \"{start_marker}\"; {command} ; echo \"{end_marker}\"")
 }
 
+/// True when an unquoted `#` would start a shell comment and truncate the tracker wrapper.
 fn has_unquoted_shell_comment_marker(command: &str) -> bool {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -994,6 +1015,9 @@ fn has_unquoted_shell_comment_marker(command: &str) -> bool {
     false
 }
 
+/// True when an unquoted `&` would background work and skip the side-channel epilogue.
+///
+/// Treats `&&` and `&>` as non-background operators so normal control flow still tracks.
 fn has_unquoted_shell_background_operator(command: &str) -> bool {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -1164,7 +1188,6 @@ mod tests {
     #[tokio::test]
     async fn execute_command_spoof_done_does_not_complete() {
         let mut stub = TmuxStub::new();
-        // Block side channel so status stays running
         stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "2");
         let tracker = CommandTracker::new(ShellType::Bash);
         let id = tracker
@@ -1172,7 +1195,6 @@ mod tests {
             .await
             .expect("execute");
 
-        // Inject forgeable DONE into capture (old attack surface)
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
             format!("TMUX_MCP_START_{id}\nTMUX_MCP_DONE_{id}_0\n"),
