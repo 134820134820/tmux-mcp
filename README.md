@@ -485,7 +485,7 @@ Tracked command snapshots use `schemaVersion: 1` and currently move through `que
 
 ## MCP resource reference
 
-Resources reflect the server's default socket. They are dynamically enumerated and filtered by the current security policy.
+Server, pane, window, session, and client resources reflect the server's default socket. Tracked-command resources retain the effective socket recorded by their originating `execute-command`, including per-tool socket overrides. Resources are dynamically enumerated and filtered by the current security policy.
 
 Only tracked-command result resources support `resources/subscribe`; read the resource after a `notifications/resources/updated` event. Other resource URIs provide on-demand snapshots.
 
