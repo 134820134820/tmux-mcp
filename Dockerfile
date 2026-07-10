@@ -23,7 +23,8 @@ RUN set -eux; \
   curl -fsSL -o "/tmp/${archive}" "$url"; \
   curl -fsSL -o "/tmp/${archive}.sha256" "${url}.sha256"; \
   cd /tmp; \
-  sha256sum -c "${archive}.sha256"; \
+  expected="$(awk 'NR == 1 { print $1 }' "${archive}.sha256")"; \
+  printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -; \
   tar -xzf "$archive"; \
   chmod 755 tmux-mcp-rs; \
   mkdir -p /tmp/tmux-mcp-workspace
