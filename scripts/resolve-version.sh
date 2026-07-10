@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
+PACKAGE_NAME="${PACKAGE_NAME:-tmux-mcp-rs}"
+
+if [[ "${RELEASE_TAG:-}" == v* ]]; then
+  version="${RELEASE_TAG#v}"
+elif [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
   version="${GITHUB_REF_NAME#v}"
 else
-  version=$(python - <<'PY'
+  version=$(python3 - <<'PY'
 import json
+import os
 import subprocess
 
+package_name = os.environ.get("PACKAGE_NAME", "tmux-mcp-rs")
 meta = json.loads(
     subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"])
 )
-print(meta["packages"][0]["version"])
+for package in meta["packages"]:
+    if package["name"] == package_name:
+        print(package["version"])
+        break
+else:
+    raise SystemExit(f"package not found in cargo metadata: {package_name}")
 PY
   )
 fi
