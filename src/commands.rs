@@ -310,6 +310,7 @@ impl CommandTracker {
             self.tracking.clone(),
             self.shell_type,
             launch,
+            false,
         )
         .await
     }
@@ -462,14 +463,14 @@ impl CommandTracker {
         commands.contains_key(id)
     }
 
-    /// Drop every tracked entry bound to `pane_id` (e.g. after the pane is killed).
-    pub async fn purge_pane(&self, pane_id: &str) -> usize {
+    /// Drop every tracked entry bound to a pane on one tmux socket.
+    pub async fn purge_pane(&self, pane_id: &str, socket: Option<&str>) -> usize {
         let mut commands = self.active_commands.write().await;
         let mut secrets = self.secrets.write().await;
         let mut removed = 0usize;
         let ids: Vec<String> = commands
             .iter()
-            .filter(|(_, e)| e.pane_id == pane_id)
+            .filter(|(_, e)| e.pane_id == pane_id && e.socket.as_deref() == socket)
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -484,12 +485,13 @@ impl CommandTracker {
                 });
             }
         }
-        // Drop queue entries for this pane (any socket key suffix)
+        // Pane ids repeat across tmux servers, so only remove this socket's key.
         {
+            let key = Self::pane_key(pane_id, socket);
             let mut queues = self.pane_queues.write().await;
-            queues.retain(|k, _| !k.ends_with(&format!("|{pane_id}")));
+            queues.remove(&key);
             let mut running = self.pane_running.write().await;
-            running.retain(|k, _| !k.ends_with(&format!("|{pane_id}")));
+            running.remove(&key);
         }
         self.notify.notify_waiters();
         removed
@@ -582,6 +584,7 @@ async fn run_tracked_launch(
     tracking: TrackingConfig,
     shell_type: ShellType,
     launch: QueuedLaunch,
+    launch_was_queued: bool,
 ) -> Result<()> {
     let QueuedLaunch {
         command_id,
@@ -624,31 +627,25 @@ async fn run_tracked_launch(
         notify.notify_waiters();
     }
 
-    if let Err(e) = dispatch_keys_free(
-        &active_commands,
-        &secrets,
-        &pane_id,
-        &wrapped,
-        delay_ms,
-        socket.as_deref(),
-        &command_id,
-    )
-    .await
-    {
+    if let Err(e) = dispatch_keys_free(&pane_id, &wrapped, delay_ms, socket.as_deref()).await {
         {
             let mut commands = active_commands.write().await;
-            if let Some(exec) = commands.get_mut(&command_id) {
-                if !exec.status.is_terminal() {
-                    exec.status = CommandStatus::TrackingError;
-                    exec.reason = Some(format!("failed to send command to pane: {e}"));
-                    exec.completed_at = Some(Instant::now());
-                    let _ = events.send(CommandEvent {
-                        command_id: exec.id.clone(),
-                        resource_uri: command_resource_uri(&exec.id),
-                        kind: CommandEventKind::Terminal,
-                        status: exec.status,
-                    });
+            if launch_was_queued {
+                if let Some(exec) = commands.get_mut(&command_id) {
+                    if !exec.status.is_terminal() {
+                        exec.status = CommandStatus::TrackingError;
+                        exec.reason = Some(format!("failed to send command to pane: {e}"));
+                        exec.completed_at = Some(Instant::now());
+                        let _ = events.send(CommandEvent {
+                            command_id: exec.id.clone(),
+                            resource_uri: command_resource_uri(&exec.id),
+                            kind: CommandEventKind::Terminal,
+                            status: exec.status,
+                        });
+                    }
                 }
+            } else {
+                commands.remove(&command_id);
             }
             secrets.write().await.remove(&command_id);
         }
@@ -830,6 +827,7 @@ fn spawn_advance_queue(
                 tracking,
                 shell_type,
                 launch,
+                true,
             )
             .await;
         }
@@ -837,40 +835,20 @@ fn spawn_advance_queue(
 }
 
 async fn dispatch_keys_free(
-    active_commands: &Arc<RwLock<HashMap<String, CommandExecution>>>,
-    secrets: &Arc<RwLock<HashMap<String, String>>>,
     pane_id: &str,
     wrapped_command: &str,
     delay_ms: Option<u64>,
     socket: Option<&str>,
-    command_id: &str,
 ) -> Result<()> {
-    let cleanup = || async {
-        active_commands.write().await.remove(command_id);
-        secrets.write().await.remove(command_id);
-    };
-
     if let Some(delay) = delay_ms {
         for ch in wrapped_command.chars() {
-            if let Err(e) = tmux::send_keys(pane_id, &ch.to_string(), true, socket).await {
-                cleanup().await;
-                return Err(e);
-            }
+            tmux::send_keys(pane_id, &ch.to_string(), true, socket).await?;
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        if let Err(e) = tmux::send_keys(pane_id, "Enter", false, socket).await {
-            cleanup().await;
-            return Err(e);
-        }
+        tmux::send_keys(pane_id, "Enter", false, socket).await?;
     } else {
-        if let Err(e) = tmux::send_keys(pane_id, wrapped_command, false, socket).await {
-            cleanup().await;
-            return Err(e);
-        }
-        if let Err(e) = tmux::send_keys(pane_id, "Enter", false, socket).await {
-            cleanup().await;
-            return Err(e);
-        }
+        tmux::send_keys(pane_id, wrapped_command, false, socket).await?;
+        tmux::send_keys(pane_id, "Enter", false, socket).await?;
     }
     Ok(())
 }
@@ -1242,6 +1220,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_send_failure_remains_pollable_as_tracking_error() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "1");
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        let id1 = tracker
+            .execute_command("%1", "echo one", false, false, None, None)
+            .await
+            .expect("first");
+        let id2 = tracker
+            .execute_command("%1", "echo two", false, false, None, None)
+            .await
+            .expect("second");
+        assert_eq!(
+            tracker
+                .get_command(&id2)
+                .await
+                .expect("queued command")
+                .status,
+            CommandStatus::Queued
+        );
+
+        stub.set_var("TMUX_STUB_ERROR_CMD", "send-keys");
+        let _ = wait_until_terminal(&tracker, &id1).await;
+        let failed = wait_until_terminal(&tracker, &id2).await;
+
+        assert_eq!(failed.status, CommandStatus::TrackingError);
+        assert!(failed.completed_at.is_some());
+        assert!(
+            failed
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("failed to send command to pane")),
+            "unexpected failure reason: {:?}",
+            failed.reason
+        );
+    }
+
+    #[tokio::test]
     async fn wait_for_returns_on_completion() {
         let _stub = TmuxStub::new();
         let tracker = CommandTracker::new(ShellType::Bash);
@@ -1361,16 +1378,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_pane_removes_commands() {
+    async fn purge_pane_is_scoped_to_socket() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "2");
         let tracker = CommandTracker::new(ShellType::Bash);
-        let id = tracker
-            .execute_command("%1", "echo hi", false, false, None, None)
+        let socket_a = "/tmp/tmux-mcp-a.sock";
+        let socket_b = "/tmp/tmux-mcp-b.sock";
+        let id_a = tracker
+            .execute_command("%1", "echo a", false, false, None, Some(socket_a.into()))
             .await
-            .expect("execute");
-        assert_eq!(tracker.purge_pane("%1").await, 1);
-        assert!(tracker.get_command(&id).await.is_none());
+            .expect("execute on socket a");
+        let queued_a = tracker
+            .execute_command(
+                "%1",
+                "echo queued-a",
+                false,
+                false,
+                None,
+                Some(socket_a.into()),
+            )
+            .await
+            .expect("queue on socket a");
+        let id_b = tracker
+            .execute_command("%1", "echo b", false, false, None, Some(socket_b.into()))
+            .await
+            .expect("execute on socket b");
+        let queued_b = tracker
+            .execute_command(
+                "%1",
+                "echo queued-b",
+                false,
+                false,
+                None,
+                Some(socket_b.into()),
+            )
+            .await
+            .expect("queue on socket b");
+
+        assert_eq!(tracker.purge_pane("%1", Some(socket_a)).await, 2);
+        assert!(tracker.get_command(&id_a).await.is_none());
+        assert!(tracker.get_command(&queued_a).await.is_none());
+        assert!(tracker.get_command(&id_b).await.is_some());
+        assert!(tracker.get_command(&queued_b).await.is_some());
+        assert_eq!(tracker.purge_pane("%1", Some(socket_b)).await, 2);
     }
 
     #[tokio::test]

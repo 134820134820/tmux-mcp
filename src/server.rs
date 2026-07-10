@@ -1879,7 +1879,9 @@ impl TmuxMcpServer {
         }
         match tmux::kill_pane(&input.0.pane_id, socket.as_deref()).await {
             Ok(()) => {
-                self.tracker.purge_pane(&input.0.pane_id).await;
+                self.tracker
+                    .purge_pane(&input.0.pane_id, socket.as_deref())
+                    .await;
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Pane {} has been killed",
                     input.0.pane_id
@@ -5120,22 +5122,31 @@ mod tests {
     async fn kill_pane_success_purges_tracked_commands_for_pane() {
         let _stub = TmuxStub::new();
         let server = server_default();
+        let socket_a = "/tmp/tmux-mcp-a.sock";
+        let socket_b = "/tmp/tmux-mcp-b.sock";
 
         let killed_id = server
             .tracker
-            .execute_command("%1", "echo killed", false, false, None, None)
+            .execute_command(
+                "%1",
+                "echo killed",
+                false,
+                false,
+                None,
+                Some(socket_a.into()),
+            )
             .await
             .expect("track command for killed pane");
         let kept_id = server
             .tracker
-            .execute_command("%2", "echo kept", false, false, None, None)
+            .execute_command("%1", "echo kept", false, false, None, Some(socket_b.into()))
             .await
-            .expect("track command for other pane");
+            .expect("track command for same pane id on other socket");
 
         let result = server
             .kill_pane(Parameters(PaneIdInput {
                 pane_id: "%1".into(),
-                socket: None,
+                socket: Some(socket_a.into()),
             }))
             .await
             .expect("kill pane");
