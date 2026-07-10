@@ -35,7 +35,7 @@ Use it when an agent needs a real TTY, long-running commands, parallel panes, re
 
 - Session, window, pane, client, and buffer tools with structured inputs and outputs.
 - `execute-command` and `get-command-result` for shell commands with command IDs, resource URIs, status, output, and side-channel exit-code tracking (optional `waitMs`; prefer resource subscribe for completion).
-- Pane and tmux-buffer resources for lightweight state checks without re-running commands.
+- Pane, window, session, client, server, and tracked-command resources for lightweight state checks without re-running tools.
 - Optional raw input tools for interactive programs, prompts, REPLs, and TUIs.
 - Runtime policy controls for tool filtering, command filtering, socket/session/pane scoping, and coarse operation groups.
 - Compile-time feature flags that remove raw input tools from the binary for hardened builds.
@@ -90,6 +90,7 @@ stdio MCP client (keep stdin attached):
 
 ```bash
 docker run --rm -i \
+  --name tmux-mcp \
   -v "$PWD:/workspace" \
   ghcr.io/bnomei/tmux-mcp:0.5.0
 ```
@@ -97,7 +98,7 @@ docker run --rm -i \
 Watch a session created inside the container:
 
 ```bash
-docker exec -it <container> tmux attach -t workspace
+docker exec -it tmux-mcp tmux attach -t workspace
 ```
 
 Linux host-socket wiring (advanced):
@@ -298,6 +299,7 @@ allow_list = true
 allowed_sockets = ["/tmp/tmux-mcp-agent.sock"]
 allowed_sessions = ["workspace"]
 allowed_panes = ["%1"]
+allowed_buffer_paths = ["/srv/tmux-mcp-buffers"]
 
 [security.command_filter]
 mode = "allowlist"
@@ -310,7 +312,6 @@ items = ["@raw-input"]
 [tracking]
 capture_initial_lines = 1000
 capture_max_lines = 16000
-capture_backoff_factor = 2
 completed_retention_minutes = 240
 completed_max_entries = 1000
 tracking_deadline_seconds = 600
@@ -335,22 +336,23 @@ streaming_threshold_bytes = 262144
 | `security.allow_capture` | boolean | `true` | Allows `capture-pane` and tmux buffer read, write, and search tools. Buffer file operations are part of this capture surface. |
 | `security.allow_list` | boolean | `true` | Allows session, window, pane, client, buffer, and current-session listing tools. |
 | `security.allowed_sockets` | string array or unset | unset | When set, the effective socket for every tool and resource request must exactly match one of these paths. |
-| `security.allowed_sessions` | string array or unset | unset | When set, session-scoped operations are limited to the listed tmux session IDs. |
+| `security.allowed_sessions` | string array or unset | unset | When set, session-scoped operations are limited to exact tmux session IDs or names in the list. |
 | `security.allowed_panes` | string array or unset | unset | When set, direct pane operations are limited to the listed pane IDs. |
+| `security.allowed_buffer_paths` | string array or unset | unset | Canonical directories allowed for `save-buffer` and `load-buffer`. When unset, paths must be relative and stay under the local temp directory's `tmux-mcp-buffers/` directory, or `/tmp/tmux-mcp-buffers/` over SSH. An empty list denies all buffer file paths. |
 | `security.command_filter.mode` | `off`, `allowlist`, `denylist` | `off` | Regex command filter mode. |
 | `security.command_filter.patterns` | string array | `[]` | Regex patterns used by the command filter. |
 | `security.tools.mode` | `deny`, `allow` | `deny` | Runtime tool-surface filter mode. |
 | `security.tools.items` | string array | `[]` | Exact tool names or groups such as `@raw-input`. |
 
-`security.command_filter` checks each non-empty shell statement for `execute-command`, `send-keys` (literal and non-literal), `paste-text`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, newlines, and command substitutions before matching. It does not screen special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
+`security.command_filter` checks each non-empty shell statement for `execute-command`, `send-keys` (literal and non-literal), `paste-text`, and the decoded bytes passed to `send-hex`. It splits unquoted `;`, `|`, `&`, and newlines, then recursively checks command substitutions, process substitutions, subshells, and brace groups. It rejects shell forms it cannot safely analyze, including ANSI-C `$'...'` quoting and shell `-c` wrappers. It does not screen special-key helpers. For a hard boundary, disable raw input tools at runtime or compile them out.
 
 ### Tracking options
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `tracking.capture_initial_lines` | `1000` | Initial pane lines captured while looking for command tracking markers. |
-| `tracking.capture_max_lines` | `16000` | Maximum pane lines captured before the tracker stops expanding the search window. |
-| `tracking.capture_backoff_factor` | `2` | Multiplier used when retrying larger capture windows. |
+| `tracking.capture_initial_lines` | `1000` | Pane lines captured when refreshing partial output for a running command. |
+| `tracking.capture_max_lines` | `16000` | Maximum pane lines captured when extracting final output between the human-visible START/DONE markers. |
+| `tracking.capture_backoff_factor` | `2` | Accepted for configuration compatibility. Side-channel completion no longer uses capture backoff. |
 | `tracking.completed_retention_minutes` | `240` | Age limit for completed command history retained in memory. |
 | `tracking.completed_max_entries` | `1000` | Maximum completed command entries retained in memory. Set to `0` to disable entry-count pruning and rely on retention time only. |
 | `tracking.tracking_deadline_seconds` | `600` | How long the side-channel watcher waits for `tmux wait-for` before marking `tracking_error`. |
@@ -367,7 +369,7 @@ By default, policy enforcement is enabled but permissive:
 
 - All coarse `allow_*` gates are `true`.
 - `command_filter.mode` is `off`.
-- `allowed_sockets`, `allowed_sessions`, and `allowed_panes` are unset.
+- `allowed_sockets`, `allowed_sessions`, `allowed_panes`, and `allowed_buffer_paths` are unset. Buffer file operations remain restricted to the default temp-directory sandbox.
 - `[security.tools]` is deny mode with no denied items.
 
 That default is convenient for local experimentation, but it is not a sandbox.
@@ -422,7 +424,7 @@ TMUX_MCP_TOOLS=allow:@read,execute-command tmux-mcp-rs
 The default Cargo feature set includes `interactive` and `special-keys`.
 
 - `interactive` registers `send-keys`, `send-hex`, and `paste-text`.
-- `special-keys` registers `send-enter`, `send-tab`, `send-escape`, arrow keys, page keys, home/end, `send-backspace`, `send-cancel`, and `send-eof`.
+- `special-keys` registers `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, `send-up`, `send-down`, `send-left`, `send-right`, `send-page-up`, `send-page-down`, `send-home`, and `send-end`.
 
 Disable those features to remove the tools from the binary:
 
@@ -458,7 +460,7 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 | `@move` | `move-window`, `select-window`, `select-pane`, `resize-pane`, `zoom-pane`, `select-layout`, `join-pane`, `break-pane`, `swap-pane`, `set-synchronize-panes`. |
 | `@kill` | `kill-session`, `kill-window`, `kill-pane`, `detach-client`. |
 | `@interactive` | `send-keys`, `send-hex`, `paste-text`. |
-| `@special-keys` | `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, arrows, page keys, home, end. |
+| `@special-keys` | `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, `send-up`, `send-down`, `send-left`, `send-right`, `send-page-up`, `send-page-down`, `send-home`, `send-end`. |
 | `@raw-input` | All `@interactive` and `@special-keys` tools. |
 
 ### Tools by task
@@ -473,13 +475,19 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 | Client management | `list-clients`, `detach-client`. |
 | Buffer inspection | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer`. |
 | Buffer mutation | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer`. |
-| Raw input | `send-keys`, `paste-text`, `send-hex`, `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, arrow keys, page keys, home, end. |
+| Raw input | `send-keys`, `paste-text`, `send-hex`, `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, `send-up`, `send-down`, `send-left`, `send-right`, `send-page-up`, `send-page-down`, `send-home`, `send-end`. |
 
 Prefer `execute-command` with resource subscribe/read (or `get-command-result` + `waitMs`) for non-interactive commands. Tracked commands queue per pane. Use `capture-pane` for live progress only; do not treat pane DONE markers as authoritative. Use raw input tools only for prompts, REPLs, editors, pagers, and TUIs—and not while a tracked command is running on that pane.
+
+Tracked command snapshots use `schemaVersion: 1` and move through `queued`, `running`, then `completed`, `failed`, `cancelled`, or `tracking_error`. Normal tracked commands reject embedded newlines, unquoted shell comment markers (`#`), and unquoted background operators (`&`) because those forms can bypass the tracking epilogue. Set `rawMode=true` or `noEnter=true` only when you intentionally want to disable side-channel completion tracking; those records remain `running`.
+
+`show-buffer` reads at most 65,536 bytes by default. `search-buffer` defaults to 40 context bytes, 50 matches, and 65,536 scanned bytes per buffer; it returns byte offsets and resume cursors when results are truncated. Literal and regex search are always available. Fuzzy matching and similarity scores require the `rapidfuzz` Cargo feature, which is enabled by default.
 
 ## MCP resource reference
 
 Resources reflect the server's default socket. They are dynamically enumerated and filtered by the current security policy.
+
+Only tracked-command result resources support `resources/subscribe`; read the resource after a `notifications/resources/updated` event. Other resource URIs provide on-demand snapshots.
 
 | URI | Description |
 | --- | --- |
@@ -616,11 +624,11 @@ Release notes and release packaging details live in [CHANGELOG.md](CHANGELOG.md)
 
 ## Notes and limitations
 
-- Paste buffers and retained command output live in memory. `paste-text`, `set-buffer`, `append-buffer`, and large retained command outputs can consume host memory. Tracked output is line-capped by `capture_max_lines`, but retained strings and individual line length are not byte-capped.
+- tmux owns paste buffers, while this server retains tracked command snapshots in memory. `paste-text`, `set-buffer`, `append-buffer`, and large retained command outputs can still consume host memory. Tracked output is line-capped by `capture_max_lines`, but retained strings and individual line length are not byte-capped.
 - Buffer search streams large buffers through a temp file after `search.streaming_threshold_bytes`, but tmux buffers themselves are not evicted by size.
 - tmux rows are parsed from tab-delimited `-F` output. A literal tab inside a pane title, path, or similar field can shift later fields and produce malformed or skipped rows.
 - `paste-text` uses bracketed paste markers. Shells and programs that do not support bracketed paste may treat embedded newlines as Enter. On macOS, the default `/bin/bash` 3.2 does not support modern bracketed paste behavior; zsh or a newer bash is safer for multi-line input that should not submit line by line.
-- `save-buffer` writes to the server filesystem, and `load-buffer` reads from it. Both are governed by `allow_capture` and `[security.tools]`.
+- `save-buffer` writes to the tmux server filesystem, and `load-buffer` reads from it. Both are governed by `allow_capture`, `[security.tools]`, and `security.allowed_buffer_paths`. With the default enabled policy, callers use relative paths inside the local temp directory's `tmux-mcp-buffers/` sandbox or `/tmp/tmux-mcp-buffers/` over SSH; parent traversal and canonical or symlink escapes are rejected.
 - Command results are socket-bound. `get-command-result` must use the same effective socket as the original `execute-command` call.
 - Tracked command completion uses a private tmux exit buffer + `wait-for` signal, not forgeable pane scrollback. Optional START/DONE lines are for humans/debug only.
 - Interactive `send-keys`/`paste-text` during a tracked run on the same pane is undefined; wait for the command to finish or use another pane.
