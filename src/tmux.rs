@@ -25,13 +25,16 @@ use crate::types::{
     Session, Window, WindowInfo,
 };
 
+/// Cap concurrent local/SSH tmux spawns so multi-tool bursts do not fork-bomb.
 const TMUX_MAX_CONCURRENCY: usize = 8;
 const DEFAULT_SHOW_MAX_BYTES: u64 = 65_536;
 const DEFAULT_SEARCH_CONTEXT_BYTES: u32 = 40;
 const DEFAULT_SEARCH_MAX_MATCHES: u32 = 50;
 const DEFAULT_SEARCH_MAX_SCAN_BYTES: u64 = 65_536;
+/// Prefer tempfile rewrite for append when local buffer exceeds this size.
 const APPEND_INLINE_MAX_BYTES: u64 = 262_144;
 const PARALLEL_BUFFER_THRESHOLD: usize = 10;
+/// Fuzzy scoring skips individual lines larger than this to bound CPU.
 const FUZZY_MAX_LINE_BYTES: usize = 4_096;
 
 static TMUX_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TMUX_MAX_CONCURRENCY));
@@ -44,26 +47,35 @@ struct BufferText {
     full_len: usize,
 }
 
-/// Options for buffer search operations.
+/// Budgets and scoring flags for multi-buffer paste-buffer search.
 #[derive(Clone, Debug, Default)]
 pub struct SearchOptions {
+    /// Bytes of surrounding text kept with each match snippet.
     pub context_bytes: Option<u32>,
+    /// Hard stop on matches returned for the whole request.
     pub max_matches: Option<u32>,
+    /// Per-buffer byte budget before the buffer is marked truncated.
     pub max_scan_bytes: Option<u64>,
+    /// Attach similarity scores when the fuzzy feature stack is enabled.
     pub include_similarity: bool,
+    /// Prefer fuzzy line scoring over exact mode when supported.
     pub fuzzy_match: bool,
+    /// Drop fuzzy hits below this score when similarity is requested.
     pub similarity_threshold: Option<f32>,
+    /// Per-buffer byte cursor to resume after a truncated scan.
     pub resume_from_offset: Option<BTreeMap<String, u64>>,
 }
 
-/// Options for anchor-scoped subsearch.
+/// Budgets for searching inside a window around a prior match anchor.
 #[derive(Clone, Debug)]
 pub struct SubsearchOptions {
+    /// Half-window of context around the anchor used as the scan range.
     pub context_bytes: u32,
     pub max_matches: Option<u32>,
     pub include_similarity: bool,
     pub fuzzy_match: bool,
     pub similarity_threshold: Option<f32>,
+    /// Resume cursor within the anchor window for paged subsearch.
     pub resume_from_offset: Option<u64>,
 }
 
@@ -200,6 +212,7 @@ fn build_tmux_command(args: &[&str], socket: Option<&str>) -> Result<Command> {
     }
 }
 
+/// Spawn local or SSH-wrapped tmux under the global concurrency semaphore.
 async fn run_tmux_with_socket(
     args: &[&str],
     socket: Option<&str>,
@@ -245,6 +258,9 @@ async fn run_tmux_with_socket(
     Ok(output)
 }
 
+/// Collect successful tmux stdout bytes; fall back to stderr when stdout is empty.
+///
+/// tmux 3.6a can print some `-P` format results on stderr only.
 async fn execute_tmux_with_socket_bytes(
     args: &[&str],
     socket: Option<&str>,
@@ -257,7 +273,6 @@ async fn execute_tmux_with_socket_bytes(
         stderr,
     } = output;
     if status.success() {
-        // tmux 3.6a can emit some `-P` output on stderr, so keep it if stdout is empty.
         if !stdout.is_empty() {
             Ok(stdout)
         } else if !stderr.is_empty() {
@@ -341,13 +356,15 @@ async fn execute_tmux_with_socket_to_file(
     }
 }
 
-/// Execute a tmux command with the given arguments and return stdout.
+/// Run a tmux (or SSH-wrapped tmux) argv list under the process semaphore and return stdout.
+///
+/// Lossy UTF-8 decode; use the bytes helpers when binary buffer content matters.
 pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Result<String> {
     let stdout = execute_tmux_with_socket_bytes(args, socket, None).await?;
     Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
-/// Execute a tmux command using the default socket (if configured).
+/// Run tmux on the process-default socket (`TMUX_MCP_SOCKET` / platform default).
 pub async fn execute_tmux(args: &[&str]) -> Result<String> {
     execute_tmux_with_socket(args, None).await
 }
@@ -424,7 +441,9 @@ pub async fn create_remote_dir(path: &str) -> Result<()> {
     }
 }
 
-/// Check if the tmux server is running.
+/// Probe whether a tmux server answers on the effective socket.
+///
+/// Distinguishes "no server" from "server up but empty session list".
 pub async fn is_tmux_running() -> Result<bool> {
     match execute_tmux(&["list-sessions", "-F", "#{session_name}"]).await {
         Ok(_) => Ok(true),
@@ -434,14 +453,14 @@ pub async fn is_tmux_running() -> Result<bool> {
     }
 }
 
-/// Parse a `tmux -V` string like "tmux 3.4" or "tmux 3.6b" into (major, minor).
-/// Returns None when the version cannot be parsed.
+/// Parse `tmux -V` output like `tmux 3.4` or `tmux 3.6b` into `(major, minor)`.
+///
+/// Letter/rc suffixes on the minor field are stripped (`6b` → `6`). Returns
+/// `None` when the version cannot be parsed.
 pub fn parse_tmux_version(output: &str) -> Option<(u32, u32)> {
     let version = output.trim().strip_prefix("tmux ")?.trim();
     let mut parts = version.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
-    // The minor field may carry a letter suffix (e.g. "6b") or "-rc"; keep the
-    // leading digits only.
     let minor_raw = parts.next().unwrap_or("0");
     let minor_digits: String = minor_raw
         .chars()
@@ -631,20 +650,20 @@ pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
         .collect()
 }
 
-/// List all tmux sessions.
+/// Enumerate sessions on a socket via tab-formatted `list-sessions`.
 pub async fn list_sessions(socket: Option<&str>) -> Result<Vec<Session>> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
     let output = execute_tmux_with_socket(&["list-sessions", "-F", format], socket).await?;
     Ok(parse_sessions(output.trim()))
 }
 
-/// Find a session by name.
+/// Locate the first session whose name equals `name` (exact match).
 pub async fn find_session_by_name(name: &str, socket: Option<&str>) -> Result<Option<Session>> {
     let sessions = list_sessions(socket).await?;
     Ok(sessions.into_iter().find(|s| s.name == name))
 }
 
-/// List windows in a session.
+/// Enumerate windows for a session target (`-t session_id`).
 pub async fn list_windows(session_id: &str, socket: Option<&str>) -> Result<Vec<Window>> {
     let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}";
     let output =
@@ -652,7 +671,7 @@ pub async fn list_windows(session_id: &str, socket: Option<&str>) -> Result<Vec<
     Ok(parse_windows(output.trim(), session_id))
 }
 
-/// List panes in a window.
+/// Enumerate panes for a window target (`-t window_id`).
 pub async fn list_panes(window_id: &str, socket: Option<&str>) -> Result<Vec<Pane>> {
     let format = "#{pane_id}\t#{pane_title}\t#{?pane_active,1,0}";
     let output =
@@ -660,7 +679,7 @@ pub async fn list_panes(window_id: &str, socket: Option<&str>) -> Result<Vec<Pan
     Ok(parse_panes(output.trim(), window_id))
 }
 
-/// Capture content from a pane.
+/// Capture pane scrollback/history as text for tools and partial command output.
 pub async fn capture_pane(
     pane_id: &str,
     lines: Option<u32>,
@@ -706,7 +725,7 @@ pub async fn capture_pane(
     execute_tmux_with_socket(&arg_refs, socket).await
 }
 
-/// List connected tmux clients.
+/// List attached clients; maps tmux "no clients" to an empty vec rather than error.
 pub async fn list_clients(socket: Option<&str>) -> Result<Vec<ClientInfo>> {
     let format =
         "#{client_tty}\t#{client_name}\t#{client_session}\t#{client_pid}\t#{?client_attached,1,0}";
@@ -717,13 +736,13 @@ pub async fn list_clients(socket: Option<&str>) -> Result<Vec<ClientInfo>> {
     }
 }
 
-/// Detach a tmux client.
+/// Detach one client by TTY target (observer disconnect, not session kill).
 pub async fn detach_client(client_tty: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["detach-client", "-t", client_tty], socket).await?;
     Ok(())
 }
 
-/// List tmux paste buffers.
+/// List named paste buffers; maps tmux "no buffers" to an empty vec.
 pub async fn list_buffers(socket: Option<&str>) -> Result<Vec<BufferInfo>> {
     let format = "#{buffer_name}\t#{buffer_size}\t#{buffer_created}";
     match execute_tmux_with_socket(&["list-buffers", "-F", format], socket).await {
@@ -733,7 +752,7 @@ pub async fn list_buffers(socket: Option<&str>) -> Result<Vec<BufferInfo>> {
     }
 }
 
-/// Show a tmux buffer.
+/// Read a paste buffer as lossy UTF-8 (`None` name selects the top buffer).
 pub async fn show_buffer(name: Option<&str>, socket: Option<&str>) -> Result<String> {
     let mut args = vec!["show-buffer"];
     if let Some(name) = name {
@@ -744,7 +763,7 @@ pub async fn show_buffer(name: Option<&str>, socket: Option<&str>) -> Result<Str
     Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
-/// Show a tmux buffer and return raw bytes.
+/// Read a paste buffer as raw bytes without UTF-8 validation.
 pub async fn show_buffer_bytes(name: Option<&str>, socket: Option<&str>) -> Result<Vec<u8>> {
     let mut args = vec!["show-buffer"];
     if let Some(name) = name {
@@ -754,7 +773,7 @@ pub async fn show_buffer_bytes(name: Option<&str>, socket: Option<&str>) -> Resu
     execute_tmux_with_socket_bytes(&args, socket, None).await
 }
 
-/// Stream a tmux buffer to a file path.
+/// Stream paste-buffer contents to a local file (used for large search windows).
 pub async fn show_buffer_to_file(
     name: Option<&str>,
     path: &Path,
@@ -768,7 +787,7 @@ pub async fn show_buffer_to_file(
     execute_tmux_with_socket_to_file(&args, socket, path).await
 }
 
-/// Show a tmux buffer slice bounded by offset/max bytes (lossy UTF-8).
+/// Read a paste-buffer byte window and decode lossily for tool previews.
 pub async fn show_buffer_slice(
     name: Option<&str>,
     offset_bytes: Option<u64>,
@@ -811,37 +830,39 @@ fn read_window_from_file(path: &Path, start: u64, len: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Save a tmux buffer to a file path.
+/// Write a paste buffer to a filesystem path (caller must pass a policy-resolved path).
 pub async fn save_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["save-buffer", "-b", name, "--", path], socket).await?;
     Ok(())
 }
 
-/// Load a tmux buffer from a file path.
+/// Replace a paste buffer from a filesystem path (caller must pass a policy-resolved path).
 pub async fn load_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["load-buffer", "-b", name, "--", path], socket).await?;
     Ok(())
 }
 
-/// Delete a tmux buffer.
+/// Remove a named paste buffer.
 pub async fn delete_buffer(name: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["delete-buffer", "-b", name], socket).await?;
     Ok(())
 }
 
-/// Set a tmux buffer from raw bytes, preferring stdin load-buffer.
+/// Replace a paste buffer via `load-buffer` stdin (avoids argv size limits).
 pub async fn set_buffer_bytes(name: &str, content: &[u8], socket: Option<&str>) -> Result<()> {
     let load_args = ["load-buffer", "-b", name, "-"];
     execute_tmux_with_socket_bytes(&load_args, socket, Some(content)).await?;
     Ok(())
 }
 
-/// Set a tmux buffer from UTF-8 content.
+/// Replace a paste buffer from UTF-8 text.
 pub async fn set_buffer(name: &str, content: &str, socket: Option<&str>) -> Result<()> {
     set_buffer_bytes(name, content.as_bytes(), socket).await
 }
 
-/// Append content to a tmux buffer.
+/// Append UTF-8 text to an existing paste buffer (creates the buffer when missing).
+///
+/// Large local buffers spill through a temp file; remote SSH always rewrites in memory.
 pub async fn append_buffer(name: &str, content: &str, socket: Option<&str>) -> Result<()> {
     let buffers = list_buffers(socket).await?;
     let existing = buffers.iter().find(|b| b.name == name);
@@ -874,7 +895,7 @@ pub async fn append_buffer(name: &str, content: &str, socket: Option<&str>) -> R
     }
 }
 
-/// Rename a tmux buffer by copying and deleting the original.
+/// Rename a paste buffer by copy+delete (tmux has no atomic rename for buffers).
 pub async fn rename_buffer(from: &str, to: &str, socket: Option<&str>) -> Result<()> {
     let bytes = show_buffer_bytes(Some(from), socket).await?;
     set_buffer_bytes(to, &bytes, socket).await?;
@@ -906,6 +927,10 @@ fn is_utf8_continuation(byte: u8) -> bool {
     (byte & 0b1100_0000) == 0b1000_0000
 }
 
+/// Decode a byte window as UTF-8, trimming incomplete sequences at either edge.
+///
+/// Incomplete multi-byte sequences at the end (`error_len() == None`) shrink the
+/// window; mid-window invalid bytes are hard errors.
 fn decode_window(buffer: &str, bytes: &[u8], base_offset: usize) -> Result<(String, usize)> {
     if bytes.is_empty() {
         return Ok((String::new(), base_offset));
@@ -931,7 +956,6 @@ fn decode_window(buffer: &str, bytes: &[u8], base_offset: usize) -> Result<(Stri
             Ok(text) => return Ok((text.to_string(), base_offset.saturating_add(start))),
             Err(err) => {
                 if err.error_len().is_none() {
-                    // Truncated UTF-8 sequence at the end of the window; trim to valid prefix.
                     let valid = err.valid_up_to();
                     end = start.saturating_add(valid);
                     continue;
@@ -946,7 +970,6 @@ fn decode_window(buffer: &str, bytes: &[u8], base_offset: usize) -> Result<(Stri
     }
 }
 
-// rapidfuzz (feature-gated) provides fuzzy similarity scoring when requested.
 #[cfg(feature = "rapidfuzz")]
 fn similarity_score(query: &str, matched: &str) -> f32 {
     rapidfuzz::fuzz::ratio(query.chars(), matched.chars()).clamp(0.0, 1.0) as f32
@@ -1088,7 +1111,6 @@ fn collect_matches(
         }
     }
 
-    // Optional fuzzy match path (feature-gated) for typo-tolerant searching.
     if fuzzy_enabled {
         let mut offset = 0usize;
         for line in scan_text.split('\n') {
@@ -1844,7 +1866,7 @@ pub async fn subsearch_buffer(
     subsearch_text_view(&window, anchor_offset, anchor_len, query, mode, options)
 }
 
-/// Get detailed info about a pane.
+/// Fetch pane cwd/command/size/pid via `display-message` (used for targeting and shell detection).
 pub async fn pane_info(pane_id: &str, socket: Option<&str>) -> Result<PaneInfo> {
     let format = "#{pane_id}\t#{window_id}\t#{session_id}\t#{?pane_active,1,0}\t#{pane_title}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{?pane_in_mode,1,0}";
     let output =
@@ -1871,7 +1893,7 @@ pub async fn pane_info(pane_id: &str, socket: Option<&str>) -> Result<PaneInfo> 
     }
 }
 
-/// Get detailed info about a window.
+/// Fetch window layout/zoom/active-pane metadata via `display-message`.
 pub async fn window_info(window_id: &str, socket: Option<&str>) -> Result<WindowInfo> {
     let format = "#{window_id}\t#{window_name}\t#{session_id}\t#{?window_active,1,0}\t#{window_layout}\t#{window_panes}\t#{window_width}\t#{window_height}\t#{window_zoomed_flag}\t#{pane_id}";
     let output =
@@ -1898,7 +1920,9 @@ pub async fn window_info(window_id: &str, socket: Option<&str>) -> Result<Window
     }
 }
 
-/// Create a new tmux session.
+/// Create a detached session (`new-session -d`) and return its parsed identity.
+///
+/// Falls back to `list-sessions` when tmux omits `-P` format output.
 pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
     let session_arg = format!("-s{name}");
@@ -1912,7 +1936,6 @@ pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session>
         return Ok(session);
     }
 
-    // Fall back to the server state when tmux omits `new-session` output.
     if let Some(session) = find_session_by_name(name, socket).await? {
         return Ok(session);
     }
@@ -1922,7 +1945,7 @@ pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session>
     })
 }
 
-/// Create a new window in a session.
+/// Create a named window in a session; falls back to listing when `-P` output is empty.
 pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -> Result<Window> {
     let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}";
     let name_arg = format!("-n{name}");
@@ -1944,7 +1967,6 @@ pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -
         return Ok(window);
     }
 
-    // Fall back to the session state when tmux omits `new-window` output.
     if let Some(window) = list_windows(session_id, socket)
         .await?
         .into_iter()
@@ -1958,7 +1980,10 @@ pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -
     })
 }
 
-/// Split a pane.
+/// Split a pane horizontally or vertically.
+///
+/// Percent sizes use tmux 3.x `-l N%` (not legacy `-p N`, which 3.4 rejects).
+/// When `-P` format is empty, the new pane is recovered by window-state diff.
 pub async fn split_pane(
     pane_id: &str,
     direction: Option<&str>,
@@ -1983,8 +2008,6 @@ pub async fn split_pane(
     let size_str;
     if let Some(s) = size {
         if s > 0 && s < 100 {
-            // tmux 3.4 rejects the legacy `-p <percent>` flag with "size missing";
-            // `-l <percent>%` is the modern form and works across tmux 3.x.
             size_str = format!("{s}%");
             args.push("-l");
             args.push(&size_str);
@@ -1993,12 +2016,10 @@ pub async fn split_pane(
 
     let output = execute_tmux_with_socket(&args, socket).await?;
 
-    // split-window -P -F includes window_id as a 4th field; list-panes format is 3 fields.
     if let Some(pane) = parse_created_pane_line(output.trim(), &source_pane.window_id) {
         return Ok(pane);
     }
 
-    // If tmux suppresses `split-window` output, identify the new pane from the window state.
     let panes = list_panes(&source_pane.window_id, socket).await?;
     if let Some(pane) = panes
         .iter()
@@ -2021,19 +2042,19 @@ pub async fn split_pane(
     })
 }
 
-/// Kill a session.
+/// Destroy a session target and all of its windows/panes.
 pub async fn kill_session(session_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["kill-session", "-t", session_id], socket).await?;
     Ok(())
 }
 
-/// Kill a window.
+/// Destroy a window target (and its panes).
 pub async fn kill_window(window_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["kill-window", "-t", window_id], socket).await?;
     Ok(())
 }
 
-/// Kill a pane.
+/// Destroy a single pane target.
 pub async fn kill_pane(pane_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["kill-pane", "-t", pane_id], socket).await?;
     Ok(())
@@ -2122,7 +2143,7 @@ pub fn shell_single_quote(value: &str) -> String {
     out
 }
 
-/// Send keys to a pane.
+/// Inject keystrokes into a pane (`-l` when `literal` so shell metacharacters stay raw).
 pub async fn send_keys(
     pane_id: &str,
     keys: &str,
@@ -2143,8 +2164,7 @@ pub async fn send_keys(
     Ok(())
 }
 
-/// Parse a whitespace-separated hex string into byte tokens, validating each.
-/// Returns the normalized two-digit lowercase tokens (e.g. "1b", "5b") or an error.
+/// Parse whitespace-separated hex tokens into two-digit lowercase bytes for `send-keys -H`.
 pub fn parse_hex_tokens(hex: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     for raw in hex.split_whitespace() {
@@ -2156,7 +2176,6 @@ pub fn parse_hex_tokens(hex: &str) -> Result<Vec<String>> {
                 message: format!("invalid hex byte token: {raw:?} (expected 00-ff)"),
             });
         }
-        // Normalize to two-digit lowercase for tmux send-keys -H.
         let byte = u8::from_str_radix(raw, 16).expect("validated above");
         tokens.push(format!("{byte:02x}"));
     }
@@ -2183,6 +2202,7 @@ pub async fn send_keys_hex(pane_id: &str, hex: &str, socket: Option<&str>) -> Re
     Ok(())
 }
 
+/// Max UTF-8 bytes per `send-keys -l` invocation to stay under argv/tmux limits.
 const MAX_LITERAL_CHUNK_BYTES: usize = 4000;
 
 fn chunk_literal_payload(keys: &str) -> Vec<String> {
@@ -2202,7 +2222,9 @@ fn chunk_literal_payload(keys: &str) -> Vec<String> {
     chunks
 }
 
-/// Paste UTF-8 content into a pane with a temporary tmux buffer.
+/// Paste UTF-8 into a pane via a disposable paste buffer (`paste-buffer -p -d`).
+///
+/// Cleans up the staging buffer if paste fails after set-buffer succeeds.
 pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> Result<()> {
     let buffer_name = format!("__tmux_mcp_paste_{}", Uuid::new_v4());
     set_buffer(&buffer_name, content, socket).await?;
@@ -2229,7 +2251,7 @@ pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> R
     }
 }
 
-/// Get the current session (the one the client is attached to).
+/// Resolve the session context for the default client via `display-message`.
 pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
     let output = execute_tmux_with_socket(&["display-message", "-p", format], socket).await?;
@@ -2240,25 +2262,25 @@ pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
     })
 }
 
-/// Rename a session.
+/// Change a session's display name.
 pub async fn rename_session(session_id: &str, name: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["rename-session", "-t", session_id, "--", name], socket).await?;
     Ok(())
 }
 
-/// Select (focus) a window.
+/// Make a window active in its session.
 pub async fn select_window(window_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["select-window", "-t", window_id], socket).await?;
     Ok(())
 }
 
-/// Select (focus) a pane.
+/// Make a pane active in its window.
 pub async fn select_pane(pane_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["select-pane", "-t", pane_id], socket).await?;
     Ok(())
 }
 
-/// Resize a pane.
+/// Grow/shrink a pane by direction+amount or set absolute width/height.
 pub async fn resize_pane(
     pane_id: &str,
     direction: Option<&str>,
@@ -2305,19 +2327,19 @@ pub async fn resize_pane(
     Ok(())
 }
 
-/// Toggle zoom for a pane.
+/// Toggle pane zoom (`resize-pane -Z`) so the pane fills or unfills the window.
 pub async fn zoom_pane(pane_id: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["resize-pane", "-Z", "-t", pane_id], socket).await?;
     Ok(())
 }
 
-/// Select a window layout.
+/// Apply a named tmux layout algorithm to a window.
 pub async fn select_layout(window_id: &str, layout: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["select-layout", "-t", window_id, "--", layout], socket).await?;
     Ok(())
 }
 
-/// Join a source pane into a target pane's window.
+/// Move a source pane into the window that owns the target pane.
 pub async fn join_pane(
     source_pane_id: &str,
     target_pane_id: &str,
@@ -2331,7 +2353,7 @@ pub async fn join_pane(
     Ok(())
 }
 
-/// Break a pane out into its own window.
+/// Promote a pane into its own window; falls back to session-state discovery when `-P` is empty.
 pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>) -> Result<Window> {
     let source_pane = pane_info(pane_id, socket).await?;
     let existing_windows: BTreeSet<String> = list_windows(&source_pane.session_id, socket)
@@ -2352,7 +2374,6 @@ pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>)
         return Ok(window);
     }
 
-    // If tmux suppresses `break-pane` output, identify the new window from the session state.
     let windows = list_windows(&source_pane.session_id, socket).await?;
     if let Some(window) = windows
         .iter()
@@ -2373,7 +2394,7 @@ pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>)
     })
 }
 
-/// Swap two panes.
+/// Exchange positions of two panes (same or different windows).
 pub async fn swap_pane(
     source_pane_id: &str,
     target_pane_id: &str,
@@ -2387,7 +2408,7 @@ pub async fn swap_pane(
     Ok(())
 }
 
-/// Enable or disable synchronize-panes for a window.
+/// Broadcast typed input to every pane in a window when enabled.
 pub async fn set_synchronize_panes(
     window_id: &str,
     enabled: bool,
@@ -2402,19 +2423,19 @@ pub async fn set_synchronize_panes(
     Ok(())
 }
 
-/// Rename a window.
+/// Change a window's display name.
 pub async fn rename_window(window_id: &str, name: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["rename-window", "-t", window_id, "--", name], socket).await?;
     Ok(())
 }
 
-/// Rename (set title of) a pane.
+/// Set a pane title via `select-pane -T`.
 pub async fn rename_pane(pane_id: &str, title: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["select-pane", "-t", pane_id, "-T", title], socket).await?;
     Ok(())
 }
 
-/// Move a window to another session.
+/// Relocate a window into another session, optionally at a fixed index.
 pub async fn move_window(
     window_id: &str,
     target_session_id: &str,
@@ -2680,7 +2701,6 @@ mod tests {
             log_path.to_str().expect("log path"),
         );
 
-        // CSI-u for Shift+Enter: ESC [ 1 3 ; 2 u
         send_keys_hex("%1", "1b 5b 31 33 3b 32 75", None)
             .await
             .expect("send hex");
@@ -2719,12 +2739,10 @@ mod tests {
 
     #[test]
     fn parse_hex_tokens_normalizes_and_validates() {
-        // Mixed case + single-digit normalize to two-digit lowercase.
         assert_eq!(
             parse_hex_tokens("1B 5b   7").expect("valid"),
             vec!["1b", "5b", "07"]
         );
-        // Invalid tokens rejected.
         assert!(parse_hex_tokens("zz").is_err());
         assert!(parse_hex_tokens("1ff").is_err());
         assert!(parse_hex_tokens("   ").is_err());

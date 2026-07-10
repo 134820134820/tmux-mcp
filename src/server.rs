@@ -43,6 +43,7 @@ pub struct TmuxMcpServer {
     subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
+/// Serialize a successful tool payload as MCP structured content.
 fn structured_output<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_value(value) {
         Ok(json) => CallToolResult::structured(json),
@@ -52,6 +53,7 @@ fn structured_output<T: Serialize>(value: &T) -> CallToolResult {
     }
 }
 
+/// Serialize a structured error payload (for example failed command snapshots).
 fn structured_error_output<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_value(value) {
         Ok(json) => CallToolResult::structured_error(json),
@@ -639,6 +641,7 @@ pub struct PasteTextInput {
 // Tool Router Implementation
 // ============================================================================
 
+/// Collapse trailing slashes so project paths hash to a stable socket id.
 fn normalize_path_for_socket(path: &str) -> String {
     let mut normalized = path.trim().to_string();
     while normalized.len() > 1 && normalized.ends_with('/') {
@@ -647,6 +650,7 @@ fn normalize_path_for_socket(path: &str) -> String {
     normalized
 }
 
+/// FNV-1a hex digest used by `socket-for-path` to derive isolated agent sockets.
 fn hash_path_for_socket(path: &str) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -683,7 +687,6 @@ impl TmuxMcpServer {
         let peer: Arc<RwLock<Option<Peer<RoleServer>>>> = Arc::new(RwLock::new(None));
         let subscriptions: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
 
-        // Forward runner events to MCP resource notifications.
         {
             let mut events = tracker.subscribe_events();
             let peer = Arc::clone(&peer);
@@ -2754,7 +2757,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "send-hex",
-        description = "Send raw bytes to a pane as whitespace-separated hex tokens via tmux send-keys -H.",
+        description = "Send raw bytes to a pane as whitespace-separated hex tokens via tmux send-keys -H. Rejects line-editing controls (BS/NAK/ETB/DEL) that can rewrite prior filtered input; use send-backspace for intentional edits.",
         annotations(open_world_hint = true)
     )]
     async fn send_hex(&self, input: Parameters<SendHexInput>) -> Result<CallToolResult, McpError> {
@@ -2782,7 +2785,6 @@ impl TmuxMcpServer {
             .iter()
             .map(|t| u8::from_str_radix(t, 16).expect("normalized hex"))
             .collect();
-        // Reject line-editing controls that can rewrite filtered input.
         if let Some(&b) = decoded
             .iter()
             .find(|&&b| matches!(b, 0x08 | 0x15 | 0x17 | 0x7f))
@@ -3392,7 +3394,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             let mut subs = self.subscriptions.write().await;
             subs.insert(uri.clone());
         }
-        // Fast-complete race: if already terminal, chime once so late subscribers wake.
+        // Already-terminal commands never emit Updated/Terminal after subscribe; chime once.
         if let Some(cmd) = self.tracker.get_command(command_id).await {
             if cmd.status.is_terminal() {
                 let peer = self.peer.read().await;
@@ -4375,9 +4377,9 @@ mod tests {
     #[tokio::test]
     async fn send_hex_rejects_line_editing_controls() {
         let server = server_with_policy("[security]\nenabled = false\n");
-        // "rx\bm -rf /\r": a backspace would rewrite this into "rm -rf /".
         let input = Parameters(SendHexInput {
             pane_id: "%1".into(),
+            // rx\b m -rf / would become rm -rf / after backspace
             hex: "72 78 08 6d 20 2d 72 66 20 2f 0d".into(),
             socket: None,
         });
@@ -5292,7 +5294,6 @@ mod tests {
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         let command_id = payload["commandId"].as_str().unwrap();
 
-        // Capture-pane failures are soft for partial-output refresh; wait for side-channel.
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
                 command_id: command_id.to_string(),
@@ -5794,7 +5795,6 @@ mod tests {
             .execute_command("%1", "echo hi", false, false, None, None)
             .await
             .expect("execute command");
-        // Side-channel completion is server-driven; wait before cataloging.
         let _ = server.tracker.wait_for(&command_id, 5_000).await;
         let (context, _client_transport, _running) = context_for_server(&server);
 
@@ -6245,7 +6245,6 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
 
         let logged = std::fs::read_to_string(log.path()).expect("read send-keys log");
-        // One send-keys for the payload, one for the Enter key.
         assert!(
             logged.contains("ls"),
             "expected payload send, got: {logged}"
@@ -6341,7 +6340,6 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
 
         let logged = std::fs::read_to_string(log.path()).expect("read paste-buffer log");
-        // Guard bracketed paste and staging-buffer cleanup flags.
         assert!(
             logged.contains("paste-buffer"),
             "expected paste-buffer call, got: {logged}"
@@ -6523,7 +6521,6 @@ mod tests {
 
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         assert_eq!(payload["status"], "running");
-        // raw_mode leaves a tracking-disabled note in output
         assert!(payload.get("output").is_some());
     }
 

@@ -39,10 +39,7 @@ impl TmuxFixture {
         let socket_path = socket_dir.path().join("tmux.sock");
         let socket_path = socket_path.to_string_lossy().to_string();
 
-        // Tests assume panes run bash (CommandTracker::new(ShellType::Bash)), but
-        // `new-session` inherits the developer's login shell, whose async prompt can
-        // swallow carriage returns on wrapped lines and stall tracking. Force a
-        // deterministic non-interactive bash (resolved via PATH for portability).
+        // Login shells/async prompts stall tracking; pin a bare bash for determinism.
         let config = socket_dir.path().join("tmux.conf");
         std::fs::write(
             &config,
@@ -162,55 +159,46 @@ async fn test_full_lifecycle() {
     let socket = fixture.socket();
     let socket_opt = Some(socket);
 
-    // Create session
     let session = tmux::create_session(&session_name, socket_opt)
         .await
         .expect("create session");
     assert_eq!(session.name, session_name);
 
-    // List sessions
     let sessions = tmux::list_sessions(socket_opt)
         .await
         .expect("list sessions");
     assert!(sessions.iter().any(|s| s.name == session_name));
 
-    // List windows (session starts with one window)
     let windows = tmux::list_windows(&session.id, socket_opt)
         .await
         .expect("list windows");
     assert!(!windows.is_empty());
     let window = &windows[0];
 
-    // List panes (window starts with one pane)
     let panes = tmux::list_panes(&window.id, socket_opt)
         .await
         .expect("list panes");
     assert_eq!(panes.len(), 1);
     let pane_id = &panes[0].id;
 
-    // Split pane
     let new_pane = tmux::split_pane(pane_id, Some("horizontal"), Some(50), socket_opt)
         .await
         .expect("split pane");
 
-    // Verify we now have 2 panes
     let panes = tmux::list_panes(&window.id, socket_opt)
         .await
         .expect("list panes after split");
     assert_eq!(panes.len(), 2);
 
-    // Create another window
     let new_window = tmux::create_window(&session.id, "second-window", socket_opt)
         .await
         .expect("create window");
     assert_eq!(new_window.name, "second-window");
 
-    // Rename window
     tmux::rename_window(&new_window.id, "renamed-window", socket_opt)
         .await
         .expect("rename window");
 
-    // Kill pane
     tmux::kill_pane(&new_pane.id, socket_opt)
         .await
         .expect("kill pane");
@@ -219,7 +207,6 @@ async fn test_full_lifecycle() {
         .expect("list panes after kill");
     assert_eq!(panes.len(), 1);
 
-    // Kill session (cleanup)
     tmux::kill_session(&session.id, socket_opt)
         .await
         .expect("kill session");
@@ -253,8 +240,7 @@ async fn test_leading_dash_names_are_not_parsed_as_flags() {
         .expect("list windows");
     let window = &windows[0];
 
-    // A window name starting with '-' must be passed after a '--' separator,
-    // otherwise tmux parses it as an unknown flag and the rename fails.
+    // Leading '-' names need argv `--` so tmux does not treat them as flags.
     tmux::rename_window(&window.id, "-leading-dash", socket_opt)
         .await
         .expect("rename window to leading-dash name");
@@ -263,7 +249,6 @@ async fn test_leading_dash_names_are_not_parsed_as_flags() {
         .expect("list windows after rename");
     assert!(windows.iter().any(|w| w.name == "-leading-dash"));
 
-    // Same hazard for session names.
     tmux::rename_session(&session.id, &dashed_session, socket_opt)
         .await
         .expect("rename session to leading-dash name");
@@ -272,7 +257,6 @@ async fn test_leading_dash_names_are_not_parsed_as_flags() {
         .expect("list sessions after rename");
     assert!(sessions.iter().any(|s| s.name == dashed_session));
 
-    // A normal layout value must still work after the '--' separator.
     tmux::select_layout(&window.id, "even-horizontal", socket_opt)
         .await
         .expect("select a valid layout");
@@ -308,10 +292,7 @@ async fn test_paste_text_delivers_content_and_cleans_buffer() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    // Single-line token (no newline) so the assertion is deterministic regardless
-    // of whether the pane's shell supports bracketed paste. The held-not-submitted
-    // behavior for embedded newlines is covered separately by
-    // `test_paste_text_holds_newlines_with_bracketed_paste` (which uses zsh).
+    // Single-line paste: multi-line hold-without-submit is covered in the zsh test.
     let token = format!("PASTE_TOKEN_{}", std::process::id());
     tmux::paste_text(pane_id, &token, socket_opt)
         .await
@@ -323,7 +304,6 @@ async fn test_paste_text_delivers_content_and_cleans_buffer() {
         "pasted token should appear in pane, got: {content}"
     );
 
-    // The throwaway staging buffer must be deleted by `paste-buffer -d`.
     let buffers = tmux::list_buffers(socket_opt).await.expect("list buffers");
     assert!(
         !buffers
@@ -357,8 +337,7 @@ async fn test_paste_text_holds_newlines_with_bracketed_paste() {
 
     use tmux_mcp_rs::tmux;
 
-    // Bracketed paste needs a capable program; zsh enables it. Skip cleanly when
-    // zsh is not installed (the boot shell is bash, which on old versions lacks it).
+    // Fixture boots bash; bracketed paste needs zsh (skip when absent).
     let zsh_ok = Command::new("zsh")
         .arg("--version")
         .output()
@@ -387,10 +366,7 @@ async fn test_paste_text_holds_newlines_with_bracketed_paste() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    // Replace bash with zsh and enable bracketed paste, then run an arithmetic
-    // sentinel: its OUTPUT ("BP_READY_42") differs from the typed command
-    // ("...$((6*7))"), so waiting on the output confirms zsh is live and has
-    // processed the setup line before we paste.
+    // BP_READY_42 is arithmetic output, not the typed command—proves zsh is ready.
     send_line(pane_id, "exec zsh -f", socket_opt).await;
     send_line(
         pane_id,
@@ -401,8 +377,6 @@ async fn test_paste_text_holds_newlines_with_bracketed_paste() {
     send_line(pane_id, "print BP_READY_$((6*7))", socket_opt).await;
     wait_for_pane_output(pane_id, "BP_READY_42", Duration::from_secs(8), socket).await;
 
-    // Paste multi-line text. With bracketed paste the embedded newlines must NOT
-    // submit line-by-line; the lines stay on the command line unexecuted.
     tmux::paste_text(pane_id, "AAA_LINE\nBBB_LINE\nCCC_LINE", socket_opt)
         .await
         .expect("paste text");
@@ -411,8 +385,6 @@ async fn test_paste_text_holds_newlines_with_bracketed_paste() {
         content.contains("AAA_LINE"),
         "pasted text should appear in the pane, got: {content}"
     );
-    // If the newlines had submitted, zsh would report each line as a missing
-    // command. Their absence is the proof the paste was held.
     assert!(
         !content.contains("command not found"),
         "bracketed paste should hold newlines, not execute each line: {content}"
@@ -440,7 +412,6 @@ async fn test_execute_command_tracking() {
     let socket_opt = Some(socket);
     let socket_owned = Some(socket.to_string());
 
-    // Create a session and get the pane
     let session = tmux::create_session(&session_name, socket_opt)
         .await
         .expect("create session");
@@ -452,23 +423,20 @@ async fn test_execute_command_tracking() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    // Create tracker
     let tracker = CommandTracker::new(ShellType::Bash);
 
-    // Execute a simple command
     let cmd_id = tracker
         .execute_command(
             pane_id,
             "echo 'hello-integration-test'",
-            false,                // not raw mode
-            false,                // not no_enter
-            None,                 // no delay
-            socket_owned.clone(), // socket
+            false,
+            false,
+            None,
+            socket_owned.clone(),
         )
         .await
         .expect("execute command");
 
-    // Wait for completion (poll with timeout)
     let timeout = Duration::from_secs(5);
     let start = std::time::Instant::now();
 
@@ -492,7 +460,6 @@ async fn test_execute_command_tracking() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Cleanup
     tmux::kill_session(&session.id, socket_opt)
         .await
         .expect("kill session");
@@ -693,8 +660,7 @@ async fn test_workflow_metadata_and_zoom() {
         .expect("pane info");
     assert_eq!(pane_info.title, "meta-pane");
 
-    // Zoom is a no-op on a single-pane window (nothing to maximize), so the
-    // `zoomed` flag would never flip. Add a second pane first.
+    // Zoom is a no-op until the window has more than one pane.
     let extra_pane = tmux::split_pane(pane_id, Some("horizontal"), Some(50), socket_opt)
         .await
         .expect("split pane for zoom");
@@ -1026,7 +992,6 @@ async fn test_send_keys_and_capture() {
     let socket = fixture.socket();
     let socket_opt = Some(socket);
 
-    // Create session
     let session = tmux::create_session(&session_name, socket_opt)
         .await
         .expect("create session");
@@ -1038,7 +1003,6 @@ async fn test_send_keys_and_capture() {
         .expect("list panes");
     let pane_id = &panes[0].id;
 
-    // Send keys to type a command
     tmux::send_keys(pane_id, "echo 'sent-via-keys'", false, socket_opt)
         .await
         .expect("send keys");
@@ -1046,10 +1010,8 @@ async fn test_send_keys_and_capture() {
         .await
         .expect("send enter");
 
-    // Wait a bit for output
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Capture and verify
     let content = tmux::capture_pane(pane_id, Some(50), false, None, None, false, socket_opt)
         .await
         .expect("capture pane");
@@ -1058,7 +1020,6 @@ async fn test_send_keys_and_capture() {
         "Output should contain sent text: {content}"
     );
 
-    // Cleanup
     tmux::kill_session(&session.id, socket_opt)
         .await
         .expect("kill session");
