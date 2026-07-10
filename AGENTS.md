@@ -3,19 +3,19 @@
 ## Project Structure & Module Organization
 - `src/` holds the Rust crate. Key files: `main.rs` (CLI entry), `lib.rs` (library exports), `server.rs` (MCP server), `tmux.rs` (tmux process wrapper), `security.rs` (policy checks/config schema), `commands.rs`, `types.rs`, `errors.rs`, and `test_support.rs` (tmux/ssh stubs for tests).
 - `tests/` contains Rust tests: `cli.rs` for CLI behavior and `integration.rs` for tmux-backed workflows.
-- `scripts/` and `npm/` support the npm distribution (workspace base + platform packages) plus release packaging helpers.
-- `npm/base/`: npm wrapper package (launcher + optionalDependencies).
-- `npm/platform/<os-arch>/`: platform packages containing the binary.
-- `docs/RELEASE.md` is the release guide; `DIST.md` is the distribution checklist.
-- Build outputs live in `target/`; npm installs create `node_modules/` (both are generated).
+- `scripts/` holds release packaging helpers (`build-release`, `package-release`, `resolve-version`).
+- `npm/tmux-mcp-rs/`: npm wrapper package (`@bnomei/tmux-mcp-rs`) that downloads the matching GitHub Release binary at first run.
+- `Dockerfile`: multi-arch image that fetches musl Linux release assets and runs on Alpine with `tmux`.
+- `packaging/README.md` describes npm/Docker/Homebrew packaging surfaces.
+- `docs/RELEASE.md` is the release guide.
+- Build outputs live in `target/` and `dist/` (both generated).
 
 ## Build, Test, and Development Commands
 - `cargo build --release` builds the `tmux-mcp-rs` binary in `target/release/`.
 - `cargo test --lib` runs unit tests without tmux.
 - `cargo test --test cli` runs CLI tests without tmux.
 - `TMUX_MCP_INTEGRATION=1 cargo test --test integration` runs tmux integration tests (requires tmux on PATH).
-- `npm install`: install workspace packages.
-- `npm run check-version-sync`: verify Rust/npm version alignment (Cargo.toml vs `npm/base/package.json`).
+- Release packaging: `TARGET=... VERSION=... scripts/build-release.sh` then `scripts/package-release.sh`.
 
 ## Coding Style & Naming Conventions
 - Rust 2021 edition; prefer rustfmt defaults (`cargo fmt`) when formatting.

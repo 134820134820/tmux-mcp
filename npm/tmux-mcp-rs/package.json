@@ -1,0 +1,20 @@
+{
+  "name": "@bnomei/tmux-mcp-rs",
+  "version": "0.5.0",
+  "description": "Tmux MCP server in Rust — npm wrapper that downloads the matching GitHub Release binary.",
+  "homepage": "https://github.com/bnomei/tmux-mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bnomei/tmux-mcp.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "tmux-mcp-rs": "bin/tmux-mcp-rs.js"
+  },
+  "files": [
+    "bin/tmux-mcp-rs.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

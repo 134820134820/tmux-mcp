@@ -65,6 +65,60 @@ cargo install tmux-mcp-rs
 brew install bnomei/tmux-mcp/tmux-mcp-rs
 ```
 
+### npm
+
+```bash
+npx @bnomei/tmux-mcp-rs --version
+# or: npm install -g @bnomei/tmux-mcp-rs
+```
+
+The npm package is a thin wrapper: on first run it downloads the matching GitHub Release binary, verifies the `.sha256`, caches it, and forwards argv.
+
+### Docker
+
+```bash
+docker run --rm ghcr.io/bnomei/tmux-mcp:0.5.0 --version
+```
+
+The image is **self-contained**: it includes Alpine `tmux` 3.x and the prebuilt musl Linux binary. Sessions run **inside the container**, not on your desktop tmux server.
+
+- **Default (recommended for Docker):** isolated agent sandbox. Human attach uses `docker exec` (see below).
+- **Optional (Linux only):** mount a host tmux socket so the container drives a host-side server you can `tmux attach` to natively. Docker Desktop on macOS/Windows generally cannot reach host Unix sockets this way.
+- For easy human/agent co-attach on a laptop, prefer Homebrew, cargo, or npm on the host instead of Docker.
+
+stdio MCP client (keep stdin attached):
+
+```bash
+docker run --rm -i \
+  -v "$PWD:/workspace" \
+  ghcr.io/bnomei/tmux-mcp:0.5.0
+```
+
+Watch a session created inside the container:
+
+```bash
+docker exec -it <container> tmux attach -t workspace
+```
+
+Linux host-socket wiring (advanced):
+
+```bash
+# host: start an isolated tmux server
+tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
+
+# container: talk to that socket (image still needs its own tmux client)
+docker run --rm -i \
+  -v /tmp/tmux-mcp-agent.sock:/tmp/tmux-mcp-agent.sock \
+  --user "$(id -u):$(id -g)" \
+  ghcr.io/bnomei/tmux-mcp:0.5.0 \
+  --socket /tmp/tmux-mcp-agent.sock
+
+# host: attach as usual
+tmux -S /tmp/tmux-mcp-agent.sock attach -t workspace
+```
+
+Match container UID/GID to the socket owner when permissions fail. More detail: [packaging/README.md](packaging/README.md#docker-image).
+
 ### GitHub Releases
 
 Download a prebuilt archive from [GitHub Releases](https://github.com/bnomei/tmux-mcp/releases), extract it, and place `tmux-mcp-rs` on your `PATH`.
@@ -92,7 +146,6 @@ Expected output:
 tmux 3.x
 tmux-mcp-rs <version>
 ```
-
 ## Quick start
 
 1. Add the server to your MCP client.
@@ -496,6 +549,10 @@ Pre-create the session when you want a human-visible workspace before the MCP cl
 tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
 TMUX_MCP_SOCKET=/tmp/tmux-mcp-agent.sock tmux-mcp-rs
 ```
+
+### Docker and sockets
+
+The GHCR image includes tmux 3.x and defaults to **self-contained** sessions inside the container (`docker exec … tmux attach`). On Linux only, you can instead mount a host socket so the container MCP server drives a host tmux server—see [Installation → Docker](#docker) and [packaging/README.md](packaging/README.md#docker-image). Docker Desktop on macOS/Windows is not a reliable host-socket path; use a native install when you need easy local co-attach.
 
 ## Agent workflow patterns
 
