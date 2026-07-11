@@ -24,24 +24,26 @@ use crate::security::{ConfigFile, SearchConfig, SecurityPolicy};
 use crate::server::TmuxMcpServer;
 use crate::types::ShellType;
 
+/// Process CLI: shell dialect, config path, and socket/SSH isolation overrides.
 #[derive(Parser, Debug)]
 #[command(name = "tmux-mcp-rs")]
 #[command(about = "Tmux MCP server in Rust")]
 #[command(version)]
 struct Cli {
-    /// Shell type (bash, zsh, fish)
+    /// Default shell dialect for tracked-command wrappers (`bash`, `zsh`, `fish`).
+    /// Overridden by `[shell].type` in config.toml when that field is set.
     #[arg(short = 't', long = "shell-type", default_value = "bash")]
     shell_type: String,
 
-    /// Path to TOML configuration file
+    /// Path to config.toml (security, tracking, search, shell, ssh sections).
     #[arg(short = 'c', long = "config")]
     config: Option<PathBuf>,
 
-    /// Path to tmux socket (for isolation or connecting to specific server)
+    /// Tmux socket path written to `TMUX_MCP_SOCKET` for process-wide isolation.
     #[arg(short = 's', long = "socket")]
     socket: Option<PathBuf>,
 
-    /// SSH connection string for remote tmux (e.g. "user@host" or "-i key user@host")
+    /// Remote tmux via OpenSSH (`user@host` or extra ssh argv). Overrides config/env.
     #[arg(short = 'r', long = "ssh")]
     ssh: Option<String>,
 }

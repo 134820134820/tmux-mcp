@@ -451,31 +451,41 @@ pub struct CommandFilter {
 ///
 /// When `enabled` is false, enforcement methods short-circuit to allow. Optional
 /// allowlists (`None`) mean unrestricted for that dimension; `Some(empty)` denies all.
+/// Capability flags and the tool filter both apply: a tool must pass both gates.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Master switch; when false every check short-circuits to allow.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Gates `execute-command` and `get-command-result`.
     #[serde(default = "default_true")]
     pub allow_execute_command: bool,
+    /// Gates `rawMode` on `execute-command` (tracked wrappers skipped).
     #[serde(default = "default_true")]
     pub allow_raw_mode: bool,
+    /// Gates interactive and special-key injection tools (`send-keys`, `paste-text`, …).
     #[serde(default = "default_true")]
     pub allow_send_keys: bool,
+    /// Gates `kill-session` / `kill-window` / `kill-pane` / `detach-client`.
     #[serde(default = "default_true")]
     pub allow_kill: bool,
+    /// Gates `create-session` and `create-window`.
     #[serde(default = "default_true")]
     pub allow_create: bool,
+    /// Gates `split-pane`.
     #[serde(default = "default_true")]
     pub allow_split: bool,
+    /// Gates `rename-session` / `rename-window` / `rename-pane`.
     #[serde(default = "default_true")]
     pub allow_rename: bool,
+    /// Gates focus/layout tools (`select-*`, `resize-pane`, `join-pane`, …).
     #[serde(default = "default_true")]
     pub allow_move: bool,
-    /// Also gates buffer-read tools (show/search/save/load/…).
+    /// Gates `capture-pane` and all paste-buffer read/write/search tools.
     #[serde(default = "default_true")]
     pub allow_capture: bool,
+    /// Gates inventory tools (`list-*`, `find-session`, `socket-for-path`, …).
     #[serde(default = "default_true")]
     pub allow_list: bool,
     /// `None` = unrestricted; `Some([])` denies every socket.
@@ -484,13 +494,16 @@ pub struct SecurityConfig {
     /// Match by session id or session name when present.
     #[serde(default)]
     pub allowed_sessions: Option<Vec<String>>,
+    /// Exact pane id allowlist (`%N`); `None` unrestricted, `Some([])` denies all.
     #[serde(default)]
     pub allowed_panes: Option<Vec<String>>,
     /// Absolute dirs for buffer save/load; unset uses the process temp sandbox.
     #[serde(default)]
     pub allowed_buffer_paths: Option<Vec<String>>,
+    /// Regex allow/deny applied per split shell statement on `execute-command`.
     #[serde(default)]
     pub command_filter: CommandFilter,
+    /// Fine-grained tool name/group surface filter (`@read`, `execute-command`, …).
     #[serde(default)]
     pub tools: ToolFilter,
 }
@@ -524,17 +537,25 @@ impl Default for SecurityConfig {
 }
 
 /// Full config.toml schema (shell, ssh, security, tracking, search sections).
+///
+/// Unknown keys are rejected so typos fail closed at load time rather than
+/// silently disabling policy or tracking budgets.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    /// Default shell dialect for tracked-command wrappers.
     #[serde(default)]
     pub shell: ShellConfig,
+    /// Optional remote tmux via OpenSSH (`TMUX_MCP_SSH` / CLI can override).
     #[serde(default)]
     pub ssh: SshConfig,
+    /// Capability flags, allowlists, and command/tool filters.
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Capture, retention, and side-channel deadline budgets.
     #[serde(default)]
     pub tracking: TrackingConfig,
+    /// When paste-buffer search spills large buffers to temp files.
     #[serde(default)]
     pub search: SearchConfig,
 }
@@ -832,7 +853,11 @@ impl SecurityPolicy {
         self.config.allowed_panes.is_some()
     }
 
-    /// Validate a local buffer file path and return the canonical path to pass to tmux.
+    /// Validate a local buffer *source* path (must already exist) and return the
+    /// canonical path to pass to tmux.
+    ///
+    /// Rejects `..` traversal. With no `allowed_buffer_paths`, only relative paths
+    /// under the process temp sandbox are accepted.
     pub fn resolve_local_buffer_path(&self, path: &str) -> Result<String> {
         if !self.config.enabled {
             return Ok(path.to_string());
@@ -866,7 +891,8 @@ impl SecurityPolicy {
         }
     }
 
-    /// Validate a local buffer destination and return the path to pass to tmux.
+    /// Validate a local buffer *destination* path (may not exist yet) and return
+    /// the path to pass to tmux, creating the default sandbox dir when needed.
     pub fn resolve_local_buffer_destination_path(&self, path: &str) -> Result<String> {
         if !self.config.enabled {
             return Ok(path.to_string());

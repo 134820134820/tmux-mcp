@@ -11,6 +11,9 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error variants returned across the library and MCP tool boundary.
+///
+/// Prefer mapping these to MCP tool errors rather than panicking. Policy denials
+/// are intentional client-visible failures, not server faults.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Configuration file IO or TOML/schema failure (including invalid regex patterns).

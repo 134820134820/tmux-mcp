@@ -28,6 +28,9 @@ main().catch((error) => {
   process.exit(1);
 });
 
+/**
+ * Resolve a local or cached native binary, downloading from GitHub Releases when needed.
+ */
 async function main() {
   if (process.env.TMUX_MCP_RS_LOCAL_BIN) {
     runBinary(process.env.TMUX_MCP_RS_LOCAL_BIN);
@@ -49,6 +52,7 @@ async function main() {
   runBinary(binaryPath);
 }
 
+/** Exec the native binary, inheriting stdio and forwarding exit code/signal. */
 function runBinary(binaryPath) {
   const result = childProcess.spawnSync(binaryPath, process.argv.slice(2), {
     stdio: "inherit",
@@ -66,10 +70,15 @@ function runBinary(binaryPath) {
   process.exit(result.status || 0);
 }
 
+/** Normalize package or env version to a `v`-prefixed release tag. */
 function normalizeVersion(version) {
   return version.startsWith("v") ? version : `v${version}`;
 }
 
+/**
+ * Map Node `platform`/`arch` to a GitHub Release target triple and archive type.
+ * @throws {Error} when the host triple is not published.
+ */
 function releaseTarget() {
   const platform = process.platform;
   const arch = process.arch;
@@ -97,6 +106,7 @@ function releaseTarget() {
   throw new Error(`unsupported platform ${platform}/${arch}`);
 }
 
+/** Unix release layout: musl/darwin tar.gz with a bare `tmux-mcp-rs` binary. */
 function unixRelease(target) {
   return {
     target,
@@ -105,6 +115,10 @@ function unixRelease(target) {
   };
 }
 
+/**
+ * Versioned download cache root.
+ * Override with `TMUX_MCP_RS_NPM_CACHE`; else XDG/LocalAppData defaults.
+ */
 function cacheDir() {
   if (process.env.TMUX_MCP_RS_NPM_CACHE) {
     return process.env.TMUX_MCP_RS_NPM_CACHE;
@@ -121,6 +135,9 @@ function cacheDir() {
   );
 }
 
+/**
+ * Download the release archive, verify SHA-256, extract, and install into `binaryPath`.
+ */
 async function installRelease(binaryPath, release) {
   const archive = `${BIN}-${VERSION}-${release.target}${release.archiveExt}`;
   const baseUrl = `https://github.com/${REPOSITORY}/releases/download/${VERSION}/${archive}`;
@@ -150,6 +167,7 @@ async function installRelease(binaryPath, release) {
   }
 }
 
+/** HTTPS download with redirect follow (bounded) into `destination`. */
 function download(url, destination, redirects = 0) {
   return new Promise((resolve, reject) => {
     const request = https.get(
@@ -191,6 +209,7 @@ function download(url, destination, redirects = 0) {
   });
 }
 
+/** Fail closed unless the archive SHA-256 matches the release `.sha256` sidecar. */
 function verifyChecksum(archivePath, checksumPath) {
   const expected = fs.readFileSync(checksumPath, "utf8").trim().split(/\s+/)[0].toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(expected)) {
@@ -203,6 +222,7 @@ function verifyChecksum(archivePath, checksumPath) {
   }
 }
 
+/** Extract `.tar.gz` via `tar`, or Windows `.zip` via PowerShell Expand-Archive. */
 function extractArchive(archivePath, destination, archiveExt) {
   if (archiveExt === ".tar.gz") {
     childProcess.execFileSync("tar", ["-xzf", archivePath, "-C", destination], {

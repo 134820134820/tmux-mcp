@@ -26,6 +26,7 @@ use crate::types::{
 };
 
 /// Cap concurrent local/SSH tmux spawns so multi-tool bursts do not fork-bomb.
+/// Long `wait-for` side-channel waits intentionally bypass this semaphore.
 const TMUX_MAX_CONCURRENCY: usize = 8;
 const DEFAULT_SHOW_MAX_BYTES: u64 = 65_536;
 const DEFAULT_SEARCH_CONTEXT_BYTES: u32 = 40;
