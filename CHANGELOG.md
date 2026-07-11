@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - Closed DONE-marker spoof early completion: forging `TMUX_MCP_DONE_<id>_<code>` in pane text cannot complete a tracked command.
 
+### Fixed
+- Various tracked-command reliability fixes: command results now accurately report incomplete or truncated output across capture races, failures, and still-running commands.
+- Fixed buffer-search pagination so boundary-spanning literal matches and cursor progression remain correct across pages.
+- Enforced the same composite capability checks for resource discovery, reads, subscriptions, and resource updates.
+
 ## [0.5.0] - 2026-06-10
 ### Added
 - Added `[security.tools]` and `TMUX_MCP_TOOLS` allow/deny filters for hiding and denying exact tools or tool groups at runtime.
