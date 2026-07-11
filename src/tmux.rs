@@ -31,6 +31,8 @@ const DEFAULT_SHOW_MAX_BYTES: u64 = 65_536;
 const DEFAULT_SEARCH_CONTEXT_BYTES: u32 = 40;
 const DEFAULT_SEARCH_MAX_MATCHES: u32 = 50;
 const DEFAULT_SEARCH_MAX_SCAN_BYTES: u64 = 65_536;
+/// Extra bytes loaded past a logical page so an edge cannot split a UTF-8 scalar.
+const UTF8_WINDOW_SLACK_BYTES: u64 = 4;
 /// Prefer tempfile rewrite for append when local buffer exceeds this size.
 const APPEND_INLINE_MAX_BYTES: u64 = 262_144;
 const PARALLEL_BUFFER_THRESHOLD: usize = 10;
@@ -54,7 +56,8 @@ pub struct SearchOptions {
     pub context_bytes: Option<u32>,
     /// Hard stop on matches returned for the whole request.
     pub max_matches: Option<u32>,
-    /// Per-buffer byte budget before the buffer is marked truncated.
+    /// Per-buffer byte budget for literal match starts. Regex/fuzzy search
+    /// requires this budget to cover the full buffer so paging stays stateless.
     pub max_scan_bytes: Option<u64>,
     /// Attach similarity scores when the fuzzy feature stack is enabled.
     pub include_similarity: bool,
@@ -83,9 +86,49 @@ struct BufferScanResult {
     name: String,
     matches: Vec<BufferSearchMatch>,
     scan_end: usize,
+    full_len: usize,
     truncated_by_scan: bool,
     fuzzy_skipped_lines: u32,
     fuzzy_skipped_bytes: u64,
+    zero_length_regex_offset: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct MatchRange {
+    /// Bytes inspected by the matcher. This may include finite lookahead.
+    search_start: usize,
+    search_end: usize,
+    /// Match starts eligible for this page. The end is exclusive.
+    eligible_start: usize,
+    eligible_end: usize,
+    /// Bounds applied to returned snippets.
+    context_start: usize,
+    context_end: usize,
+}
+
+impl MatchRange {
+    fn contains_start(self, offset: usize) -> bool {
+        offset >= self.eligible_start && offset < self.eligible_end
+    }
+}
+
+#[derive(Clone)]
+struct BufferScanPlan {
+    buffer: BufferText,
+    range: MatchRange,
+    /// Absolute byte cursor immediately after the logical page.
+    scan_end: usize,
+    truncated_by_scan: bool,
+}
+
+struct ScanExecution<'a> {
+    query: &'a str,
+    context_bytes: usize,
+    include_similarity: bool,
+    mode: SearchMode,
+    regex: Option<&'a Regex>,
+    fuzzy_enabled: bool,
+    similarity_threshold: f32,
 }
 
 /// Return tmux's default socket path for the current user.
@@ -1029,6 +1072,7 @@ struct MatchCollection {
     matches: Vec<BufferSearchMatch>,
     fuzzy_skipped_lines: u32,
     fuzzy_skipped_bytes: u64,
+    zero_length_regex_offset: Option<u64>,
 }
 
 fn build_match(
@@ -1048,7 +1092,12 @@ fn build_match(
         true,
     );
     let bounded_start = context_start.max(scan_start);
-    let bounded_end = context_end.min(scan_end);
+    // Keep ordinary context inside the logical page while always returning the
+    // complete match that finite lookahead proved at the page boundary.
+    let bounded_end = context_end
+        .min(scan_end)
+        .max(offset.saturating_add(match_len))
+        .min(ctx.text.len());
     let snippet = if bounded_start < bounded_end {
         ctx.text[bounded_start..bounded_end].to_string()
     } else {
@@ -1077,36 +1126,51 @@ fn build_match(
 
 fn collect_matches(
     ctx: &MatchContext<'_>,
-    scan_start: usize,
-    scan_end: usize,
+    range: MatchRange,
     mode: SearchMode,
     regex: Option<&Regex>,
     fuzzy_enabled: bool,
     similarity_threshold: f32,
 ) -> MatchCollection {
-    let scan_text = &ctx.text[scan_start..scan_end];
+    let scan_text = &ctx.text[range.search_start..range.search_end];
     let mut matches: Vec<BufferSearchMatch> = Vec::new();
     let mut seen_offsets: BTreeSet<u64> = BTreeSet::new();
     let mut fuzzy_skipped_lines: u32 = 0;
     let mut fuzzy_skipped_bytes: u64 = 0;
+    let mut zero_length_regex_offset: Option<u64> = None;
 
     if mode == SearchMode::Literal {
         for (offset, _) in scan_text.match_indices(ctx.query) {
-            let absolute = scan_start.saturating_add(offset);
+            let absolute = range.search_start.saturating_add(offset);
+            if !range.contains_start(absolute) {
+                continue;
+            }
             matches.push(build_match(
                 ctx,
                 absolute,
                 ctx.query.len(),
-                scan_start,
-                scan_end,
+                range.context_start,
+                range.context_end,
             ));
             seen_offsets.insert(absolute as u64);
         }
     } else if let Some(regex) = regex {
         for m in regex.find_iter(scan_text) {
             let match_len = m.end().saturating_sub(m.start());
-            let absolute = scan_start.saturating_add(m.start());
-            matches.push(build_match(ctx, absolute, match_len, scan_start, scan_end));
+            let absolute = range.search_start.saturating_add(m.start());
+            if match_len == 0 && zero_length_regex_offset.is_none() {
+                zero_length_regex_offset = Some(ctx.base_offset.saturating_add(absolute) as u64);
+            }
+            if !range.contains_start(absolute) {
+                continue;
+            }
+            matches.push(build_match(
+                ctx,
+                absolute,
+                match_len,
+                range.context_start,
+                range.context_end,
+            ));
             seen_offsets.insert(absolute as u64);
         }
     }
@@ -1122,11 +1186,19 @@ fn collect_matches(
                 } else {
                     let (score, best_start, best_len) = best_fuzzy_window(ctx.query, line);
                     if score >= similarity_threshold && best_len > 0 {
-                        let absolute = scan_start.saturating_add(offset).saturating_add(best_start);
+                        let absolute = range
+                            .search_start
+                            .saturating_add(offset)
+                            .saturating_add(best_start);
                         let absolute_u64 = absolute as u64;
-                        if !seen_offsets.contains(&absolute_u64) {
-                            let mut entry =
-                                build_match(ctx, absolute, best_len, scan_start, scan_end);
+                        if range.contains_start(absolute) && !seen_offsets.contains(&absolute_u64) {
+                            let mut entry = build_match(
+                                ctx,
+                                absolute,
+                                best_len,
+                                range.context_start,
+                                range.context_end,
+                            );
                             entry.similarity = Some(score);
                             matches.push(entry);
                             seen_offsets.insert(absolute_u64);
@@ -1146,6 +1218,7 @@ fn collect_matches(
         matches,
         fuzzy_skipped_lines,
         fuzzy_skipped_bytes,
+        zero_length_regex_offset,
     }
 }
 
@@ -1165,6 +1238,36 @@ fn resolve_similarity_flags(
 
     let threshold = similarity_threshold.unwrap_or(0.8).clamp(0.0, 1.0);
     Ok((include_similarity, fuzzy_enabled, threshold))
+}
+
+fn execute_scan_plan(plan: &BufferScanPlan, execution: &ScanExecution<'_>) -> BufferScanResult {
+    let buffer = &plan.buffer;
+    let ctx = MatchContext {
+        buffer: &buffer.name,
+        text: &buffer.text,
+        query: execution.query,
+        context_bytes: execution.context_bytes,
+        include_similarity: execution.include_similarity,
+        base_offset: buffer.base_offset,
+    };
+    let collection = collect_matches(
+        &ctx,
+        plan.range,
+        execution.mode,
+        execution.regex,
+        execution.fuzzy_enabled,
+        execution.similarity_threshold,
+    );
+    BufferScanResult {
+        name: buffer.name.clone(),
+        matches: collection.matches,
+        scan_end: plan.scan_end,
+        full_len: buffer.full_len,
+        truncated_by_scan: plan.truncated_by_scan,
+        fuzzy_skipped_lines: collection.fuzzy_skipped_lines,
+        fuzzy_skipped_bytes: collection.fuzzy_skipped_bytes,
+        zero_length_regex_offset: collection.zero_length_regex_offset,
+    }
 }
 
 fn search_texts(
@@ -1191,9 +1294,24 @@ fn search_texts(
 
     let context_bytes = context_bytes.unwrap_or(DEFAULT_SEARCH_CONTEXT_BYTES) as usize;
     let max_matches = max_matches.unwrap_or(DEFAULT_SEARCH_MAX_MATCHES);
-    let max_scan_bytes = max_scan_bytes.unwrap_or(DEFAULT_SEARCH_MAX_SCAN_BYTES) as usize;
+    if max_matches == 0 {
+        return Err(Error::InvalidArgument {
+            message: "maxMatches must be greater than zero".into(),
+        });
+    }
+    let max_scan_bytes_u64 = max_scan_bytes.unwrap_or(DEFAULT_SEARCH_MAX_SCAN_BYTES);
+    if max_scan_bytes_u64 == 0 {
+        return Err(Error::InvalidArgument {
+            message: "maxScanBytes must be greater than zero".into(),
+        });
+    }
+    let max_scan_bytes = usize::try_from(max_scan_bytes_u64).unwrap_or(usize::MAX);
     let (include_similarity, fuzzy_enabled, similarity_threshold) =
         resolve_similarity_flags(include_similarity, fuzzy_match, similarity_threshold)?;
+    // Arbitrary regex spans and fuzzy line state cannot be represented by the
+    // public offset-only continuation cursor. Evaluate those modes against the
+    // original full buffer and use maxScanBytes as a hard full-buffer ceiling.
+    let requires_full_scan = mode == SearchMode::Regex || fuzzy_enabled;
 
     let regex = if mode == SearchMode::Regex {
         Some(Regex::new(query).map_err(|e| Error::InvalidArgument {
@@ -1203,7 +1321,7 @@ fn search_texts(
         None
     };
 
-    let mut buffer_texts: Vec<(BufferText, usize, usize, usize, bool)> = Vec::new();
+    let mut scan_plans: Vec<BufferScanPlan> = Vec::new();
     let mut bytes_scanned_total: u64 = 0;
 
     if let Some(ref resume) = resume_from_offset {
@@ -1217,11 +1335,11 @@ fn search_texts(
         }
     }
 
-    for buffer in buffers.iter() {
+    for buffer in &buffers {
         let window_len = buffer.text.len();
         let buffer_len = buffer.full_len;
         let window_start = buffer.base_offset;
-        let scan_start = if let Some(ref resume) = resume_from_offset {
+        let resume_offset = if let Some(ref resume) = resume_from_offset {
             if let Some(offset) = resume.get(&buffer.name) {
                 let offset = *offset as usize;
                 if offset > buffer_len {
@@ -1232,7 +1350,15 @@ fn search_texts(
                         ),
                     });
                 }
-                let relative = offset.saturating_sub(window_start);
+                if offset < window_start {
+                    return Err(Error::InvalidArgument {
+                        message: format!(
+                            "resumeFromOffset {} is not a UTF-8 character boundary in buffer '{}'",
+                            offset, buffer.name
+                        ),
+                    });
+                }
+                let relative = offset - window_start;
                 if relative > window_len {
                     return Err(Error::InvalidArgument {
                         message: format!(
@@ -1241,72 +1367,150 @@ fn search_texts(
                         ),
                     });
                 }
-                clamp_char_boundary(&buffer.text, relative, false)
+                if !buffer.text.is_char_boundary(relative) {
+                    return Err(Error::InvalidArgument {
+                        message: format!(
+                            "resumeFromOffset {} is not a UTF-8 character boundary in buffer '{}'",
+                            offset, buffer.name
+                        ),
+                    });
+                }
+                offset
             } else {
                 0
             }
         } else {
             0
         };
+
+        if resume_offset < window_start {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "resumeFromOffset {} is outside the scan window for buffer '{}'",
+                    resume_offset, buffer.name
+                ),
+            });
+        }
+        let scan_start = resume_offset - window_start;
+
+        if resume_offset == buffer_len {
+            let range = MatchRange {
+                search_start: scan_start,
+                search_end: scan_start,
+                eligible_start: scan_start,
+                eligible_end: scan_start,
+                context_start: scan_start,
+                context_end: scan_start,
+            };
+            scan_plans.push(BufferScanPlan {
+                buffer: buffer.clone(),
+                range,
+                scan_end: buffer_len,
+                truncated_by_scan: false,
+            });
+            continue;
+        }
+
+        if requires_full_scan {
+            if window_start != 0 || window_len != buffer_len {
+                return Err(Error::InvalidArgument {
+                    message: format!(
+                        "regex/fuzzy search requires the complete contents of buffer '{}'",
+                        buffer.name
+                    ),
+                });
+            }
+            if max_scan_bytes_u64 < buffer_len as u64 {
+                return Err(Error::InvalidArgument {
+                    message: format!(
+                        "regex/fuzzy search requires maxScanBytes to cover the full buffer because resumeFromOffset cannot preserve partial matcher state; buffer '{}' requires at least {} bytes",
+                        buffer.name, buffer_len
+                    ),
+                });
+            }
+            let range = MatchRange {
+                search_start: 0,
+                search_end: window_len,
+                eligible_start: scan_start,
+                eligible_end: window_len,
+                context_start: scan_start,
+                context_end: window_len,
+            };
+            let bytes_scanned = buffer_len as u64;
+            bytes_scanned_total = bytes_scanned_total.saturating_add(bytes_scanned);
+            scan_plans.push(BufferScanPlan {
+                buffer: buffer.clone(),
+                range,
+                scan_end: buffer_len,
+                truncated_by_scan: false,
+            });
+            continue;
+        }
+
         let scan_limit_end = clamp_char_boundary(
             &buffer.text,
             scan_start.saturating_add(max_scan_bytes).min(window_len),
             false,
         );
-        let scan_end = scan_limit_end;
-        bytes_scanned_total += (scan_limit_end - scan_start) as u64;
-        buffer_texts.push((
-            buffer.clone(),
-            scan_start,
-            scan_limit_end,
-            scan_end,
-            window_start.saturating_add(scan_limit_end) < buffer_len,
-        ));
+        if scan_limit_end == scan_start {
+            let next_char_bytes = buffer.text[scan_start..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(UTF8_WINDOW_SLACK_BYTES as usize);
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "maxScanBytes {max_scan_bytes_u64} cannot consume the next UTF-8 character in buffer '{}' at byte {resume_offset}; increase it to at least {next_char_bytes}",
+                    buffer.name
+                ),
+            });
+        }
+        let absolute_scan_end = window_start.saturating_add(scan_limit_end);
+        let truncated_by_scan = absolute_scan_end < buffer_len;
+        let finite_lookahead = context_bytes.saturating_add(query.len().saturating_sub(1));
+        let search_end = clamp_char_boundary(
+            &buffer.text,
+            scan_limit_end
+                .saturating_add(finite_lookahead)
+                .min(window_len),
+            true,
+        );
+        let range = MatchRange {
+            search_start: scan_start,
+            search_end,
+            eligible_start: scan_start,
+            eligible_end: scan_limit_end,
+            context_start: scan_start,
+            context_end: scan_limit_end,
+        };
+        let bytes_scanned = (scan_limit_end - scan_start) as u64;
+        bytes_scanned_total = bytes_scanned_total.saturating_add(bytes_scanned);
+        scan_plans.push(BufferScanPlan {
+            buffer: buffer.clone(),
+            range,
+            scan_end: absolute_scan_end,
+            truncated_by_scan,
+        });
     }
 
-    let use_parallel = cfg!(feature = "rayon") && buffer_texts.len() >= PARALLEL_BUFFER_THRESHOLD;
+    let use_parallel = cfg!(feature = "rayon") && scan_plans.len() >= PARALLEL_BUFFER_THRESHOLD;
+    let execution = ScanExecution {
+        query,
+        context_bytes,
+        include_similarity,
+        mode,
+        regex: regex.as_ref(),
+        fuzzy_enabled,
+        similarity_threshold,
+    };
 
     let scan_results: Vec<BufferScanResult> = if use_parallel {
         #[cfg(feature = "rayon")]
         {
             use rayon::prelude::*;
-            buffer_texts
+            scan_plans
                 .par_iter()
-                .map(
-                    |(buffer, scan_start, scan_limit_end, scan_end, truncated_by_scan)| {
-                        let ctx = MatchContext {
-                            buffer: &buffer.name,
-                            text: &buffer.text,
-                            query,
-                            context_bytes,
-                            include_similarity,
-                            base_offset: buffer.base_offset,
-                        };
-                        let collection = collect_matches(
-                            &ctx,
-                            *scan_start,
-                            *scan_end,
-                            mode,
-                            regex.as_ref(),
-                            fuzzy_enabled,
-                            similarity_threshold,
-                        );
-                        let max_offset = buffer.base_offset.saturating_add(*scan_limit_end) as u64;
-                        let matches = collection
-                            .matches
-                            .into_iter()
-                            .filter(|m| m.offset_bytes < max_offset)
-                            .collect();
-                        BufferScanResult {
-                            name: buffer.name.clone(),
-                            matches,
-                            scan_end: max_offset as usize,
-                            truncated_by_scan: *truncated_by_scan,
-                            fuzzy_skipped_lines: collection.fuzzy_skipped_lines,
-                            fuzzy_skipped_bytes: collection.fuzzy_skipped_bytes,
-                        }
-                    },
-                )
+                .map(|plan| execute_scan_plan(plan, &execution))
                 .collect()
         }
         #[cfg(not(feature = "rayon"))]
@@ -1314,45 +1518,25 @@ fn search_texts(
             Vec::new()
         }
     } else {
-        buffer_texts
+        scan_plans
             .iter()
-            .map(
-                |(buffer, scan_start, scan_limit_end, scan_end, truncated_by_scan)| {
-                    let ctx = MatchContext {
-                        buffer: &buffer.name,
-                        text: &buffer.text,
-                        query,
-                        context_bytes,
-                        include_similarity,
-                        base_offset: buffer.base_offset,
-                    };
-                    let collection = collect_matches(
-                        &ctx,
-                        *scan_start,
-                        *scan_end,
-                        mode,
-                        regex.as_ref(),
-                        fuzzy_enabled,
-                        similarity_threshold,
-                    );
-                    let max_offset = buffer.base_offset.saturating_add(*scan_limit_end) as u64;
-                    let matches = collection
-                        .matches
-                        .into_iter()
-                        .filter(|m| m.offset_bytes < max_offset)
-                        .collect();
-                    BufferScanResult {
-                        name: buffer.name.clone(),
-                        matches,
-                        scan_end: max_offset as usize,
-                        truncated_by_scan: *truncated_by_scan,
-                        fuzzy_skipped_lines: collection.fuzzy_skipped_lines,
-                        fuzzy_skipped_bytes: collection.fuzzy_skipped_bytes,
-                    }
-                },
-            )
+            .map(|plan| execute_scan_plan(plan, &execution))
             .collect()
     };
+
+    if mode == SearchMode::Regex {
+        if let Some((buffer, offset)) = scan_results.iter().find_map(|result| {
+            result
+                .zero_length_regex_offset
+                .map(|offset| (result.name.as_str(), offset))
+        }) {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "regex search for buffer '{buffer}' produced a zero-length match at byte {offset}; offset-only resumeFromOffset cannot page zero-length matches without duplicates"
+                ),
+            });
+        }
+    }
 
     let mut output_matches: Vec<BufferSearchMatch> = Vec::new();
     let mut truncated_buffers: Vec<String> = Vec::new();
@@ -1368,6 +1552,8 @@ fn search_texts(
         fuzzy_skipped_lines = fuzzy_skipped_lines.saturating_add(result.fuzzy_skipped_lines);
         fuzzy_skipped_bytes = fuzzy_skipped_bytes.saturating_add(result.fuzzy_skipped_bytes);
         let mut added_in_buffer: usize = 0;
+        let mut cursor = result.full_len as u64;
+        let mut unfinished = false;
         if remaining > 0 {
             for m in &result.matches {
                 if remaining == 0 {
@@ -1386,29 +1572,21 @@ fn search_texts(
             }
             if remaining == 0 && result.matches.len() > added_in_buffer {
                 let next_match = &result.matches[added_in_buffer];
-                resume_from_offset
-                    .entry(result.name.clone())
-                    .or_insert(next_match.offset_bytes);
-                if !truncated_buffers.contains(&result.name) {
-                    truncated_buffers.push(result.name.clone());
-                }
+                cursor = next_match.offset_bytes;
+                unfinished = true;
             }
         } else if let Some(first) = result.matches.first() {
-            resume_from_offset
-                .entry(result.name.clone())
-                .or_insert(first.offset_bytes);
-            if !truncated_buffers.contains(&result.name) {
-                truncated_buffers.push(result.name.clone());
-            }
+            cursor = first.offset_bytes;
+            unfinished = true;
         }
 
-        if result.truncated_by_scan {
-            resume_from_offset
-                .entry(result.name.clone())
-                .or_insert(result.scan_end as u64);
-            if !truncated_buffers.contains(&result.name) {
-                truncated_buffers.push(result.name.clone());
-            }
+        if !unfinished && result.truncated_by_scan {
+            cursor = result.scan_end as u64;
+            unfinished = true;
+        }
+        resume_from_offset.insert(result.name.clone(), cursor);
+        if unfinished {
+            truncated_buffers.push(result.name);
         }
     }
 
@@ -1563,10 +1741,19 @@ fn subsearch_text_view(
         include_similarity,
         base_offset: buffer.base_offset,
     };
+    let range = MatchRange {
+        search_start: scan_start,
+        search_end: scan_end,
+        eligible_start: scan_start,
+        // Preserve zero-width matches at the end of the fixed anchor window.
+        // Top-level paged search rejects those because its cursor is offset-only.
+        eligible_end: scan_end.saturating_add(1),
+        context_start: scan_start,
+        context_end: scan_end,
+    };
     let collection = collect_matches(
         &ctx,
-        scan_start,
-        scan_end,
+        range,
         mode,
         regex.as_ref(),
         fuzzy_enabled,
@@ -1758,7 +1945,7 @@ pub async fn search_buffers(
         size_by_name.insert(info.name.clone(), info.size_bytes);
     }
 
-    let buffers = if let Some(names) = names {
+    let requested_buffers = if let Some(names) = names {
         if names.is_empty() {
             Vec::new()
         } else {
@@ -1767,11 +1954,21 @@ pub async fn search_buffers(
     } else {
         buffer_infos.iter().map(|info| info.name.clone()).collect()
     };
+    // Preserve the caller/tmux order while preventing duplicate scans and hits.
+    let mut seen_buffers = BTreeSet::new();
+    let buffers: Vec<String> = requested_buffers
+        .into_iter()
+        .filter(|name| seen_buffers.insert(name.clone()))
+        .collect();
 
     let context_for_window = context_bytes.unwrap_or(DEFAULT_SEARCH_CONTEXT_BYTES) as u64;
     let max_scan_for_window = max_scan_bytes.unwrap_or(DEFAULT_SEARCH_MAX_SCAN_BYTES);
-    let overlap = context_for_window.saturating_add(query.len() as u64);
-    let window_len = max_scan_for_window.saturating_add(overlap);
+    let fuzzy_enabled = fuzzy_match || similarity_threshold.is_some();
+    let requires_full_scan = mode == SearchMode::Regex || fuzzy_enabled;
+    let overlap = context_for_window
+        .saturating_add(query.len() as u64)
+        .saturating_add(UTF8_WINDOW_SLACK_BYTES);
+    let literal_window_len = max_scan_for_window.saturating_add(overlap);
 
     let mut buffer_texts: Vec<BufferText> = Vec::new();
     for buffer in &buffers {
@@ -1781,9 +1978,42 @@ pub async fn search_buffers(
             .copied()
             .unwrap_or(0);
         let size_hint = size_by_name.get(buffer).copied();
+        if requires_full_scan {
+            if let Some(size) = size_hint {
+                if resume_offset > size {
+                    return Err(Error::InvalidArgument {
+                        message: format!(
+                            "resumeFromOffset {resume_offset} exceeds buffer '{buffer}' length {size}"
+                        ),
+                    });
+                }
+                if resume_offset == size {
+                    buffer_texts.push(BufferText {
+                        name: buffer.clone(),
+                        text: String::new(),
+                        base_offset: size as usize,
+                        full_len: size as usize,
+                    });
+                    continue;
+                }
+                if max_scan_for_window < size {
+                    return Err(Error::InvalidArgument {
+                        message: format!(
+                            "regex/fuzzy search requires maxScanBytes to cover the full buffer because resumeFromOffset cannot preserve partial matcher state; buffer '{buffer}' requires at least {size} bytes"
+                        ),
+                    });
+                }
+            }
+        }
+        let window_start = if requires_full_scan { 0 } else { resume_offset };
+        let window_len = if requires_full_scan {
+            u64::MAX
+        } else {
+            literal_window_len
+        };
         let window = load_buffer_window(
             buffer,
-            resume_offset,
+            window_start,
             window_len,
             streaming_threshold_bytes,
             size_hint,
@@ -3269,6 +3499,166 @@ mod tests {
         assert_eq!(result.total_matches, 0);
         assert!(result.truncated_buffers.contains(&"buffer0".to_string()));
         assert_eq!(result.resume_from_offset.get("buffer0"), Some(&5));
+    }
+
+    #[tokio::test]
+    async fn search_buffers_streaming_searches_literal_lookahead_once() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_LIST_BUFFERS", "buffer0\t9\t0");
+        stub.set_var("TMUX_STUB_SHOW_BUFFER", "aaaXYZbbb");
+
+        let first = search_buffers(
+            Some(vec!["buffer0".to_string(), "buffer0".to_string()]),
+            "XYZ",
+            SearchMode::Literal,
+            Some(0),
+            Some(10),
+            Some(5),
+            false,
+            false,
+            None,
+            None,
+            1,
+            None,
+        )
+        .await
+        .expect("first search page");
+
+        assert_eq!(first.buffers, vec!["buffer0"]);
+        assert_eq!(first.matches.len(), 1);
+        assert_eq!(first.matches[0].offset_bytes, 3);
+        assert_eq!(first.matches[0].snippet, "XYZ");
+        assert_eq!(first.resume_from_offset.get("buffer0"), Some(&5));
+
+        let second = search_buffers(
+            Some(vec!["buffer0".to_string()]),
+            "XYZ",
+            SearchMode::Literal,
+            Some(0),
+            Some(10),
+            Some(5),
+            false,
+            false,
+            None,
+            Some(first.resume_from_offset),
+            1,
+            None,
+        )
+        .await
+        .expect("second search page");
+
+        assert!(second.matches.is_empty());
+        assert!(second.truncated_buffers.is_empty());
+        assert_eq!(second.resume_from_offset.get("buffer0"), Some(&9));
+    }
+
+    #[tokio::test]
+    async fn search_buffers_regex_requires_full_budget_before_loading_window() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_LIST_BUFFERS", "buffer0\t12\t0");
+        stub.set_var("TMUX_STUB_SHOW_BUFFER", "a1234567890z");
+
+        let error = search_buffers(
+            Some(vec!["buffer0".to_string()]),
+            "a.*z",
+            SearchMode::Regex,
+            Some(0),
+            Some(10),
+            Some(5),
+            false,
+            false,
+            None,
+            None,
+            1,
+            None,
+        )
+        .await
+        .expect_err("partial regex budget must fail");
+        assert!(error.to_string().contains("requires at least 12 bytes"));
+
+        let result = search_buffers(
+            Some(vec!["buffer0".to_string()]),
+            "a.*z",
+            SearchMode::Regex,
+            Some(0),
+            Some(10),
+            Some(12),
+            false,
+            false,
+            None,
+            None,
+            1,
+            None,
+        )
+        .await
+        .expect("full regex budget");
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].match_len, 12);
+        assert_eq!(result.bytes_scanned_total, 12);
+    }
+
+    #[test]
+    fn max_matches_cursor_replays_complete_multi_buffer_request_without_duplicates() {
+        let buffers = vec![
+            BufferText {
+                name: "zeta".to_string(),
+                text: "hit-z".to_string(),
+                base_offset: 0,
+                full_len: 5,
+            },
+            BufferText {
+                name: "alpha".to_string(),
+                text: "xxhit-a".to_string(),
+                base_offset: 0,
+                full_len: 7,
+            },
+            BufferText {
+                name: "middle".to_string(),
+                text: "none".to_string(),
+                base_offset: 0,
+                full_len: 4,
+            },
+        ];
+        let options = |resume| SearchOptions {
+            context_bytes: Some(0),
+            max_matches: Some(1),
+            max_scan_bytes: Some(100),
+            include_similarity: false,
+            fuzzy_match: false,
+            similarity_threshold: None,
+            resume_from_offset: resume,
+        };
+
+        let first = search_texts(buffers.clone(), "hit", SearchMode::Literal, options(None))
+            .expect("first multi-buffer page");
+        assert_eq!(first.buffers, vec!["zeta", "alpha", "middle"]);
+        assert_eq!(first.matches.len(), 1);
+        assert_eq!(first.matches[0].buffer, "zeta");
+        assert_eq!(first.truncated_buffers, vec!["alpha"]);
+        assert_eq!(first.resume_from_offset.get("zeta"), Some(&5));
+        assert_eq!(first.resume_from_offset.get("alpha"), Some(&2));
+        assert_eq!(first.resume_from_offset.get("middle"), Some(&4));
+
+        let second = search_texts(
+            buffers.clone(),
+            "hit",
+            SearchMode::Literal,
+            options(Some(first.resume_from_offset)),
+        )
+        .expect("second multi-buffer page");
+        assert_eq!(second.matches.len(), 1);
+        assert_eq!(second.matches[0].buffer, "alpha");
+        assert!(second.truncated_buffers.is_empty());
+
+        let replay = search_texts(
+            buffers,
+            "hit",
+            SearchMode::Literal,
+            options(Some(second.resume_from_offset)),
+        )
+        .expect("completed multi-buffer replay");
+        assert!(replay.matches.is_empty());
+        assert!(replay.truncated_buffers.is_empty());
     }
 
     #[test]
