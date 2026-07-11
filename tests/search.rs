@@ -356,6 +356,65 @@ fn literal_pages_find_boundary_spanning_matches_once_with_utf8_cursors() {
 }
 
 #[test]
+fn literal_pages_preserve_full_scan_non_overlapping_match_semantics() {
+    let text = "banana";
+    let full = search_text(
+        "fixture",
+        text,
+        "ana",
+        SearchMode::Literal,
+        SearchOptions {
+            context_bytes: Some(0),
+            max_matches: Some(10),
+            max_scan_bytes: Some(text.len() as u64),
+            include_similarity: false,
+            fuzzy_match: false,
+            similarity_threshold: None,
+            resume_from_offset: None,
+        },
+    )
+    .expect("full literal search");
+
+    let first = search_text(
+        "fixture",
+        text,
+        "ana",
+        SearchMode::Literal,
+        SearchOptions {
+            context_bytes: Some(0),
+            max_matches: Some(10),
+            max_scan_bytes: Some(3),
+            include_similarity: false,
+            fuzzy_match: false,
+            similarity_threshold: None,
+            resume_from_offset: None,
+        },
+    )
+    .expect("first literal page");
+    assert_eq!(first.matches, full.matches);
+    assert_eq!(first.resume_from_offset.get("fixture"), Some(&4));
+
+    let second = search_text(
+        "fixture",
+        text,
+        "ana",
+        SearchMode::Literal,
+        SearchOptions {
+            context_bytes: Some(0),
+            max_matches: Some(10),
+            max_scan_bytes: Some(3),
+            include_similarity: false,
+            fuzzy_match: false,
+            similarity_threshold: None,
+            resume_from_offset: Some(first.resume_from_offset),
+        },
+    )
+    .expect("second literal page");
+    assert!(second.matches.is_empty());
+    assert!(second.truncated_buffers.is_empty());
+}
+
+#[test]
 fn literal_paging_rejects_non_progressing_or_invalid_utf8_cursors() {
     let too_small = search_text(
         "fixture",
