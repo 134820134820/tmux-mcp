@@ -3530,7 +3530,11 @@ mod tests {
         assert_eq!(first.matches.len(), 1);
         assert_eq!(first.matches[0].offset_bytes, 3);
         assert_eq!(first.matches[0].snippet, "XYZ");
-        assert_eq!(first.resume_from_offset.get("buffer0"), Some(&5));
+        let match_end = first.matches[0]
+            .offset_bytes
+            .saturating_add(u64::from(first.matches[0].match_len));
+        assert_eq!(match_end, 6);
+        assert_eq!(first.resume_from_offset.get("buffer0"), Some(&match_end));
 
         let second = search_buffers(
             Some(vec!["buffer0".to_string()]),
