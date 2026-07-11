@@ -100,6 +100,9 @@ impl IntoAnnotated for RawResourceTemplate {
 }
 
 impl Annotated {
+    // This mirrors rmcp's compatibility constructor and intentionally returns
+    // the concrete annotated resource/template type instead of `Annotated`.
+    #[allow(clippy::new_ret_no_self)]
     fn new<T: IntoAnnotated>(value: T, _annotations: Option<()>) -> T::Output {
         value.into_annotated()
     }
