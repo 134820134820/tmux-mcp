@@ -81,6 +81,12 @@ case "$cmd" in
     fi
     ;;
   capture-pane)
+    if [ -n "${TMUX_STUB_CAPTURE_LOG:-}" ]; then
+      printf '%s\n' "capture-pane $*" >> "$TMUX_STUB_CAPTURE_LOG"
+    fi
+    if [ -n "${TMUX_STUB_CAPTURE_SLEEP_SECS:-}" ]; then
+      sleep "${TMUX_STUB_CAPTURE_SLEEP_SECS}"
+    fi
     if [ "${TMUX_STUB_CAPTURE_OUTPUT+x}" = "x" ]; then
       printf '%b' "$TMUX_STUB_CAPTURE_OUTPUT"
     else

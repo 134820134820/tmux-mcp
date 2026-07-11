@@ -245,8 +245,12 @@ pub struct CommandSnapshot {
     pub pane_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
+    /// Bounded pane text, or omitted when marker loss prevents safe isolation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// True when `output` is unavailable or incomplete within the bounded capture.
+    ///
+    /// This describes capture completeness, not whether the command lifecycle is terminal.
     pub output_truncated: bool,
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,8 +306,12 @@ pub struct CommandExecution {
     pub status: CommandStatus,
     /// Present only after side-channel completion (or tracking_error path).
     pub exit_code: Option<i32>,
-    /// Optional partial or final pane text between START/DONE markers.
+    /// Optional bounded partial or final pane text between START/DONE markers.
+    /// `Some("")` means the bounded markers prove the command emitted no text;
+    /// `None` means no safely isolated output is currently available.
     pub output: Option<String>,
+    /// Whether the bounded pane capture could not recover complete output boundaries.
+    /// This is independent of command completion, which is side-channel authoritative.
     pub output_truncated: bool,
     /// Human-readable explanation for cancelled/tracking_error terminals.
     pub reason: Option<String>,
@@ -312,4 +320,37 @@ pub struct CommandExecution {
     pub raw_mode: bool,
     /// True when raw_mode/no_enter skipped side-channel tracking entirely.
     pub tracking_disabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_snapshot_preserves_output_capture_completeness() {
+        let now = Instant::now();
+        let execution = CommandExecution {
+            id: "cmd-1".to_string(),
+            pane_id: "%1".to_string(),
+            socket: Some("/tmp/tmux.sock".to_string()),
+            command: "printf tail".to_string(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            output: Some("tail".to_string()),
+            output_truncated: true,
+            reason: None,
+            started_at: now,
+            completed_at: Some(now),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        let snapshot = CommandSnapshot::from_execution(&execution, None);
+        assert_eq!(snapshot.output.as_deref(), Some("tail"));
+        assert!(snapshot.output_truncated);
+
+        let wire = serde_json::to_value(snapshot).expect("serialize command snapshot");
+        assert_eq!(wire["output"], "tail");
+        assert_eq!(wire["outputTruncated"], true);
+    }
 }
