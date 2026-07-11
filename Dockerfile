@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG TMUX_MCP_RS_VERSION=0.5.0
+ARG TMUX_MCP_RS_VERSION=0.6.0
 ARG TMUX_MCP_RS_REPOSITORY=bnomei/tmux-mcp
 
 # Fetch the prebuilt musl Linux release asset for the image architecture.
