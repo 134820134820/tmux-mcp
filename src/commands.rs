@@ -274,7 +274,9 @@ impl CommandTracker {
             } else {
                 None
             },
-            output_truncated: false,
+            // No marker-bounded pane capture exists yet. Raw/no-enter output is a
+            // diagnostic, while tracked commands begin queued with no output at all.
+            output_truncated: true,
             reason: None,
             started_at: Instant::now(),
             completed_at: None,
@@ -777,52 +779,89 @@ fn spawn_side_channel_watcher(
             ),
         };
 
-        let max_lines = tracking.capture_max_lines.max(1);
-        let captured = if final_capture {
-            capture_terminal_output(&pane_id, &command_id, max_lines, socket.as_deref()).await
-        } else {
-            let mut captured =
-                capture_running_output(&pane_id, &command_id, max_lines, socket.as_deref()).await;
-            // A tracking error without the completion signal means the command's output
-            // boundary is unknown even when START remains visible.
-            captured.truncated = true;
-            captured
-        };
-
-        let mut commands = active_commands.write().await;
-        if let Some(exec) = commands.get_mut(&command_id) {
-            if !exec.status.is_terminal() {
+        // Commit lifecycle state before any presentation-only pane capture. A stalled
+        // local/SSH capture must not keep a side-channel-authoritative command Running.
+        let terminal_snapshot = {
+            let mut commands = active_commands.write().await;
+            commands.get_mut(&command_id).and_then(|exec| {
+                if exec.status.is_terminal() {
+                    return None;
+                }
                 exec.status = status;
                 exec.exit_code = exit_code;
-                apply_captured_output(exec, captured);
+                exec.output_truncated = true;
                 exec.reason = reason;
                 exec.completed_at = Some(Instant::now());
+                Some(exec.clone())
+            })
+        };
+        if let Some(exec) = &terminal_snapshot {
+            let _ = events.send(CommandEvent {
+                command_id: exec.id.clone(),
+                resource_uri: command_resource_uri(&exec.id),
+                kind: CommandEventKind::Terminal,
+                status: exec.status,
+            });
+            notify.notify_waiters();
+        }
+
+        spawn_advance_queue(
+            Arc::clone(&active_commands),
+            Arc::clone(&secrets),
+            pane_queues,
+            pane_running,
+            events.clone(),
+            Arc::clone(&notify),
+            tracking.clone(),
+            shell_type,
+            pane_id.clone(),
+            socket.clone(),
+        );
+
+        secrets.write().await.remove(&command_id);
+        let cleanup_socket = socket.clone();
+        let cleanup_secret = secret.clone();
+        tokio::spawn(async move {
+            let _ = tmux::delete_exit_code_buffer(&cleanup_secret, cleanup_socket.as_deref()).await;
+        });
+
+        if terminal_snapshot.is_some() {
+            let max_lines = tracking.capture_max_lines.max(1);
+            let captured = if final_capture {
+                capture_terminal_output(&pane_id, &command_id, max_lines, socket.as_deref()).await
+            } else {
+                let mut captured =
+                    capture_running_output(&pane_id, &command_id, max_lines, socket.as_deref())
+                        .await;
+                // A tracking error without the completion signal means the command's output
+                // boundary is unknown even when START remains visible.
+                captured.truncated = true;
+                captured
+            };
+
+            let updated_snapshot = {
+                let mut commands = active_commands.write().await;
+                commands.get_mut(&command_id).and_then(|exec| {
+                    if !exec.status.is_terminal() {
+                        return None;
+                    }
+                    let previous_output = exec.output.clone();
+                    let previous_truncated = exec.output_truncated;
+                    apply_captured_output(exec, captured);
+                    (exec.output != previous_output || exec.output_truncated != previous_truncated)
+                        .then(|| exec.clone())
+                })
+            };
+            if let Some(exec) = updated_snapshot {
                 let _ = events.send(CommandEvent {
                     command_id: exec.id.clone(),
                     resource_uri: command_resource_uri(&exec.id),
-                    kind: CommandEventKind::Terminal,
+                    kind: CommandEventKind::Updated,
                     status: exec.status,
                 });
                 notify.notify_waiters();
             }
         }
-        drop(commands);
-
-        let _ = tmux::delete_exit_code_buffer(&secret, socket.as_deref()).await;
-        secrets.write().await.remove(&command_id);
-
-        spawn_advance_queue(
-            active_commands,
-            secrets,
-            pane_queues,
-            pane_running,
-            events,
-            notify,
-            tracking,
-            shell_type,
-            pane_id,
-            socket,
-        );
     });
 }
 
@@ -1179,6 +1218,7 @@ mod tests {
     use super::*;
     use crate::errors::Error;
     use crate::test_support::TmuxStub;
+    use crate::types::CommandSnapshot;
     use rstest::rstest;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1194,6 +1234,26 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         tracker.get_command(id).await.expect("command should exist")
+    }
+
+    async fn wait_until_output_refresh(tracker: &CommandTracker, id: &str) -> CommandExecution {
+        for _ in 0..100 {
+            if let Some(cmd) = tracker.get_command(id).await {
+                if cmd.status.is_terminal() && cmd.output.is_some() {
+                    return cmd;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tracker.get_command(id).await.expect("command should exist")
+    }
+
+    fn assert_snapshot_output_incomplete(exec: &CommandExecution) {
+        assert!(exec.output_truncated);
+        let snapshot = CommandSnapshot::from_execution(exec, None);
+        assert!(snapshot.output_truncated);
+        let wire = serde_json::to_value(snapshot).expect("serialize command snapshot");
+        assert_eq!(wire["outputTruncated"], true);
     }
 
     fn running_execution(id: &str) -> CommandExecution {
@@ -1487,9 +1547,9 @@ mod tests {
             .execute_command("%1", "echo hi", false, false, None, None)
             .await
             .expect("execute");
-        let cmd = wait_until_terminal(&tracker, &id).await;
-        assert_eq!(cmd.status, CommandStatus::Completed);
-        assert_eq!(cmd.exit_code, Some(0));
+        let terminal = wait_until_terminal(&tracker, &id).await;
+        assert_eq!(terminal.status, CommandStatus::Completed);
+        assert_eq!(terminal.exit_code, Some(0));
     }
 
     #[tokio::test]
@@ -1514,7 +1574,10 @@ mod tests {
             format!("TMUX_MCP_START_{id}\nfinal output\nTMUX_MCP_DONE_{id}_0\n"),
         );
 
-        let cmd = wait_until_terminal(&tracker, &id).await;
+        let terminal = wait_until_terminal(&tracker, &id).await;
+        assert_eq!(terminal.status, CommandStatus::Completed);
+        assert_eq!(terminal.exit_code, Some(0));
+        let cmd = wait_until_output_refresh(&tracker, &id).await;
         assert_eq!(cmd.status, CommandStatus::Completed);
         assert_eq!(cmd.exit_code, Some(0));
         assert_eq!(cmd.output.as_deref(), Some("final output"));
@@ -1544,9 +1607,10 @@ mod tests {
             format!("TMUX_MCP_START_{id}\nbounded tail\n"),
         );
 
-        let cmd = wait_until_terminal(&tracker, &id).await;
-        assert_eq!(cmd.status, CommandStatus::Completed);
-        assert_eq!(cmd.exit_code, Some(0));
+        let terminal = wait_until_terminal(&tracker, &id).await;
+        assert_eq!(terminal.status, CommandStatus::Completed);
+        assert_eq!(terminal.exit_code, Some(0));
+        let cmd = wait_until_output_refresh(&tracker, &id).await;
         assert_eq!(cmd.output.as_deref(), Some("bounded tail"));
         assert!(cmd.output_truncated);
         let logged = std::fs::read_to_string(capture_log.path()).expect("read capture log");
@@ -1602,11 +1666,69 @@ mod tests {
             CommandStatus::Queued,
             "second tracked command should queue"
         );
+        assert_eq!(c2.output, None);
+        assert_snapshot_output_incomplete(&c2);
 
         let c1 = wait_until_terminal(&tracker, &id1).await;
         assert!(c1.status.is_terminal());
         let c2 = wait_until_terminal(&tracker, &id2).await;
         assert!(c2.status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn terminal_state_and_queue_advance_while_presentation_capture_is_blocked() {
+        let mut stub = TmuxStub::new();
+        let capture_log = NamedTempFile::new().expect("capture log");
+        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "0.1");
+        stub.set_var("TMUX_STUB_CAPTURE_SLEEP_SECS", "2");
+        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
+
+        let mut tracking = TrackingConfig::default();
+        tracking.tracking_deadline_seconds = 1;
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let id1 = tracker
+            .execute_command("%1", "echo one", false, false, None, None)
+            .await
+            .expect("first");
+        let id2 = tracker
+            .execute_command("%1", "echo two", false, false, None, None)
+            .await
+            .expect("second");
+        assert_eq!(
+            tracker.get_command(&id2).await.expect("queued").status,
+            CommandStatus::Queued
+        );
+
+        let mut capture_started = false;
+        for _ in 0..100 {
+            if std::fs::metadata(capture_log.path()).is_ok_and(|metadata| metadata.len() > 0) {
+                capture_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(capture_started, "presentation capture did not start");
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(1_200),
+            wait_until_terminal(&tracker, &id1),
+        )
+        .await
+        .expect("first status blocked on capture");
+        assert_eq!(first.status, CommandStatus::Completed);
+        assert_snapshot_output_incomplete(&first);
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(1_200),
+            wait_until_terminal(&tracker, &id2),
+        )
+        .await
+        .expect("pane queue blocked on first capture");
+        assert_eq!(second.status, CommandStatus::Completed);
+        assert_snapshot_output_incomplete(&second);
+
+        // Let both deliberately slow stub captures finish before restoring the environment.
+        tokio::time::sleep(Duration::from_millis(2_300)).await;
     }
 
     #[tokio::test]
@@ -1638,6 +1760,8 @@ mod tests {
 
         assert_eq!(failed.status, CommandStatus::TrackingError);
         assert!(failed.completed_at.is_some());
+        assert_eq!(failed.output, None);
+        assert_snapshot_output_incomplete(&failed);
         assert!(
             failed
                 .reason
@@ -1824,6 +1948,10 @@ mod tests {
         let cmd = tracker.get_command(&id).await.expect("found");
         assert!(cmd.tracking_disabled);
         assert_eq!(cmd.status, CommandStatus::Running);
+        assert!(cmd.output.as_deref().is_some_and(|output| {
+            output.contains("Tracking disabled for raw_mode or no_enter commands")
+        }));
+        assert_snapshot_output_incomplete(&cmd);
     }
 
     #[rstest]

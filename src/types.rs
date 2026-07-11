@@ -245,7 +245,8 @@ pub struct CommandSnapshot {
     pub pane_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
-    /// Bounded pane text, or omitted when marker loss prevents safe isolation.
+    /// Bounded pane text, a tracking-disabled diagnostic, or omitted when marker loss
+    /// prevents safe isolation. Diagnostics always pair with `output_truncated = true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     /// True when `output` is unavailable or incomplete within the bounded capture.
@@ -308,7 +309,8 @@ pub struct CommandExecution {
     pub exit_code: Option<i32>,
     /// Optional bounded partial or final pane text between START/DONE markers.
     /// `Some("")` means the bounded markers prove the command emitted no text;
-    /// `None` means no safely isolated output is currently available.
+    /// `None` means no safely isolated output is currently available. Tracking-disabled
+    /// records instead carry a diagnostic string and keep `output_truncated = true`.
     pub output: Option<String>,
     /// Whether the bounded pane capture could not recover complete output boundaries.
     /// This is independent of command completion, which is side-channel authoritative.
