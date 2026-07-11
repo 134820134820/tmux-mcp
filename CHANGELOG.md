@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared `CommandSnapshot` JSON schema for tools and command resources (`schemaVersion: 1`).
 
 ### Changed
+- Upgraded the RMCP server dependency to the 2.x API while preserving the existing server-only transport feature set.
 - Command completion is side-channel based (`tmux set-buffer` + `wait-for`); scrollback START/DONE markers are debug/bracketing only and no longer authorize completion.
 - Command statuses are now `queued`, `running`, `completed`, `failed`, `cancelled`, `tracking_error` (replacing `pending` / sticky `error` from marker parsing).
 - Server instructions and skills prefer subscribe → notify → read over client poll loops.
