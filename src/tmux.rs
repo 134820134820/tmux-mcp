@@ -132,21 +132,31 @@ struct ScanExecution<'a> {
     similarity_threshold: f32,
 }
 
-/// Return tmux's default socket path for the current user.
+/// Return tmux's default Unix socket path for the current user.
 ///
 /// tmux uses `$TMUX_TMPDIR` when set, otherwise `/tmp`, with sockets stored
 /// under a `tmux-$UID` directory and the default socket named `default`.
-pub fn default_socket_path() -> String {
+/// Non-Unix targets have no equivalent UID socket convention, so callers must
+/// use an explicit socket or let tmux choose its native default.
+#[cfg(unix)]
+pub fn default_socket_path() -> Option<String> {
     let base = std::env::var("TMUX_TMPDIR")
         .ok()
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| "/tmp".to_string());
     let uid = unsafe { libc::getuid() };
-    Path::new(&base)
-        .join(format!("tmux-{uid}"))
-        .join("default")
-        .to_string_lossy()
-        .into_owned()
+    Some(
+        Path::new(&base)
+            .join(format!("tmux-{uid}"))
+            .join("default")
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(not(unix))]
+pub fn default_socket_path() -> Option<String> {
+    None
 }
 
 /// Resolve the effective tmux socket path from an override, environment variable,
@@ -157,7 +167,7 @@ pub fn resolve_socket(socket: Option<&str>) -> Option<String> {
     }
     match std::env::var("TMUX_MCP_SOCKET") {
         Ok(socket) if !socket.is_empty() => Some(socket),
-        _ => Some(default_socket_path()),
+        _ => default_socket_path(),
     }
 }
 
@@ -3731,7 +3741,17 @@ mod tests {
         assert_eq!(resolve_socket(Some("")), Some("/tmp/env.sock".to_string()));
 
         stub.set_var("TMUX_MCP_SOCKET", "");
-        assert_eq!(resolve_socket(None), Some(default_socket_path()));
+        assert_eq!(resolve_socket(None), default_socket_path());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn resolve_socket_without_override_has_no_platform_default() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SOCKET", "");
+
+        assert_eq!(default_socket_path(), None);
+        assert_eq!(resolve_socket(None), None);
     }
 
     #[tokio::test]
