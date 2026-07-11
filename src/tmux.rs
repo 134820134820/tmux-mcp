@@ -985,9 +985,6 @@ fn decode_window(buffer: &str, bytes: &[u8], base_offset: usize) -> Result<(Stri
     }
 
     let mut end = bytes.len();
-    while end > start && is_utf8_continuation(bytes[end.saturating_sub(1)]) {
-        end = end.saturating_sub(1);
-    }
 
     loop {
         if start >= end {
@@ -1554,12 +1551,14 @@ fn search_texts(
         let mut added_in_buffer: usize = 0;
         let mut cursor = result.full_len as u64;
         let mut unfinished = false;
+        let mut emitted_match_end: Option<u64> = None;
         if remaining > 0 {
             for m in &result.matches {
                 if remaining == 0 {
                     break;
                 }
                 output_matches.push(m.clone());
+                emitted_match_end = Some(m.offset_bytes.saturating_add(u64::from(m.match_len)));
                 added_in_buffer += 1;
                 remaining -= 1;
                 if include_similarity {
@@ -1581,8 +1580,11 @@ fn search_texts(
         }
 
         if !unfinished && result.truncated_by_scan {
-            cursor = result.scan_end as u64;
-            unfinished = true;
+            // `str::match_indices` is non-overlapping. When a literal match
+            // crosses the logical page boundary, resuming inside that match
+            // could emit a self-overlapping hit that a full scan would skip.
+            cursor = (result.scan_end as u64).max(emitted_match_end.unwrap_or(0));
+            unfinished = cursor < result.full_len as u64;
         }
         resume_from_offset.insert(result.name.clone(), cursor);
         if unfinished {
@@ -3659,6 +3661,44 @@ mod tests {
         .expect("completed multi-buffer replay");
         assert!(replay.matches.is_empty());
         assert!(replay.truncated_buffers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_buffers_preserves_complete_trailing_utf8_scalar() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_LIST_BUFFERS", "buffer0\t3\t0");
+        stub.set_var("TMUX_STUB_SHOW_BUFFER", "xé");
+
+        for streaming_threshold in [1, 100] {
+            let result = search_buffers(
+                Some(vec!["buffer0".to_string()]),
+                "é$",
+                SearchMode::Regex,
+                Some(0),
+                Some(10),
+                Some(3),
+                false,
+                false,
+                None,
+                None,
+                streaming_threshold,
+                None,
+            )
+            .await
+            .expect("search complete trailing scalar");
+
+            assert_eq!(result.matches.len(), 1);
+            assert_eq!(result.matches[0].offset_bytes, 1);
+            assert_eq!(result.matches[0].match_len, 2);
+        }
+    }
+
+    #[test]
+    fn decode_window_preserves_complete_trailing_utf8_scalar() {
+        let (text, base_offset) =
+            decode_window("buffer0", "xé".as_bytes(), 0).expect("decode complete trailing scalar");
+        assert_eq!(text, "xé");
+        assert_eq!(base_offset, 0);
     }
 
     #[test]
