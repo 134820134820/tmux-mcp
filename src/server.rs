@@ -113,14 +113,20 @@ use crate::types::{
     CommandStatus, Pane, SearchMode, Session, Window,
 };
 
-/// MCP server holding command tracking state, compiled policy, and the tool router.
+/// stdio MCP server: policy-gated tool router, command tracker, and dynamic resources.
+///
+/// Constructed once at process start. Policy removes denied tool routes at build
+/// time and re-checks sockets/sessions/panes/commands/paths on each call. Command
+/// lifecycle events fan out to subscribed `tmux://command/{id}/result` resources.
 #[derive(Clone)]
 pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
     search: SearchConfig,
     router: ToolRouter<Self>,
+    /// Connected MCP peer used for resource list/updated notifications.
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
+    /// Resource URIs currently subscribed by the client.
     subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -208,547 +214,555 @@ macro_rules! read_resource_request {
 // Tool Output Schemas
 // ============================================================================
 
-/// Output payload for the execute-command tool.
+/// Accept response for `execute-command` (before optional wait completion).
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteCommandOutput {
+    /// Opaque id for `get-command-result` / command resources.
     pub command_id: String,
+    /// `tmux://command/{id}/result` URI for resources/subscribe.
     pub resource_uri: String,
+    /// Initial lifecycle status wire string (`queued` or `running`).
     pub status: String,
+    /// Human-readable accept note (not the command's shell output).
     pub message: String,
 }
 
-/// Output payload for the list-sessions tool.
+/// `list-sessions` structured payload.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListSessionsOutput {
     pub sessions: Vec<Session>,
 }
 
-/// Output payload for the list-windows tool.
+/// `list-windows` structured payload.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListWindowsOutput {
     pub windows: Vec<Window>,
 }
 
-/// Output payload for the list-panes tool.
+/// `list-panes` structured payload.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListPanesOutput {
     pub panes: Vec<Pane>,
 }
 
-/// Output payload for the list-clients tool.
+/// `list-clients` structured payload.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListClientsOutput {
     pub clients: Vec<ClientInfo>,
 }
 
-/// Output payload for the list-buffers tool.
+/// `list-buffers` structured payload.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListBuffersOutput {
     pub buffers: Vec<BufferInfo>,
 }
 
-/// Output payload for the get-command-result tool (same schema as command resources).
+/// `get-command-result` payload (same schema as command resources).
 pub type GetCommandResultOutput = CommandSnapshot;
 
 // ============================================================================
 // Tool Input Schemas
 // ============================================================================
 
-/// Input parameters for socket-only tools.
+/// Shared optional socket override for inventory tools that need no other target.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SocketInput {
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the socket-for-path tool.
+/// `socket-for-path`: derive a deterministic isolated socket from a project path.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SocketForPathInput {
-    /// Project path to derive a deterministic socket path
+    /// Project/worktree path hashed into `/tmp/{fnv}.sock` (or platform temp).
     pub path: String,
 }
 
-/// Input parameters for the find-session tool.
+/// `find-session`: exact session-name lookup.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindSessionInput {
-    /// Name of the tmux session to find
+    /// Session display name (exact match, not id).
     pub name: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for tools that target a session id.
+/// Session-targeted tools (`list-windows`, `kill-session`, …).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionIdInput {
-    /// ID of the tmux session
+    /// Session target id (typically `$N`).
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for tools that target a window id.
+/// Window-targeted tools (`list-panes`, `kill-window`, `select-window`, …).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WindowIdInput {
-    /// ID of the tmux window
+    /// Window target id (typically `@N`).
     #[serde(rename = "windowId")]
     pub window_id: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for tools that target a pane id.
+/// Pane-targeted tools (`kill-pane`, `select-pane`, `zoom-pane`, …).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PaneIdInput {
-    /// ID of the tmux pane
+    /// Pane target id (typically `%N`); unique only within one tmux server/socket.
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the capture-pane tool.
+/// `capture-pane`: read scrollback/screen text (not a substitute for tracked command output).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CapturePaneInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Number of lines to capture
+    /// History line budget when start/end are omitted.
     pub lines: Option<u32>,
-    /// Include color/escape sequences
+    /// Keep SGR/escape sequences when true.
     pub colors: Option<bool>,
-    /// Start line offset (negative counts from bottom)
+    /// Start line offset (negative counts from the bottom).
     pub start: Option<i32>,
-    /// End line offset (negative counts from bottom)
+    /// End line offset (negative counts from the bottom).
     pub end: Option<i32>,
-    /// Join wrapped lines
+    /// Join soft-wrapped lines when true.
     pub join: Option<bool>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the create-session tool.
+/// `create-session`: detached session bootstrap.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateSessionInput {
-    /// Name for the new tmux session
+    /// Display name for the new session.
     pub name: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the create-window tool.
+/// `create-window`: named window inside an existing session.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateWindowInput {
-    /// ID of the tmux session
+    /// Session target id (`$N`).
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    /// Name for the new window
+    /// Display name for the new window.
     pub name: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the split-pane tool.
+/// `split-pane`: horizontal/vertical split with optional percent size.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SplitPaneInput {
-    /// ID of the tmux pane to split
+    /// Pane to split (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Split direction: "horizontal" or "vertical"
+    /// `"horizontal"` or `"vertical"` (default vertical).
     pub direction: Option<String>,
-    /// Size percentage for the new pane
+    /// New-pane size percent for tmux 3.x `-l N%`.
     pub size: Option<u32>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the execute-command tool.
+/// `execute-command`: tracked shell work or raw key injection into a pane.
+///
+/// Tracked mode (default) queues per pane, wraps with a private exit-code side
+/// channel, and rejects unquoted `#`, `&`, and embedded newlines. Prefer
+/// resources/subscribe on the returned URI over tight poll loops.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteCommandInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Command to execute
+    /// Shell text to inject. Tracked mode forbids unquoted `#`, `&`, and newlines.
     pub command: String,
-    /// Send command without tracking markers
+    /// Skip side-channel tracking wrappers (raw send; no authoritative exit code).
     #[serde(rename = "rawMode")]
     pub raw_mode: Option<bool>,
-    /// Send keys without pressing Enter
+    /// Omit the trailing Enter; also disables tracking.
     #[serde(rename = "noEnter")]
     pub no_enter: Option<bool>,
-    /// Delay between key transmissions in milliseconds
+    /// Per-character send delay in milliseconds (slow typing).
     #[serde(rename = "delayMs")]
     pub delay_ms: Option<u64>,
-    /// Optional block until terminal (or timeout). Prefer resources/subscribe when available.
+    /// Optional block until terminal or timeout after accept. Prefer resource subscribe.
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the get-command-result tool.
+/// `get-command-result`: poll or wait for a tracked command snapshot.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetCommandResultInput {
-    /// ID of the executed command
+    /// Command id returned by `execute-command`.
     #[serde(rename = "commandId")]
     pub command_id: String,
-    /// Optional block until terminal or timeout (does not change command status on timeout).
+    /// Block until terminal or timeout; timeout does not change command status.
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the rename-window tool.
+/// `rename-window` args.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RenameWindowInput {
-    /// ID of the tmux window
+    /// Window target id (`@N`).
     #[serde(rename = "windowId")]
     pub window_id: String,
-    /// New name for the window
+    /// New window display name.
     pub name: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the rename-pane tool.
+/// `rename-pane` args (sets `#{pane_title}`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RenamePaneInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// New title for the pane
+    /// New pane title string.
     pub title: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the move-window tool.
+/// `move-window`: relocate a window into another session.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MoveWindowInput {
-    /// ID of the tmux window to move
+    /// Window to move (`@N`).
     #[serde(rename = "windowId")]
     pub window_id: String,
-    /// Target session ID
+    /// Destination session id (`$N`).
     #[serde(rename = "targetSessionId")]
     pub target_session_id: String,
-    /// Target index in the session
+    /// Optional index in the destination session.
     #[serde(rename = "targetIndex")]
     pub target_index: Option<u32>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the rename-session tool.
+/// `rename-session` args.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RenameSessionInput {
-    /// ID of the tmux session
+    /// Session target id (`$N`).
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    /// New name for the session
+    /// New session display name.
     pub name: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the resize-pane tool.
+/// `resize-pane`: relative direction/amount or absolute width/height.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResizePaneInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Resize direction: "left", "right", "up", "down"
+    /// Relative resize direction: `left`, `right`, `up`, or `down`.
     pub direction: Option<String>,
-    /// Resize amount in cells
+    /// Cells to grow/shrink when `direction` is set.
     pub amount: Option<u32>,
-    /// Absolute width in cells
+    /// Absolute width in cells (overrides relative resize when set with height).
     pub width: Option<u32>,
-    /// Absolute height in cells
+    /// Absolute height in cells.
     pub height: Option<u32>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the select-layout tool.
+/// `select-layout`: apply a named tmux layout algorithm to a window.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SelectLayoutInput {
-    /// ID of the tmux window
+    /// Window target id (`@N`).
     #[serde(rename = "windowId")]
     pub window_id: String,
-    /// Layout name (e.g. even-horizontal, tiled, main-vertical)
+    /// Layout name (for example `even-horizontal`, `tiled`, `main-vertical`).
     pub layout: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the join-pane tool.
+/// `join-pane`: move source pane into the window that owns the target pane.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JoinPaneInput {
-    /// Source pane ID
+    /// Pane to relocate (`%N`).
     #[serde(rename = "sourcePaneId")]
     pub source_pane_id: String,
-    /// Target pane ID
+    /// Destination pane whose window receives the join (`%N`).
     #[serde(rename = "targetPaneId")]
     pub target_pane_id: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the swap-pane tool.
+/// `swap-pane`: exchange two pane positions.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SwapPaneInput {
-    /// Source pane ID
+    /// First pane (`%N`).
     #[serde(rename = "sourcePaneId")]
     pub source_pane_id: String,
-    /// Target pane ID
+    /// Second pane (`%N`).
     #[serde(rename = "targetPaneId")]
     pub target_pane_id: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the break-pane tool.
+/// `break-pane`: promote a pane into its own window.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BreakPaneInput {
-    /// ID of the tmux pane
+    /// Pane to break out (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Optional name for the new window
+    /// Optional name for the new window.
     pub name: Option<String>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the set-synchronize-panes tool.
+/// `set-synchronize-panes`: fan-out typing to every pane in a window.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetSynchronizePanesInput {
-    /// ID of the tmux window
+    /// Window target id (`@N`).
     #[serde(rename = "windowId")]
     pub window_id: String,
-    /// Whether to enable synchronize-panes
+    /// Enable (`true`) or disable (`false`) synchronize-panes.
     pub enabled: bool,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the detach-client tool.
+/// `detach-client`: disconnect an observer by TTY (not session kill).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DetachClientInput {
-    /// Client tty identifier
+    /// Client TTY path from `list-clients`.
     #[serde(rename = "clientTty")]
     pub client_tty: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the show-buffer tool.
+/// `show-buffer`: read a paste buffer with optional byte window.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShowBufferInput {
-    /// Buffer name (omit to show the most recent buffer)
+    /// Buffer name; omit to show the most recent buffer.
     pub name: Option<String>,
-    /// Optional offset into the buffer in bytes
+    /// Absolute UTF-8 byte offset into the buffer.
     #[serde(rename = "offsetBytes")]
     pub offset_bytes: Option<u64>,
-    /// Optional maximum number of bytes to return
+    /// Maximum UTF-8 bytes to return from the offset.
     #[serde(rename = "maxBytes")]
     pub max_bytes: Option<u64>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the save-buffer tool.
+/// `save-buffer`: write a paste buffer to a policy-resolved filesystem path.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SaveBufferInput {
-    /// Buffer name
+    /// Paste-buffer name to export.
     pub name: String,
-    /// Path to save the buffer contents
+    /// Destination path (sandbox-relative when no buffer path allowlist is set).
     pub path: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the load-buffer tool.
+/// `load-buffer`: replace a paste buffer from a policy-resolved filesystem path.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LoadBufferInput {
-    /// Buffer name
+    /// Paste-buffer name to create or replace.
     pub name: String,
-    /// Path to load the buffer contents from
+    /// Source path (must pass buffer path policy).
     pub path: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the delete-buffer tool.
+/// `delete-buffer` args.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteBufferInput {
-    /// Buffer name
+    /// Paste-buffer name to remove.
     pub name: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the set-buffer tool.
+/// `set-buffer`: create or replace a paste buffer from UTF-8 text.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetBufferInput {
-    /// Buffer name
+    /// Paste-buffer name to create or replace.
     pub name: String,
-    /// Buffer content (UTF-8)
+    /// Full buffer body (UTF-8).
     pub content: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the append-buffer tool.
+/// `append-buffer`: append UTF-8 text (creates the buffer when missing).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AppendBufferInput {
-    /// Buffer name
+    /// Paste-buffer name to append to.
     pub name: String,
-    /// Content to append (UTF-8)
+    /// Text to append (UTF-8).
     pub content: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the rename-buffer tool.
+/// `rename-buffer`: copy+delete rename (tmux has no atomic buffer rename).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RenameBufferInput {
-    /// Source buffer name
+    /// Existing paste-buffer name.
     pub from: String,
-    /// Destination buffer name
+    /// New paste-buffer name.
     pub to: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Search anchor for subsearch-buffer.
+/// Prior match position used as the `subsearch-buffer` scan anchor.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchAnchorInput {
-    /// Match offset in bytes (UTF-8)
+    /// Absolute UTF-8 byte offset of the prior match start.
     #[serde(rename = "offsetBytes", alias = "offset_bytes")]
     pub offset_bytes: u64,
-    /// Match length in bytes (UTF-8)
+    /// Prior match length in UTF-8 bytes.
     #[serde(rename = "matchLen", alias = "match_len")]
     pub match_len: u32,
-    /// Optional buffer name (used if top-level buffer is omitted)
+    /// Buffer name when the top-level `buffer` field is omitted.
     pub buffer: Option<String>,
 }
 
-/// Input parameters for the search-buffer tool.
+/// `search-buffer`: multi-buffer literal/regex search with optional fuzzy scoring.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchBufferInput {
-    /// Optional single buffer name (alias for buffers)
+    /// Single buffer name (alias for a one-element `buffers` list).
     #[serde(rename = "buffer")]
     pub buffer: Option<String>,
-    /// Optional list of buffer names to search (defaults to all buffers)
+    /// Buffer names to scan; omit to search every paste buffer.
     pub buffers: Option<Vec<String>>,
-    /// Query string
+    /// Search query (literal text or regex depending on `mode`).
     pub query: String,
-    /// Search mode: literal or regex
+    /// Match strategy: `literal` or `regex`.
     pub mode: SearchMode,
-    /// Context window size in bytes
+    /// Snippet context radius in bytes around each hit.
     #[serde(rename = "contextBytes")]
     pub context_bytes: Option<u32>,
-    /// Max matches to return
+    /// Hard cap on matches returned for the whole request.
     #[serde(rename = "maxMatches")]
     pub max_matches: Option<u32>,
-    /// Max bytes to scan per buffer
+    /// Per-buffer scan budget for literal starts; regex/fuzzy need full-buffer coverage.
     #[serde(rename = "maxScanBytes")]
     pub max_scan_bytes: Option<u64>,
-    /// Whether to include similarity scores
+    /// Attach similarity scores when the fuzzy feature stack is enabled.
     #[serde(rename = "includeSimilarity")]
     pub include_similarity: Option<bool>,
-    /// Enable fuzzy matching
+    /// Prefer fuzzy line scoring over exact mode when supported.
     #[serde(rename = "fuzzyMatch")]
     pub fuzzy_match: Option<bool>,
-    /// Similarity threshold for fuzzy matching (0.0-1.0)
+    /// Drop fuzzy hits below this score in `[0.0, 1.0]`.
     #[serde(rename = "similarityThreshold")]
     pub similarity_threshold: Option<f32>,
-    /// Optional per-buffer resume offset in bytes (UTF-8)
+    /// Per-buffer absolute byte cursors from a prior truncated result.
     #[serde(rename = "resumeFromOffset")]
     pub resume_from_offset: Option<BTreeMap<String, u64>>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the subsearch-buffer tool.
+/// `subsearch-buffer`: follow-up search inside a window around a prior match.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubsearchBufferInput {
-    /// Buffer name
+    /// Paste-buffer name (may also come from `anchor.buffer`).
     pub buffer: Option<String>,
-    /// Anchor offset and length from a prior match
+    /// Prior match offset/length defining the subsearch window center.
     pub anchor: SearchAnchorInput,
-    /// Context window size in bytes
+    /// Half-window of context around the anchor used as the scan range.
     #[serde(rename = "contextBytes", alias = "context_bytes")]
     pub context_bytes: u32,
-    /// Optional resume offset in bytes (UTF-8) within the anchor window
+    /// Resume cursor within the anchor window for paged subsearch.
     #[serde(rename = "resumeFromOffset")]
     pub resume_from_offset: Option<u64>,
-    /// Query string
+    /// Search query (literal text or regex depending on `mode`).
     pub query: String,
-    /// Search mode: literal or regex
+    /// Match strategy: `literal` or `regex`.
     pub mode: SearchMode,
-    /// Max matches to return
+    /// Hard cap on matches returned.
     #[serde(rename = "maxMatches")]
     pub max_matches: Option<u32>,
-    /// Whether to include similarity scores
+    /// Attach similarity scores when the fuzzy feature stack is enabled.
     #[serde(rename = "includeSimilarity")]
     pub include_similarity: Option<bool>,
-    /// Enable fuzzy matching
+    /// Prefer fuzzy line scoring over exact mode when supported.
     #[serde(rename = "fuzzyMatch")]
     pub fuzzy_match: Option<bool>,
-    /// Similarity threshold for fuzzy matching (0.0-1.0)
+    /// Drop fuzzy hits below this score in `[0.0, 1.0]`.
     #[serde(rename = "similarityThreshold")]
     pub similarity_threshold: Option<f32>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the send-keys tool.
+/// `send-keys` (feature `interactive`): raw key injection without command tracking.
 #[cfg(feature = "interactive")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendKeysInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Keys to send
+    /// Key sequence or literal text to inject.
     pub keys: String,
-    /// Send each character individually
+    /// When true, send each character with `-l` so shell metacharacters stay raw.
     pub literal: Option<bool>,
     /// Press Enter after each repeat.
     pub enter: Option<bool>,
-    /// Number of times to repeat the keys
+    /// How many times to emit `keys` (default 1).
     pub repeat: Option<u32>,
-    /// Delay between key transmissions in milliseconds
+    /// Delay between key transmissions in milliseconds.
     #[serde(rename = "delayMs")]
     pub delay_ms: Option<u64>,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the send-hex tool.
+/// `send-hex` (feature `interactive`): inject raw bytes via `send-keys -H`.
 #[cfg(feature = "interactive")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendHexInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Whitespace-separated hex byte tokens (00-ff), e.g. "1b 5b 31 33 3b 32 75" for Shift+Enter (CSI-u)
+    /// Whitespace-separated hex byte tokens (`00`-`ff`), e.g. CSI-u sequences.
     pub hex: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
-/// Input parameters for the paste-text tool.
+/// `paste-text` (feature `interactive`): paste UTF-8 via a disposable paste buffer.
 #[cfg(feature = "interactive")]
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PasteTextInput {
-    /// ID of the tmux pane
+    /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// UTF-8 text to paste.
+    /// UTF-8 text staged through a temporary paste buffer then pasted.
     pub content: String,
-    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
 
@@ -864,6 +878,8 @@ impl TmuxMcpServer {
         *slot = Some(context.peer.clone());
     }
 
+    /// Drop routes that fail capability flags or the tool filter so clients never
+    /// discover denied tools in `tools/list`.
     fn apply_tool_policy(router: &mut ToolRouter<Self>, policy: &SecurityPolicy) {
         for tool_name in router
             .list_all()

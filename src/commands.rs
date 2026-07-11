@@ -59,10 +59,13 @@ impl CapturedOutput {
 /// notifications for subscribed `tmux://command/{id}/result` URIs.
 #[derive(Debug, Clone)]
 pub struct CommandEvent {
+    /// Command id that was created, updated, completed, or evicted.
     #[allow(dead_code)]
     pub command_id: String,
+    /// Canonical `tmux://command/{id}/result` URI for subscription matching.
     pub resource_uri: String,
     pub kind: CommandEventKind,
+    /// Status at the moment of the durable commit.
     #[allow(dead_code)]
     pub status: CommandStatus,
 }
@@ -154,17 +157,24 @@ struct QueuedLaunch {
 }
 
 /// In-process registry of queued, running, and recently completed pane commands.
+///
+/// One tracker instance is shared by the MCP server. Tracked launches serialize
+/// per `socket|pane_id` so a pane never runs two side-channel wrappers at once.
+/// Completion is side-channel authoritative; pane scrollback is presentation only.
 pub struct CommandTracker {
+    /// All live records keyed by command id (including terminal until eviction).
     active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
     /// Private side-channel secrets (never exposed on CommandExecution).
     secrets: Arc<RwLock<HashMap<String, String>>>,
-    /// pane_key -> command ids waiting to run (tracked only).
+    /// `socket|pane_id` → queued tracked launches waiting for the running slot.
     pane_queues: Arc<RwLock<HashMap<String, VecDeque<QueuedLaunch>>>>,
-    /// pane_key -> currently running tracked command id.
+    /// `socket|pane_id` → currently running tracked command id.
     pane_running: Arc<RwLock<HashMap<String, String>>>,
+    /// Process-default shell dialect; pane `current_command` may override at wrap time.
     shell_type: ShellType,
     tracking: TrackingConfig,
     events: broadcast::Sender<CommandEvent>,
+    /// Wakes `wait_for` callers after durable commits.
     notify: Arc<Notify>,
 }
 
