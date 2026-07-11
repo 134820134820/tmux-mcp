@@ -13,3 +13,5 @@ bin/*/
 .frigg
 .devana
 .orchid
+specs
+docs/
