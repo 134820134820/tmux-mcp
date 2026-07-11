@@ -11,9 +11,8 @@ use std::time::Duration;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, CallToolResult, Content, RawResource, RawResourceTemplate, Resource,
-    ResourceContents, ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities,
-    ServerInfo,
+    CallToolResult, ContentBlock as Content, Resource, ResourceContents, ResourceTemplate,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
 };
 use rmcp::schemars::JsonSchema;
 use rmcp::serde::{Deserialize, Serialize};
@@ -23,6 +22,88 @@ use rmcp::tool;
 use rmcp::tool_router;
 use rmcp::ErrorData as McpError;
 use tokio::sync::RwLock;
+
+struct Annotated;
+
+struct RawResource {
+    uri: String,
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    size: Option<u64>,
+    icons: Option<Vec<rmcp::model::Icon>>,
+    meta: Option<rmcp::model::Meta>,
+}
+
+struct RawResourceTemplate {
+    uri_template: String,
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    mime_type: Option<String>,
+    icons: Option<Vec<rmcp::model::Icon>>,
+}
+
+trait IntoAnnotated {
+    type Output;
+
+    fn into_annotated(self) -> Self::Output;
+}
+
+impl IntoAnnotated for RawResource {
+    type Output = Resource;
+
+    fn into_annotated(self) -> Self::Output {
+        let mut resource = Resource::new(self.uri, self.name);
+        if let Some(title) = self.title {
+            resource = resource.with_title(title);
+        }
+        if let Some(description) = self.description {
+            resource = resource.with_description(description);
+        }
+        if let Some(mime_type) = self.mime_type {
+            resource = resource.with_mime_type(mime_type);
+        }
+        if let Some(size) = self.size {
+            resource = resource.with_size(size);
+        }
+        if let Some(icons) = self.icons {
+            resource = resource.with_icons(icons);
+        }
+        if let Some(meta) = self.meta {
+            resource = resource.with_meta(meta);
+        }
+        resource
+    }
+}
+
+impl IntoAnnotated for RawResourceTemplate {
+    type Output = ResourceTemplate;
+
+    fn into_annotated(self) -> Self::Output {
+        let mut template = ResourceTemplate::new(self.uri_template, self.name);
+        if let Some(title) = self.title {
+            template = template.with_title(title);
+        }
+        if let Some(description) = self.description {
+            template = template.with_description(description);
+        }
+        if let Some(mime_type) = self.mime_type {
+            template = template.with_mime_type(mime_type);
+        }
+        if let Some(icons) = self.icons {
+            template = template.with_icons(icons);
+        }
+        template
+    }
+}
+
+impl Annotated {
+    fn new<T: IntoAnnotated>(value: T, _annotations: Option<()>) -> T::Output {
+        value.into_annotated()
+    }
+}
 
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::security::{SearchConfig, SecurityPolicy};
@@ -3983,7 +4064,7 @@ mod tests {
         result
             .content
             .first()
-            .and_then(|content| content.raw.as_text())
+            .and_then(Content::as_text)
             .map(|text| text.text.clone())
             .unwrap_or_default()
     }
@@ -4001,14 +4082,14 @@ mod tests {
         server
             .policy_filtered_resource_templates()
             .into_iter()
-            .map(|template| template.raw.uri_template)
+            .map(|template| template.uri_template)
             .collect()
     }
 
     fn resource_uris(resources: &[Resource]) -> BTreeSet<String> {
         resources
             .iter()
-            .map(|resource| resource.raw.uri.clone())
+            .map(|resource| resource.uri.clone())
             .collect()
     }
 
@@ -4661,7 +4742,7 @@ mod tests {
         let templates = result
             .resource_templates
             .iter()
-            .map(|template| template.raw.uri_template.as_str())
+            .map(|template| template.uri_template.as_str())
             .collect::<BTreeSet<_>>();
 
         assert!(templates.contains("tmux://server/info"));
