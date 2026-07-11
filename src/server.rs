@@ -4038,6 +4038,10 @@ impl rmcp::ServerHandler for TmuxMcpServer {
 mod tests {
     use super::*;
     use crate::test_support::TmuxStub;
+
+    // Keep buffer policy tests self-contained; the optional copyrighted search
+    // corpus is intentionally not required for CI compilation or execution.
+    const BUFFER_FILE_TEST_CONTENT: &str = "tmux-mcp buffer policy test payload\n";
     use crate::types::ShellType;
     use crate::types::{Pane, Session, Window};
     use rmcp::model::{NumberOrString, ReadResourceRequestParams, ResourceContents};
@@ -4246,16 +4250,13 @@ mod tests {
     async fn buffer_file_operations_allowed_by_capture_policy() {
         let _stub = TmuxStub::new();
         let server = server_with_policy("[security]\nallow_capture = true\n");
-        stage_default_buffer_file(
-            "old-man-and-the-sea.txt",
-            include_str!("../tests/fixtures/old-man-and-the-sea.txt"),
-        );
+        stage_default_buffer_file("buffer-input.txt", BUFFER_FILE_TEST_CONTENT);
         remove_default_buffer_file("buffer.txt");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
                 name: "buffer0".into(),
-                path: "old-man-and-the-sea.txt".into(),
+                path: "buffer-input.txt".into(),
                 socket: None,
             }))
             .await
@@ -4301,7 +4302,7 @@ mod tests {
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
                 name: "buffer0".into(),
-                path: "tests/fixtures/old-man-and-the-sea.txt".into(),
+                path: "buffer-input.txt".into(),
                 socket: None,
             }))
             .await
@@ -4344,16 +4345,13 @@ mod tests {
     async fn save_delete_and_detach_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
-        stage_default_buffer_file(
-            "old-man-and-the-sea.txt",
-            include_str!("../tests/fixtures/old-man-and-the-sea.txt"),
-        );
+        stage_default_buffer_file("buffer-input.txt", BUFFER_FILE_TEST_CONTENT);
         remove_default_buffer_file("buffer.txt");
 
         let result = server
             .load_buffer(Parameters(LoadBufferInput {
                 name: "buffer0".into(),
-                path: "old-man-and-the-sea.txt".into(),
+                path: "buffer-input.txt".into(),
                 socket: None,
             }))
             .await
