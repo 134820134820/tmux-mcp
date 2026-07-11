@@ -43,6 +43,40 @@ pub struct TmuxMcpServer {
     subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
+/// Tool capabilities required to expose each MCP resource family.
+///
+/// Keep this matrix as the single authorization source for resource templates,
+/// concrete resource listings, and direct resource reads. Concrete catalog
+/// discovery may require additional list capabilities to enumerate target IDs,
+/// but it must never weaken these per-resource requirements.
+#[derive(Clone, Copy, Debug)]
+enum ResourceCapability {
+    Pane,
+    Window,
+    SessionTree,
+    Clients,
+    CommandResult,
+}
+
+impl ResourceCapability {
+    const fn required_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Pane => &["capture-pane"],
+            Self::Window => &["list-windows"],
+            Self::SessionTree => &["list-sessions", "list-windows", "list-panes"],
+            Self::Clients => &["list-clients"],
+            Self::CommandResult => &["get-command-result"],
+        }
+    }
+
+    fn check(self, policy: &SecurityPolicy) -> Result<(), crate::errors::Error> {
+        for tool_name in self.required_tools() {
+            policy.check_tool(tool_name)?;
+        }
+        Ok(())
+    }
+}
+
 /// Serialize a successful tool payload as MCP structured content.
 fn structured_output<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_value(value) {
@@ -683,6 +717,7 @@ impl TmuxMcpServer {
         #[cfg(feature = "special-keys")]
         router.merge(Self::special_keys_tool_router());
         Self::apply_tool_policy(&mut router, &policy);
+        let command_resources_enabled = ResourceCapability::CommandResult.check(&policy).is_ok();
         let tracker = Arc::new(tracker);
         let peer: Arc<RwLock<Option<Peer<RoleServer>>>> = Arc::new(RwLock::new(None));
         let subscriptions: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -701,7 +736,9 @@ impl TmuxMcpServer {
                             };
                             match event.kind {
                                 CommandEventKind::Created | CommandEventKind::Evicted => {
-                                    let _ = peer.notify_resource_list_changed().await;
+                                    if command_resources_enabled {
+                                        let _ = peer.notify_resource_list_changed().await;
+                                    }
                                     if event.kind == CommandEventKind::Evicted {
                                         let mut subs = subscriptions.write().await;
                                         subs.remove(&event.resource_uri);
@@ -778,6 +815,13 @@ impl TmuxMcpServer {
         )
     }
 
+    fn check_resource_capability(
+        &self,
+        capability: ResourceCapability,
+    ) -> Result<(), crate::errors::Error> {
+        capability.check(&self.policy)
+    }
+
     fn policy_filtered_resource_templates(&self) -> Vec<ResourceTemplate> {
         let socket = tmux::resolve_socket(None);
         if self.policy.check_socket(socket.as_deref()).is_err() {
@@ -792,7 +836,10 @@ impl TmuxMcpServer {
             "application/json",
         ));
 
-        if self.policy.check_tool("capture-pane").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::Pane)
+            .is_ok()
+        {
             templates.push(Self::resource_template(
                 "tmux://pane/{paneId}",
                 "Tmux Pane Content",
@@ -819,7 +866,10 @@ impl TmuxMcpServer {
             ));
         }
 
-        if self.policy.check_tool("list-windows").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::Window)
+            .is_ok()
+        {
             templates.push(Self::resource_template(
                 "tmux://window/{windowId}/info",
                 "Tmux Window Info",
@@ -828,7 +878,10 @@ impl TmuxMcpServer {
             ));
         }
 
-        if self.policy.check_tool("list-sessions").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::SessionTree)
+            .is_ok()
+        {
             templates.push(Self::resource_template(
                 "tmux://session/{sessionId}/tree",
                 "Tmux Session Tree",
@@ -837,7 +890,10 @@ impl TmuxMcpServer {
             ));
         }
 
-        if self.policy.check_tool("list-clients").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::Clients)
+            .is_ok()
+        {
             templates.push(Self::resource_template(
                 "tmux://clients",
                 "Tmux Clients",
@@ -846,7 +902,10 @@ impl TmuxMcpServer {
             ));
         }
 
-        if self.policy.check_tool("get-command-result").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::CommandResult)
+            .is_ok()
+        {
             templates.push(Self::resource_template(
                 "tmux://command/{commandId}/result",
                 "Command Execution Result",
@@ -3158,13 +3217,6 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             ));
         }
 
-        if self.policy.check_tool("list-sessions").is_err() {
-            return Ok(rmcp::model::ListResourcesResult {
-                resources,
-                next_cursor: None,
-                meta: None,
-            });
-        }
         if let Err(_e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(rmcp::model::ListResourcesResult {
                 resources,
@@ -3173,79 +3225,130 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             });
         }
 
-        let can_capture_pane = self.policy.check_tool("capture-pane").is_ok();
-        let mut has_pane_resources = false;
-        let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
-            McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
-        })?;
-        for session in sessions {
-            if self
-                .policy
-                .check_session_identity(&session.id, Some(&session.name))
-                .is_err()
-            {
-                continue;
-            }
-            let mut session_has_allowed_panes = false;
-            let windows = tmux::list_windows(&session.id, socket.as_deref())
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        format!("Error listing tmux windows for session {}: {e}", session.id),
-                        None,
-                    )
-                })?;
-            for window in windows {
-                let mut window_has_allowed_panes = false;
-                let panes = tmux::list_panes(&window.id, socket.as_deref())
+        let can_discover_sessions = self.policy.check_tool("list-sessions").is_ok();
+        let can_discover_windows =
+            can_discover_sessions && self.policy.check_tool("list-windows").is_ok();
+        let can_discover_panes =
+            can_discover_windows && self.policy.check_tool("list-panes").is_ok();
+        let can_publish_panes = can_discover_panes
+            && self
+                .check_resource_capability(ResourceCapability::Pane)
+                .is_ok();
+        let can_publish_windows = can_discover_windows
+            && self
+                .check_resource_capability(ResourceCapability::Window)
+                .is_ok();
+        let can_publish_session_trees = can_discover_panes
+            && self
+                .check_resource_capability(ResourceCapability::SessionTree)
+                .is_ok();
+
+        if can_publish_panes || can_publish_windows || can_publish_session_trees {
+            let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
+                McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
+            })?;
+            for session in sessions {
+                if self
+                    .policy
+                    .check_session_identity(&session.id, Some(&session.name))
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut session_has_visible_window = false;
+                let windows = tmux::list_windows(&session.id, socket.as_deref())
                     .await
                     .map_err(|e| {
                         McpError::internal_error(
-                            format!("Error listing tmux panes for window {}: {e}", window.id),
+                            format!("Error listing tmux windows for session {}: {e}", session.id),
                             None,
                         )
                     })?;
-                let all_window_panes_allowed = panes
-                    .iter()
-                    .all(|pane| self.policy.check_pane(&pane.id).is_ok());
-                for pane in panes {
-                    if self.policy.check_pane(&pane.id).is_err() {
-                        continue;
+                for window in windows {
+                    let inspect_panes = can_discover_panes || self.policy.has_pane_allowlist();
+                    let (window_has_allowed_panes, all_window_panes_allowed) = if inspect_panes {
+                        let panes = tmux::list_panes(&window.id, socket.as_deref())
+                            .await
+                            .map_err(|e| {
+                                McpError::internal_error(
+                                    format!(
+                                        "Error listing tmux panes for window {}: {e}",
+                                        window.id
+                                    ),
+                                    None,
+                                )
+                            })?;
+                        let all_allowed = panes
+                            .iter()
+                            .all(|pane| self.policy.check_pane(&pane.id).is_ok());
+                        let mut any_allowed = false;
+                        for pane in panes {
+                            if self.policy.check_pane(&pane.id).is_err() {
+                                continue;
+                            }
+                            any_allowed = true;
+                            if can_publish_panes {
+                                resources.push(Annotated::new(
+                                    RawResource {
+                                        uri: format!("tmux://pane/{}", pane.id),
+                                        name: format!(
+                                            "Pane: {} - {} - {}",
+                                            session.name, pane.id, pane.title
+                                        ),
+                                        title: None,
+                                        description: Some(format!(
+                                            "Pane output for state checks or log monitoring in session {} (pane {}).",
+                                            session.name, pane.id
+                                        )),
+                                        mime_type: Some("text/plain".into()),
+                                        size: None,
+                                        icons: None,
+                                        meta: None,
+                                    },
+                                    None,
+                                ));
+                                resources.push(Annotated::new(
+                                    RawResource {
+                                        uri: format!("tmux://pane/{}/info", pane.id),
+                                        name: format!(
+                                            "Pane Info: {} - {} - {}",
+                                            session.name, pane.id, pane.title
+                                        ),
+                                        title: None,
+                                        description: Some(format!(
+                                            "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
+                                            session.name, pane.id
+                                        )),
+                                        mime_type: Some("application/json".into()),
+                                        size: None,
+                                        icons: None,
+                                        meta: None,
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
+                        (any_allowed, all_allowed)
+                    } else {
+                        // A tmux window always owns at least one pane. Without a pane
+                        // allowlist, no pane IDs need to be discovered to publish its
+                        // independently authorized window-info resource.
+                        (true, true)
+                    };
+
+                    if window_has_allowed_panes && all_window_panes_allowed {
+                        session_has_visible_window = true;
                     }
-                    has_pane_resources = true;
-                    window_has_allowed_panes = true;
-                    session_has_allowed_panes = true;
-                    if can_capture_pane {
+
+                    if can_publish_windows && window_has_allowed_panes && all_window_panes_allowed {
                         resources.push(Annotated::new(
                             RawResource {
-                                uri: format!("tmux://pane/{}", pane.id),
-                                name: format!(
-                                    "Pane: {} - {} - {}",
-                                    session.name, pane.id, pane.title
-                                ),
+                                uri: format!("tmux://window/{}/info", window.id),
+                                name: format!("Window Info: {} - {}", session.name, window.name),
                                 title: None,
                                 description: Some(format!(
-                                    "Pane output for state checks or log monitoring in session {} (pane {}).",
-                                    session.name, pane.id
-                                )),
-                                mime_type: Some("text/plain".into()),
-                                size: None,
-                                icons: None,
-                                meta: None,
-                            },
-                            None,
-                        ));
-                        resources.push(Annotated::new(
-                            RawResource {
-                                uri: format!("tmux://pane/{}/info", pane.id),
-                                name: format!(
-                                    "Pane Info: {} - {} - {}",
-                                    session.name, pane.id, pane.title
-                                ),
-                                title: None,
-                                description: Some(format!(
-                                    "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
-                                    session.name, pane.id
+                                    "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
+                                    session.name, window.name
                                 )),
                                 mime_type: Some("application/json".into()),
                                 size: None,
@@ -3256,15 +3359,15 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         ));
                     }
                 }
-                if window_has_allowed_panes && all_window_panes_allowed {
+                if can_publish_session_trees && session_has_visible_window {
                     resources.push(Annotated::new(
                         RawResource {
-                            uri: format!("tmux://window/{}/info", window.id),
-                            name: format!("Window Info: {} - {}", session.name, window.name),
+                            uri: format!("tmux://session/{}/tree", session.id),
+                            name: format!("Session Tree: {}", session.name),
                             title: None,
                             description: Some(format!(
-                                "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
-                                session.name, window.name
+                                "Session snapshot to plan multi-pane workflows and choose targets in {}.",
+                                session.name
                             )),
                             mime_type: Some("application/json".into()),
                             size: None,
@@ -3275,27 +3378,12 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     ));
                 }
             }
-            if session_has_allowed_panes {
-                resources.push(Annotated::new(
-                    RawResource {
-                        uri: format!("tmux://session/{}/tree", session.id),
-                        name: format!("Session Tree: {}", session.name),
-                        title: None,
-                        description: Some(format!(
-                            "Session snapshot to plan multi-pane workflows and choose targets in {}.",
-                            session.name
-                        )),
-                        mime_type: Some("application/json".into()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    },
-                    None,
-                ));
-            }
         }
 
-        if has_pane_resources && self.policy.check_tool("list-clients").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::Clients)
+            .is_ok()
+        {
             resources.push(Annotated::new(
                 RawResource {
                     uri: "tmux://clients".into(),
@@ -3313,11 +3401,17 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             ));
         }
 
-        if self.policy.check_tool("get-command-result").is_ok() {
+        if self
+            .check_resource_capability(ResourceCapability::CommandResult)
+            .is_ok()
+        {
             for id in self.tracker.get_active_ids().await {
                 let Some(cmd) = self.tracker.get_command(&id).await else {
                     continue;
                 };
+                if self.policy.check_socket(cmd.socket.as_deref()).is_err() {
+                    continue;
+                }
                 if self.policy.check_pane(&cmd.pane_id).is_err() {
                     continue;
                 }
@@ -3375,6 +3469,12 @@ impl rmcp::ServerHandler for TmuxMcpServer {
     ) -> Result<(), McpError> {
         self.capture_peer(&context).await;
         let uri = request.uri;
+        if let Err(e) = self.check_resource_capability(ResourceCapability::CommandResult) {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
         let Some(command_id) = uri
             .strip_prefix("tmux://command/")
             .and_then(|rest| rest.strip_suffix("/result"))
@@ -3390,19 +3490,44 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 None,
             ));
         }
+        let Some(cmd) = self.tracker.get_command(command_id).await else {
+            return Err(McpError::invalid_params(
+                format!("unknown command resource: {uri}"),
+                None,
+            ));
+        };
+        if let Err(e) = self.policy.check_socket(cmd.socket.as_deref()) {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
+        if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
+            .await
+        {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
         {
             let mut subs = self.subscriptions.write().await;
             subs.insert(uri.clone());
         }
         // Already-terminal commands never emit Updated/Terminal after subscribe; chime once.
-        if let Some(cmd) = self.tracker.get_command(command_id).await {
-            if cmd.status.is_terminal() {
-                let peer = self.peer.read().await;
-                if let Some(peer) = peer.as_ref() {
-                    let _ = peer
-                        .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
-                        .await;
-                }
+        if cmd.status.is_terminal() {
+            let peer = self.peer.read().await;
+            if let Some(peer) = peer.as_ref() {
+                let _ = peer
+                    .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                    .await;
             }
         }
         Ok(())
@@ -3458,7 +3583,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     contents: vec![ResourceContents::text("Invalid pane resource URI", uri)],
                 });
             }
-            if let Err(e) = self.policy.check_tool("capture-pane") {
+            if let Err(e) = self.check_resource_capability(ResourceCapability::Pane) {
                 return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
@@ -3578,7 +3703,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
-                if let Err(e) = self.policy.check_tool("list-windows") {
+                if let Err(e) = self.check_resource_capability(ResourceCapability::Window) {
                     return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
@@ -3623,7 +3748,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
                 }
-                if let Err(e) = self.policy.check_tool("list-sessions") {
+                if let Err(e) = self.check_resource_capability(ResourceCapability::SessionTree) {
                     return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
@@ -3643,18 +3768,39 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                             .find(|s| s.id == session_id || s.name == session_id);
                         if let Some(session) = session {
                             let mut windows_tree = Vec::new();
-                            if let Ok(windows) =
-                                tmux::list_windows(&session.id, socket.as_deref()).await
-                            {
-                                for window in windows {
-                                    let panes = tmux::list_panes(&window.id, socket.as_deref())
-                                        .await
-                                        .unwrap_or_default()
-                                        .into_iter()
-                                        .filter(|pane| self.policy.check_pane(&pane.id).is_ok())
-                                        .collect();
-                                    windows_tree.push(crate::types::WindowTree { window, panes });
+                            let windows =
+                                match tmux::list_windows(&session.id, socket.as_deref()).await {
+                                    Ok(windows) => windows,
+                                    Err(e) => {
+                                        return Ok(read_resource_result! {
+                                            contents: vec![ResourceContents::text(
+                                                format!("Error: {e}"),
+                                                uri,
+                                            )],
+                                        });
+                                    }
+                                };
+                            for window in windows {
+                                let panes =
+                                    match tmux::list_panes(&window.id, socket.as_deref()).await {
+                                        Ok(panes) => panes,
+                                        Err(e) => {
+                                            return Ok(read_resource_result! {
+                                                contents: vec![ResourceContents::text(
+                                                    format!("Error: {e}"),
+                                                    uri,
+                                                )],
+                                            });
+                                        }
+                                    };
+                                if panes.is_empty()
+                                    || panes
+                                        .iter()
+                                        .any(|pane| self.policy.check_pane(&pane.id).is_err())
+                                {
+                                    continue;
                                 }
+                                windows_tree.push(crate::types::WindowTree { window, panes });
                             }
                             let tree = crate::types::SessionTree {
                                 session,
@@ -3691,7 +3837,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
-            if let Err(e) = self.policy.check_tool("list-clients") {
+            if let Err(e) = self.check_resource_capability(ResourceCapability::Clients) {
                 return Ok(read_resource_result! {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
@@ -3714,7 +3860,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             }
         } else if let Some(rest) = uri.strip_prefix("tmux://command/") {
             if let Some(command_id) = rest.strip_suffix("/result") {
-                if let Err(e) = self.policy.check_tool("get-command-result") {
+                if let Err(e) = self.check_resource_capability(ResourceCapability::CommandResult) {
                     return Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
@@ -3849,6 +3995,33 @@ mod tests {
             }
         }
         ""
+    }
+
+    fn resource_template_uris(server: &TmuxMcpServer) -> BTreeSet<String> {
+        server
+            .policy_filtered_resource_templates()
+            .into_iter()
+            .map(|template| template.raw.uri_template)
+            .collect()
+    }
+
+    fn resource_uris(resources: &[Resource]) -> BTreeSet<String> {
+        resources
+            .iter()
+            .map(|resource| resource.raw.uri.clone())
+            .collect()
+    }
+
+    async fn read_resource_text(server: &TmuxMcpServer, uri: &str) -> String {
+        let (context, _client_transport, _running) = context_for_server(server);
+        let result = server
+            .read_resource(
+                read_resource_request!(uri: uri.to_string(), meta: None),
+                context,
+            )
+            .await
+            .expect("read resource");
+        first_text_resource(&result.contents).to_string()
     }
 
     fn tool_names(server: &TmuxMcpServer) -> BTreeSet<String> {
@@ -4513,6 +4686,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_template_capability_matrix_handles_composite_tool_filters() {
+        let deny_windows =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-windows\"]\n");
+        let templates = resource_template_uris(&deny_windows);
+        assert!(!templates.contains("tmux://window/{windowId}/info"));
+        assert!(!templates.contains("tmux://session/{sessionId}/tree"));
+        assert!(templates.contains("tmux://pane/{paneId}"));
+        assert!(templates.contains("tmux://clients"));
+        assert!(templates.contains("tmux://command/{commandId}/result"));
+
+        let deny_panes =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-panes\"]\n");
+        let templates = resource_template_uris(&deny_panes);
+        assert!(templates.contains("tmux://window/{windowId}/info"));
+        assert!(!templates.contains("tmux://session/{sessionId}/tree"));
+        assert!(templates.contains("tmux://pane/{paneId}"));
+
+        let deny_capture =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
+        let templates = resource_template_uris(&deny_capture);
+        assert!(!templates.iter().any(|uri| uri.starts_with("tmux://pane/")));
+        assert!(templates.contains("tmux://window/{windowId}/info"));
+        assert!(templates.contains("tmux://session/{sessionId}/tree"));
+
+        let deny_clients_and_commands = server_with_policy(
+            "[security.tools]\nmode = \"deny\"\nitems = [\"list-clients\", \"get-command-result\"]\n",
+        );
+        let templates = resource_template_uris(&deny_clients_and_commands);
+        assert!(!templates.contains("tmux://clients"));
+        assert!(!templates.contains("tmux://command/{commandId}/result"));
+
+        let topology_only = server_with_policy(
+            "[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\", \"list-windows\", \"list-panes\"]\n",
+        );
+        let templates = resource_template_uris(&topology_only);
+        assert_eq!(
+            templates,
+            BTreeSet::from([
+                "tmux://server/info".to_string(),
+                "tmux://session/{sessionId}/tree".to_string(),
+                "tmux://window/{windowId}/info".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn read_window_info_respects_allowed_panes() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_LIST_PANES", "%99\tdisallowed\t1");
@@ -4536,6 +4755,85 @@ mod tests {
         assert!(text.contains("allowed panes"));
         assert!(!text.contains("%99"));
         assert!(!text.contains("active_pane_id"));
+    }
+
+    #[tokio::test]
+    async fn resource_reads_enforce_composite_capability_matrix() {
+        let _stub = TmuxStub::new();
+
+        let deny_windows =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-windows\"]\n");
+        let text = read_resource_text(&deny_windows, "tmux://window/@1/info").await;
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("list-windows"));
+        let text = read_resource_text(&deny_windows, "tmux://session/%1/tree").await;
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("list-windows"));
+
+        let deny_panes =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-panes\"]\n");
+        let text = read_resource_text(&deny_panes, "tmux://session/%1/tree").await;
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("list-panes"));
+        let text = read_resource_text(&deny_panes, "tmux://window/@1/info").await;
+        assert!(!text.contains("Access denied"));
+
+        let deny_capture =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
+        let text = read_resource_text(&deny_capture, "tmux://pane/%1/info").await;
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("capture-pane"));
+        let text = read_resource_text(&deny_capture, "tmux://pane/%1/tail/10").await;
+        assert!(text.contains("Access denied"));
+
+        let deny_clients =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-clients\"]\n");
+        let text = read_resource_text(&deny_clients, "tmux://clients").await;
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("list-clients"));
+
+        let topology_only = server_with_policy(
+            "[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\", \"list-windows\", \"list-panes\"]\n",
+        );
+        let text = read_resource_text(&topology_only, "tmux://session/%1/tree").await;
+        assert!(!text.contains("Access denied"));
+        let payload: Value = serde_json::from_str(&text).expect("session tree JSON");
+        assert!(payload.get("session").is_some());
+        let text = read_resource_text(&topology_only, "tmux://pane/%1").await;
+        assert!(text.contains("Access denied"));
+        assert!(text.contains("capture-pane"));
+    }
+
+    #[tokio::test]
+    async fn session_tree_fails_closed_for_disallowed_panes() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_LIST_PANES", "%1\tallowed\t1\n%99\tdisallowed\t0");
+        let server = server_with_policy("[security]\nallowed_panes = [\"%1\"]\n");
+
+        let text = read_resource_text(&server, "tmux://session/%1/tree").await;
+        let payload: Value = serde_json::from_str(&text).expect("session tree JSON");
+        assert!(payload["windows"]
+            .as_array()
+            .expect("windows array")
+            .is_empty());
+        assert!(!text.contains("%99"));
+        assert!(!text.contains("disallowed"));
+
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let resources = server
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        let uris = resource_uris(&resources.resources);
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://window/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://session/")));
+        assert!(uris.contains("tmux://pane/%1"));
+        assert!(!uris.contains("tmux://pane/%99"));
+
+        let no_allowed_sessions = server_with_policy("[security]\nallowed_sessions = []\n");
+        let clients = read_resource_text(&no_allowed_sessions, "tmux://clients").await;
+        let payload: Value = serde_json::from_str(&clients).expect("clients JSON");
+        assert_eq!(payload, Value::Array(Vec::new()));
     }
 
     #[test]
@@ -5657,8 +5955,13 @@ mod tests {
             .list_resources(None, context)
             .await
             .expect("list resources");
-        assert_eq!(result.resources.len(), 1);
-        assert_eq!(result.resources[0].uri, "tmux://server/info");
+        assert_eq!(
+            resource_uris(&result.resources),
+            BTreeSet::from([
+                "tmux://clients".to_string(),
+                "tmux://server/info".to_string(),
+            ])
+        );
 
         let server = server_with_policy("[security]\nallowed_panes = []\n");
         let (context, _client_transport, _running) = context_for_server(&server);
@@ -5666,8 +5969,126 @@ mod tests {
             .list_resources(None, context)
             .await
             .expect("list resources");
-        assert_eq!(result.resources.len(), 1);
-        assert_eq!(result.resources[0].uri, "tmux://server/info");
+        assert_eq!(
+            resource_uris(&result.resources),
+            BTreeSet::from([
+                "tmux://clients".to_string(),
+                "tmux://server/info".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_resources_enforces_composite_capability_matrix() {
+        let _stub = TmuxStub::new();
+
+        let deny_windows =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-windows\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&deny_windows);
+        let resources = deny_windows
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        let uris = resource_uris(&resources.resources);
+        assert_eq!(
+            uris,
+            BTreeSet::from([
+                "tmux://clients".to_string(),
+                "tmux://server/info".to_string(),
+            ])
+        );
+
+        let deny_panes =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-panes\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&deny_panes);
+        let resources = deny_panes
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        let uris = resource_uris(&resources.resources);
+        assert!(uris.iter().any(|uri| uri.starts_with("tmux://window/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://session/")));
+
+        let deny_capture =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&deny_capture);
+        let resources = deny_capture
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        let uris = resource_uris(&resources.resources);
+        assert!(uris.iter().any(|uri| uri.starts_with("tmux://window/")));
+        assert!(uris.iter().any(|uri| uri.starts_with("tmux://session/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
+
+        let topology_only = server_with_policy(
+            "[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\", \"list-windows\", \"list-panes\"]\n",
+        );
+        let (context, _client_transport, _running) = context_for_server(&topology_only);
+        let resources = topology_only
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        let uris = resource_uris(&resources.resources);
+        assert!(uris.iter().any(|uri| uri.starts_with("tmux://window/")));
+        assert!(uris.iter().any(|uri| uri.starts_with("tmux://session/")));
+        assert!(!uris.contains("tmux://clients"));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://command/")));
+    }
+
+    #[tokio::test]
+    async fn list_resources_keeps_clients_and_commands_independent_from_topology() {
+        let _stub = TmuxStub::new();
+        let server =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-sessions\"]\n");
+        let result = server
+            .execute_command(Parameters(ExecuteCommandInput {
+                pane_id: "%1".into(),
+                command: "echo hi".into(),
+                raw_mode: None,
+                no_enter: None,
+                delay_ms: None,
+                wait_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("execute command");
+        let payload: Value = serde_json::from_str(&first_text(&result)).expect("command payload");
+        let command_uri = payload["resourceUri"]
+            .as_str()
+            .expect("command resource URI");
+
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let resources = server
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        let uris = resource_uris(&resources.resources);
+        assert!(uris.contains("tmux://server/info"));
+        assert!(uris.contains("tmux://clients"));
+        assert!(uris.contains(command_uri));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://window/")));
+        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://session/")));
+
+        let deny_command = server_with_policy(
+            "[security.tools]\nmode = \"deny\"\nitems = [\"get-command-result\"]\n",
+        );
+        deny_command
+            .tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("track command");
+        let (context, _client_transport, _running) = context_for_server(&deny_command);
+        let resources = deny_command
+            .list_resources(None, context)
+            .await
+            .expect("list resources");
+        assert!(!resource_uris(&resources.resources)
+            .iter()
+            .any(|uri| uri.starts_with("tmux://command/")));
     }
 
     #[tokio::test]
@@ -6793,7 +7214,9 @@ mod tests {
     #[tokio::test]
     async fn read_resource_command_denied_by_policy() {
         let _stub = TmuxStub::new();
-        let server = server_with_policy("[security]\nallow_execute_command = false\n");
+        let server = server_with_policy(
+            "[security.tools]\nmode = \"deny\"\nitems = [\"get-command-result\"]\n",
+        );
         let (context, _client_transport, _running) = context_for_server(&server);
 
         let command_id = server
@@ -6812,6 +7235,7 @@ mod tests {
             .expect("read resource");
         let text = first_text_resource(&result.contents);
         assert!(text.contains("Access denied"));
+        assert!(text.contains("get-command-result"));
     }
 
     #[tokio::test]
