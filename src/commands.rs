@@ -1342,9 +1342,11 @@ mod tests {
 
     #[test]
     fn partial_capture_never_exceeds_final_capture_budget() {
-        let mut tracking = TrackingConfig::default();
-        tracking.capture_initial_lines = 10_000;
-        tracking.capture_max_lines = 25;
+        let mut tracking = TrackingConfig {
+            capture_initial_lines: 10_000,
+            capture_max_lines: 25,
+            ..TrackingConfig::default()
+        };
         assert_eq!(partial_capture_lines(&tracking), 25);
 
         tracking.capture_initial_lines = 0;
@@ -1362,9 +1364,11 @@ mod tests {
             "TMUX_MCP_START_cmd-partial\nfirst partial\n",
         );
 
-        let mut tracking = TrackingConfig::default();
-        tracking.capture_initial_lines = 100;
-        tracking.capture_max_lines = 2;
+        let tracking = TrackingConfig {
+            capture_initial_lines: 100,
+            capture_max_lines: 2,
+            ..TrackingConfig::default()
+        };
         let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
         tracker
             .active_commands
@@ -1687,8 +1691,10 @@ mod tests {
         stub.set_var("TMUX_STUB_CAPTURE_SLEEP_SECS", "2");
         stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
 
-        let mut tracking = TrackingConfig::default();
-        tracking.tracking_deadline_seconds = 1;
+        let tracking = TrackingConfig {
+            tracking_deadline_seconds: 1,
+            ..TrackingConfig::default()
+        };
         let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
         let id1 = tracker
             .execute_command("%1", "echo one", false, false, None, None)
