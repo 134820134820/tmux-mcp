@@ -24,6 +24,35 @@ pub const START_MARKER_PREFIX: &str = "TMUX_MCP_START_";
 /// Prefix for the end marker, followed by command id and exit code.
 pub const END_MARKER_PREFIX: &str = "TMUX_MCP_DONE_";
 
+const FINAL_OUTPUT_CAPTURE_ATTEMPTS: usize = 3;
+const FINAL_OUTPUT_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BracketedOutput {
+    /// Both marker boundaries were present in the bounded capture.
+    Complete(String),
+    /// START was present but DONE was not yet visible.
+    Open(String),
+    /// The bounded capture did not include START, so output cannot be isolated safely.
+    MissingStart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedOutput {
+    output: Option<String>,
+    /// Capture completeness only; command lifecycle remains side-channel authoritative.
+    truncated: bool,
+}
+
+impl CapturedOutput {
+    fn unavailable() -> Self {
+        Self {
+            output: None,
+            truncated: true,
+        }
+    }
+}
+
 /// Lifecycle event published after a durable tracker commit.
 ///
 /// The MCP server maps these to resource list-changed / resource-updated
@@ -394,32 +423,28 @@ impl CommandTracker {
             return Ok(Some(execution));
         }
 
-        if matches!(
-            execution.status,
-            CommandStatus::Running | CommandStatus::Queued
-        ) {
-            let lines = self.tracking.capture_initial_lines.max(1);
-            if let Ok(captured) = tmux::capture_pane(
+        if execution.status == CommandStatus::Running {
+            let lines = partial_capture_lines(&self.tracking);
+            let captured = capture_running_output(
                 &execution.pane_id,
-                Some(lines),
-                false,
-                None,
-                None,
-                true,
+                &execution.id,
+                lines,
                 execution.socket.as_deref().or(socket_override),
             )
-            .await
-            {
-                if let Some(partial) = extract_output_between_markers(&captured, &execution.id) {
-                    execution.output = Some(partial);
-                    let mut commands = self.active_commands.write().await;
-                    if let Some(stored) = commands.get_mut(command_id) {
-                        if !stored.status.is_terminal() {
-                            stored.output = execution.output.clone();
-                        }
-                    }
-                }
+            .await;
+
+            // The side-channel watcher may have committed terminal state while capture-pane
+            // was in flight. Re-read under the write lock so that commit always wins and a
+            // stale Running snapshot never escapes after terminal state is durable.
+            let mut commands = self.active_commands.write().await;
+            let stored = match commands.get_mut(command_id) {
+                Some(stored) => stored,
+                None => return Ok(None),
+            };
+            if !stored.status.is_terminal() {
+                apply_captured_output(stored, captured);
             }
+            execution = stored.clone();
         }
 
         Ok(Some(execution))
@@ -719,69 +744,69 @@ fn spawn_side_channel_watcher(
             tokio::time::timeout(deadline, tmux::wait_for_signal(&channel, socket.as_deref()))
                 .await;
 
-        let terminal = match wait_result {
+        let (status, exit_code, reason, final_capture) = match wait_result {
             Ok(Ok(())) => match tmux::read_exit_code_buffer(&secret, socket.as_deref()).await {
-                Ok(exit_code) => {
-                    let output = capture_bracketed_output(
-                        &pane_id,
-                        &command_id,
-                        tracking.capture_max_lines.max(1),
-                        socket.as_deref(),
-                    )
-                    .await;
-                    Some((
-                        if exit_code == 0 {
-                            CommandStatus::Completed
-                        } else {
-                            CommandStatus::Failed
-                        },
-                        Some(exit_code),
-                        output,
-                        None,
-                    ))
-                }
-                Err(e) => Some((
+                Ok(exit_code) => (
+                    if exit_code == 0 {
+                        CommandStatus::Completed
+                    } else {
+                        CommandStatus::Failed
+                    },
+                    Some(exit_code),
+                    None,
+                    true,
+                ),
+                Err(e) => (
                     CommandStatus::TrackingError,
                     None,
-                    None,
                     Some(format!("side-channel exit buffer unreadable: {e}")),
-                )),
+                    true,
+                ),
             },
-            Ok(Err(e)) => Some((
+            Ok(Err(e)) => (
                 CommandStatus::TrackingError,
-                None,
                 None,
                 Some(format!("wait-for failed: {e}")),
-            )),
-            Err(_) => Some((
+                false,
+            ),
+            Err(_) => (
                 CommandStatus::TrackingError,
                 None,
-                None,
                 Some("tracking deadline exceeded waiting for side channel".to_string()),
-            )),
+                false,
+            ),
         };
 
-        if let Some((status, exit_code, output, reason)) = terminal {
-            let mut commands = active_commands.write().await;
-            if let Some(exec) = commands.get_mut(&command_id) {
-                if !exec.status.is_terminal() {
-                    exec.status = status;
-                    exec.exit_code = exit_code;
-                    if let Some(out) = output {
-                        exec.output = Some(out);
-                    }
-                    exec.reason = reason;
-                    exec.completed_at = Some(Instant::now());
-                    let _ = events.send(CommandEvent {
-                        command_id: exec.id.clone(),
-                        resource_uri: command_resource_uri(&exec.id),
-                        kind: CommandEventKind::Terminal,
-                        status: exec.status,
-                    });
-                    notify.notify_waiters();
-                }
+        let max_lines = tracking.capture_max_lines.max(1);
+        let captured = if final_capture {
+            capture_terminal_output(&pane_id, &command_id, max_lines, socket.as_deref()).await
+        } else {
+            let mut captured =
+                capture_running_output(&pane_id, &command_id, max_lines, socket.as_deref()).await;
+            // A tracking error without the completion signal means the command's output
+            // boundary is unknown even when START remains visible.
+            captured.truncated = true;
+            captured
+        };
+
+        let mut commands = active_commands.write().await;
+        if let Some(exec) = commands.get_mut(&command_id) {
+            if !exec.status.is_terminal() {
+                exec.status = status;
+                exec.exit_code = exit_code;
+                apply_captured_output(exec, captured);
+                exec.reason = reason;
+                exec.completed_at = Some(Instant::now());
+                let _ = events.send(CommandEvent {
+                    command_id: exec.id.clone(),
+                    resource_uri: command_resource_uri(&exec.id),
+                    kind: CommandEventKind::Terminal,
+                    status: exec.status,
+                });
+                notify.notify_waiters();
             }
         }
+        drop(commands);
 
         let _ = tmux::delete_exit_code_buffer(&secret, socket.as_deref()).await;
         secrets.write().await.remove(&command_id);
@@ -867,36 +892,97 @@ async fn dispatch_keys_free(
     Ok(())
 }
 
+fn partial_capture_lines(tracking: &TrackingConfig) -> u32 {
+    tracking
+        .capture_initial_lines
+        .max(1)
+        .min(tracking.capture_max_lines.max(1))
+}
+
+fn apply_captured_output(exec: &mut CommandExecution, captured: CapturedOutput) {
+    if let Some(output) = captured.output {
+        exec.output = Some(output);
+    }
+    exec.output_truncated = captured.truncated;
+}
+
 async fn capture_bracketed_output(
     pane_id: &str,
     command_id: &str,
     max_lines: u32,
     socket: Option<&str>,
-) -> Option<String> {
-    let captured = tmux::capture_pane(pane_id, Some(max_lines), false, None, None, true, socket)
-        .await
-        .ok()?;
-    extract_output_between_markers(&captured, command_id)
+) -> Result<BracketedOutput> {
+    let captured =
+        tmux::capture_pane(pane_id, Some(max_lines), false, None, None, true, socket).await?;
+    Ok(extract_output_between_markers(&captured, command_id))
 }
 
-/// Optional output extraction from markers (never used for completion/status).
-fn extract_output_between_markers(captured: &str, command_id: &str) -> Option<String> {
+async fn capture_running_output(
+    pane_id: &str,
+    command_id: &str,
+    max_lines: u32,
+    socket: Option<&str>,
+) -> CapturedOutput {
+    match capture_bracketed_output(pane_id, command_id, max_lines, socket).await {
+        Ok(BracketedOutput::Complete(output) | BracketedOutput::Open(output)) => CapturedOutput {
+            output: Some(output),
+            truncated: false,
+        },
+        Ok(BracketedOutput::MissingStart) | Err(_) => CapturedOutput::unavailable(),
+    }
+}
+
+async fn capture_terminal_output(
+    pane_id: &str,
+    command_id: &str,
+    max_lines: u32,
+    socket: Option<&str>,
+) -> CapturedOutput {
+    let mut best_open_output = None;
+    for attempt in 0..FINAL_OUTPUT_CAPTURE_ATTEMPTS {
+        match capture_bracketed_output(pane_id, command_id, max_lines, socket).await {
+            Ok(BracketedOutput::Complete(output)) => {
+                return CapturedOutput {
+                    output: Some(output),
+                    truncated: false,
+                };
+            }
+            Ok(BracketedOutput::Open(output)) => best_open_output = Some(output),
+            Ok(BracketedOutput::MissingStart) => {
+                return CapturedOutput {
+                    output: best_open_output,
+                    truncated: true,
+                };
+            }
+            Err(_) => {}
+        }
+
+        if attempt + 1 < FINAL_OUTPUT_CAPTURE_ATTEMPTS {
+            tokio::time::sleep(FINAL_OUTPUT_CAPTURE_RETRY_DELAY).await;
+        }
+    }
+
+    CapturedOutput {
+        output: best_open_output,
+        truncated: true,
+    }
+}
+
+/// Extract bounded output markers for presentation only, never command completion.
+fn extract_output_between_markers(captured: &str, command_id: &str) -> BracketedOutput {
     let start_marker = get_start_marker(command_id);
     let after_start = match captured.rfind(&start_marker) {
         Some(start_idx) => &captured[start_idx + start_marker.len()..],
-        None => return None,
+        None => return BracketedOutput::MissingStart,
     };
     let end_prefix = end_marker_prefix(command_id);
-    let end_regex = Regex::new(&format!(r"{}(\d+)", regex::escape(&end_prefix))).ok()?;
-    if let Some(m) = end_regex.find(after_start) {
-        Some(after_start[..m.start()].trim().to_string())
+    let Some(end_regex) = Regex::new(&format!(r"{}(\d+)", regex::escape(&end_prefix))).ok() else {
+        return BracketedOutput::MissingStart;
+    };
+    if let Some(m) = end_regex.find_iter(after_start).last() {
+        BracketedOutput::Complete(after_start[..m.start()].trim().to_string())
     } else {
-        let trimmed = after_start.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
+        BracketedOutput::Open(after_start.trim().to_string())
     }
 }
 
@@ -1094,6 +1180,7 @@ mod tests {
     use crate::errors::Error;
     use crate::test_support::TmuxStub;
     use rstest::rstest;
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::NamedTempFile;
 
@@ -1107,6 +1194,24 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         tracker.get_command(id).await.expect("command should exist")
+    }
+
+    fn running_execution(id: &str) -> CommandExecution {
+        CommandExecution {
+            id: id.to_string(),
+            pane_id: "%1".to_string(),
+            socket: None,
+            command: "printf partial".to_string(),
+            status: CommandStatus::Running,
+            exit_code: None,
+            output: None,
+            output_truncated: false,
+            reason: None,
+            started_at: Instant::now(),
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        }
     }
 
     #[rstest]
@@ -1133,6 +1238,208 @@ mod tests {
             parse_command_output(input, "cmd-1"),
             Some(("hello".to_string(), 0))
         );
+    }
+
+    #[rstest]
+    #[case(
+        "TMUX_MCP_START_cmd-1\nhello\nTMUX_MCP_DONE_cmd-1_0\n",
+        BracketedOutput::Complete("hello".to_string())
+    )]
+    #[case(
+        "TMUX_MCP_START_cmd-1\nTMUX_MCP_DONE_cmd-1_0\n",
+        BracketedOutput::Complete(String::new())
+    )]
+    #[case(
+        "TMUX_MCP_START_cmd-1\npartial\n",
+        BracketedOutput::Open("partial".to_string())
+    )]
+    #[case("tail without start", BracketedOutput::MissingStart)]
+    fn extract_output_reports_capture_boundaries(
+        #[case] captured: &str,
+        #[case] expected: BracketedOutput,
+    ) {
+        assert_eq!(extract_output_between_markers(captured, "cmd-1"), expected);
+    }
+
+    #[test]
+    fn extract_output_uses_last_done_marker_for_the_boundary() {
+        let captured = concat!(
+            "TMUX_MCP_START_cmd-1\n",
+            "first\n",
+            "TMUX_MCP_DONE_cmd-1_0\n",
+            "last\n",
+            "TMUX_MCP_DONE_cmd-1_0\n",
+        );
+        assert_eq!(
+            extract_output_between_markers(captured, "cmd-1"),
+            BracketedOutput::Complete("first\nTMUX_MCP_DONE_cmd-1_0\nlast".to_string())
+        );
+    }
+
+    #[test]
+    fn partial_capture_never_exceeds_final_capture_budget() {
+        let mut tracking = TrackingConfig::default();
+        tracking.capture_initial_lines = 10_000;
+        tracking.capture_max_lines = 25;
+        assert_eq!(partial_capture_lines(&tracking), 25);
+
+        tracking.capture_initial_lines = 0;
+        tracking.capture_max_lines = 0;
+        assert_eq!(partial_capture_lines(&tracking), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_capture_is_bounded_and_preserves_useful_output_after_marker_loss() {
+        let mut stub = TmuxStub::new();
+        let capture_log = NamedTempFile::new().expect("capture log");
+        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "TMUX_MCP_START_cmd-partial\nfirst partial\n",
+        );
+
+        let mut tracking = TrackingConfig::default();
+        tracking.capture_initial_lines = 100;
+        tracking.capture_max_lines = 2;
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        tracker
+            .active_commands
+            .write()
+            .await
+            .insert("cmd-partial".to_string(), running_execution("cmd-partial"));
+
+        let first = tracker
+            .check_status("cmd-partial", None)
+            .await
+            .expect("partial status")
+            .expect("partial command");
+        assert_eq!(first.output.as_deref(), Some("first partial"));
+        assert!(!first.output_truncated);
+
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "tail after START left scrollback",
+        );
+        let overflowed = tracker
+            .check_status("cmd-partial", None)
+            .await
+            .expect("overflow status")
+            .expect("overflow command");
+        assert_eq!(overflowed.output.as_deref(), Some("first partial"));
+        assert!(overflowed.output_truncated);
+
+        let logged = std::fs::read_to_string(capture_log.path()).expect("read capture log");
+        assert_eq!(logged.lines().count(), 2);
+        assert!(
+            logged.lines().all(|line| line.contains("-J -S -2 -E -")),
+            "partial capture exceeded final line budget: {logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_capture_retries_boundedly_until_done_is_visible() {
+        let mut stub = TmuxStub::new();
+        let count_file = NamedTempFile::new().expect("capture count");
+        stub.set_var("TMUX_STUB_CAPTURE_COUNT_FILE", count_file.path());
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER", "2");
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_BEFORE",
+            "TMUX_MCP_START_cmd-final\nfinal output\n",
+        );
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_AFTER_OUTPUT",
+            "TMUX_MCP_START_cmd-final\nfinal output\nTMUX_MCP_DONE_cmd-final_0\n",
+        );
+
+        let captured = capture_terminal_output("%1", "cmd-final", 8, None).await;
+        assert_eq!(captured.output.as_deref(), Some("final output"));
+        assert!(!captured.truncated);
+        assert_eq!(
+            std::fs::read_to_string(count_file.path())
+                .expect("read capture count")
+                .trim(),
+            "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_capture_marks_missing_boundaries_truncated() {
+        let mut stub = TmuxStub::new();
+        let capture_log = NamedTempFile::new().expect("capture log");
+        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "TMUX_MCP_START_cmd-final\nbounded tail\n",
+        );
+
+        let missing_done = capture_terminal_output("%1", "cmd-final", 4, None).await;
+        assert_eq!(missing_done.output.as_deref(), Some("bounded tail"));
+        assert!(missing_done.truncated);
+        let logged = std::fs::read_to_string(capture_log.path()).expect("read capture log");
+        assert_eq!(logged.lines().count(), FINAL_OUTPUT_CAPTURE_ATTEMPTS);
+
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "left-truncated tail\nTMUX_MCP_DONE_cmd-final_0\n",
+        );
+        let missing_start = capture_terminal_output("%1", "cmd-final", 4, None).await;
+        assert_eq!(missing_start.output, None);
+        assert!(missing_start.truncated);
+    }
+
+    #[tokio::test]
+    async fn check_status_returns_terminal_commit_that_wins_capture_race() {
+        let mut stub = TmuxStub::new();
+        let capture_log = NamedTempFile::new().expect("capture log");
+        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
+        stub.set_var("TMUX_STUB_CAPTURE_SLEEP_SECS", "1");
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "TMUX_MCP_START_cmd-race\nstale partial\n",
+        );
+
+        let tracker = Arc::new(CommandTracker::new(ShellType::Bash));
+        tracker
+            .active_commands
+            .write()
+            .await
+            .insert("cmd-race".to_string(), running_execution("cmd-race"));
+
+        let status_task = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move { tracker.check_status("cmd-race", None).await })
+        };
+
+        let mut capture_started = false;
+        // Other command tests may still have short-lived watcher subprocesses occupying
+        // the shared tmux semaphore; wait long enough for those bounded tasks to drain.
+        for _ in 0..500 {
+            if std::fs::metadata(capture_log.path()).is_ok_and(|metadata| metadata.len() > 0) {
+                capture_started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(capture_started, "capture-pane did not start");
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            let committed = commands.get_mut("cmd-race").expect("race command");
+            committed.status = CommandStatus::Completed;
+            committed.exit_code = Some(0);
+            committed.output = Some("authoritative final".to_string());
+            committed.output_truncated = false;
+            committed.completed_at = Some(Instant::now());
+        }
+
+        let observed = status_task
+            .await
+            .expect("join status task")
+            .expect("status result")
+            .expect("race command");
+        assert_eq!(observed.status, CommandStatus::Completed);
+        assert_eq!(observed.output.as_deref(), Some("authoritative final"));
+        assert!(!observed.output_truncated);
     }
 
     #[test]
@@ -1183,6 +1490,67 @@ mod tests {
         let cmd = wait_until_terminal(&tracker, &id).await;
         assert_eq!(cmd.status, CommandStatus::Completed);
         assert_eq!(cmd.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn execute_command_side_channel_retries_output_until_done_marker_is_visible() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "1");
+        let count_file = NamedTempFile::new().expect("capture count");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let id = tracker
+            .execute_command("%1", "printf final", false, false, None, None)
+            .await
+            .expect("execute");
+
+        stub.set_var("TMUX_STUB_CAPTURE_COUNT_FILE", count_file.path());
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER", "2");
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_BEFORE",
+            format!("TMUX_MCP_START_{id}\nfinal output\n"),
+        );
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_AFTER_OUTPUT",
+            format!("TMUX_MCP_START_{id}\nfinal output\nTMUX_MCP_DONE_{id}_0\n"),
+        );
+
+        let cmd = wait_until_terminal(&tracker, &id).await;
+        assert_eq!(cmd.status, CommandStatus::Completed);
+        assert_eq!(cmd.exit_code, Some(0));
+        assert_eq!(cmd.output.as_deref(), Some("final output"));
+        assert!(!cmd.output_truncated);
+        assert_eq!(
+            std::fs::read_to_string(count_file.path())
+                .expect("read capture count")
+                .trim(),
+            "2"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_side_channel_keeps_status_but_marks_unclosed_output_truncated() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "1");
+        let capture_log = NamedTempFile::new().expect("capture log");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let id = tracker
+            .execute_command("%1", "printf tail", false, false, None, None)
+            .await
+            .expect("execute");
+
+        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            format!("TMUX_MCP_START_{id}\nbounded tail\n"),
+        );
+
+        let cmd = wait_until_terminal(&tracker, &id).await;
+        assert_eq!(cmd.status, CommandStatus::Completed);
+        assert_eq!(cmd.exit_code, Some(0));
+        assert_eq!(cmd.output.as_deref(), Some("bounded tail"));
+        assert!(cmd.output_truncated);
+        let logged = std::fs::read_to_string(capture_log.path()).expect("read capture log");
+        assert_eq!(logged.lines().count(), FINAL_OUTPUT_CAPTURE_ATTEMPTS);
     }
 
     #[tokio::test]
