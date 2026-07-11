@@ -23,11 +23,11 @@ Default release workflow targets:
 Local packaging smoke:
 
 ```bash
-VERSION=0.5.0 TARGET=x86_64-unknown-linux-musl scripts/build-release.sh
-VERSION=0.5.0 TARGET=x86_64-unknown-linux-musl scripts/package-release.sh
+VERSION=0.6.0 TARGET=x86_64-unknown-linux-musl scripts/build-release.sh
+VERSION=0.6.0 TARGET=x86_64-unknown-linux-musl scripts/package-release.sh
 
-VERSION=0.5.0 TARGET=aarch64-unknown-linux-musl scripts/build-release.sh
-VERSION=0.5.0 TARGET=aarch64-unknown-linux-musl scripts/package-release.sh
+VERSION=0.6.0 TARGET=aarch64-unknown-linux-musl scripts/build-release.sh
+VERSION=0.6.0 TARGET=aarch64-unknown-linux-musl scripts/package-release.sh
 ```
 
 Use `cross` for musl targets unless the matching musl C toolchain is installed on the host.
@@ -39,7 +39,7 @@ Package directory: `npm/tmux-mcp-rs`
 ```bash
 # after a GitHub Release exists for this version
 cd npm/tmux-mcp-rs
-npm version 0.5.0 --no-git-tag-version --allow-same-version
+npm version 0.6.0 --no-git-tag-version --allow-same-version
 npm publish --access public
 ```
 
@@ -76,11 +76,11 @@ Build and smoke (after GitHub Release assets for that version exist):
 
 ```bash
 docker build \
-  --build-arg TMUX_MCP_RS_VERSION=0.5.0 \
-  -t tmux-mcp-rs:0.5.0 .
+  --build-arg TMUX_MCP_RS_VERSION=0.6.0 \
+  -t tmux-mcp-rs:0.6.0 .
 
-docker run --rm tmux-mcp-rs:0.5.0 --version
-docker run --rm tmux-mcp-rs:0.5.0 --help
+docker run --rm tmux-mcp-rs:0.6.0 --version
+docker run --rm tmux-mcp-rs:0.6.0 --help
 ```
 
 stdio MCP client (keep stdin attached; mount a workspace if agents need files):
@@ -89,7 +89,7 @@ stdio MCP client (keep stdin attached; mount a workspace if agents need files):
 docker run --rm -i \
   -v "$PWD:/workspace" \
   --name tmux-mcp \
-  ghcr.io/bnomei/tmux-mcp:0.5.0
+  ghcr.io/bnomei/tmux-mcp:0.6.0
 ```
 
 Attach from another terminal while that container is running:
@@ -123,7 +123,7 @@ tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
 docker run --rm -i \
   -v /tmp/tmux-mcp-agent.sock:/tmp/tmux-mcp-agent.sock \
   --user "$(id -u):$(id -g)" \
-  ghcr.io/bnomei/tmux-mcp:0.5.0 \
+  ghcr.io/bnomei/tmux-mcp:0.6.0 \
   --socket /tmp/tmux-mcp-agent.sock
 
 # host

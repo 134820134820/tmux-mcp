@@ -77,7 +77,7 @@ The npm package is a thin wrapper: on first run it downloads the matching GitHub
 ### Docker
 
 ```bash
-docker run --rm ghcr.io/bnomei/tmux-mcp:0.5.0 --version
+docker run --rm ghcr.io/bnomei/tmux-mcp:0.6.0 --version
 ```
 
 The image is **self-contained**: it includes Alpine `tmux` 3.x and the prebuilt musl Linux binary. Sessions run **inside the container**, not on your desktop tmux server.
@@ -92,7 +92,7 @@ stdio MCP client (keep stdin attached):
 docker run --rm -i \
   --name tmux-mcp \
   -v "$PWD:/workspace" \
-  ghcr.io/bnomei/tmux-mcp:0.5.0
+  ghcr.io/bnomei/tmux-mcp:0.6.0
 ```
 
 Watch a session created inside the container:
@@ -111,7 +111,7 @@ tmux -S /tmp/tmux-mcp-agent.sock -f /dev/null new-session -d -s workspace
 docker run --rm -i \
   -v /tmp/tmux-mcp-agent.sock:/tmp/tmux-mcp-agent.sock \
   --user "$(id -u):$(id -g)" \
-  ghcr.io/bnomei/tmux-mcp:0.5.0 \
+  ghcr.io/bnomei/tmux-mcp:0.6.0 \
   --socket /tmp/tmux-mcp-agent.sock
 
 # host: attach as usual
