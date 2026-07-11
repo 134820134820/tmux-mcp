@@ -963,9 +963,13 @@ async fn capture_running_output(
     socket: Option<&str>,
 ) -> CapturedOutput {
     match capture_bracketed_output(pane_id, command_id, max_lines, socket).await {
-        Ok(BracketedOutput::Complete(output) | BracketedOutput::Open(output)) => CapturedOutput {
+        Ok(BracketedOutput::Complete(output)) => CapturedOutput {
             output: Some(output),
             truncated: false,
+        },
+        Ok(BracketedOutput::Open(output)) => CapturedOutput {
+            output: Some(output),
+            truncated: true,
         },
         Ok(BracketedOutput::MissingStart) | Err(_) => CapturedOutput::unavailable(),
     }
@@ -1374,7 +1378,7 @@ mod tests {
             .expect("partial status")
             .expect("partial command");
         assert_eq!(first.output.as_deref(), Some("first partial"));
-        assert!(!first.output_truncated);
+        assert_snapshot_output_incomplete(&first);
 
         stub.set_var(
             "TMUX_STUB_CAPTURE_OUTPUT",
