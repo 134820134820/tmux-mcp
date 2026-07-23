@@ -1,0 +1,1072 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>tmux MCP 控制台</title>
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --panel: #12161b;
+        --panel-2: #181d23;
+        --line: #28303a;
+        --text: #e9eef5;
+        --muted: #8d99a8;
+        --blue: #68a8ff;
+        --cyan: #4fd6c7;
+        --amber: #f4bd62;
+        --red: #ff7373;
+        --green: #73d59a;
+        --shadow: 0 16px 48px rgb(0 0 0 / 28%);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-width: 760px;
+        min-height: 100vh;
+        overflow: hidden;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 12% -10%, rgb(64 118 184 / 18%), transparent 32rem),
+          var(--bg);
+        font: 14px/1.45 Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+      }
+
+      button, input { font: inherit; }
+
+      button {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: var(--text);
+        background: var(--panel-2);
+        cursor: pointer;
+      }
+
+      button:hover { border-color: #465363; }
+      button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+      .app {
+        display: grid;
+        grid-template:
+          "header header" 64px
+          "sidebar main" calc(100vh - 64px) /
+          272px minmax(0, 1fr);
+      }
+
+      header {
+        grid-area: header;
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        padding: 0 20px;
+        border-bottom: 1px solid var(--line);
+        background: rgb(12 15 19 / 88%);
+        backdrop-filter: blur(16px);
+      }
+
+      .brand {
+        display: flex;
+        align-items: baseline;
+        gap: 9px;
+        min-width: 235px;
+      }
+
+      .brand strong { letter-spacing: -.02em; font-size: 17px; }
+      .brand span, .subtle { color: var(--muted); font-size: 12px; }
+
+      .mode-switch {
+        display: flex;
+        gap: 3px;
+        padding: 3px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #0b0e12;
+      }
+
+      .mode-switch button {
+        min-width: 88px;
+        padding: 7px 12px;
+        border: 0;
+        background: transparent;
+      }
+
+      .mode-switch button.active {
+        color: #07111d;
+        background: var(--blue);
+        box-shadow: 0 3px 14px rgb(104 168 255 / 24%);
+      }
+
+      .header-spacer { flex: 1; }
+
+      .connection {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--amber);
+      }
+
+      .status-dot.online { background: var(--green); box-shadow: 0 0 12px rgb(115 213 154 / 60%); }
+      .status-dot.offline { background: var(--red); }
+
+      .gate-control {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 7px 10px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--panel);
+      }
+
+      .gate-control input {
+        width: 36px;
+        height: 19px;
+        accent-color: var(--amber);
+      }
+
+      .log-button { padding: 8px 11px; }
+
+      aside {
+        grid-area: sidebar;
+        overflow: auto;
+        padding: 16px 12px 24px;
+        border-right: 1px solid var(--line);
+        background: rgb(15 18 22 / 90%);
+      }
+
+      .sidebar-heading {
+        display: flex;
+        justify-content: space-between;
+        padding: 0 8px 12px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: .09em;
+        text-transform: uppercase;
+      }
+
+      .tree-session { margin-bottom: 14px; }
+
+      .tree-session-name {
+        padding: 5px 8px;
+        color: #b8c3d1;
+        font-weight: 650;
+      }
+
+      .tree-window-name {
+        padding: 4px 8px 3px 18px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .pane-button {
+        position: relative;
+        display: grid;
+        grid-template-columns: 1fr auto;
+        width: 100%;
+        margin: 2px 0;
+        padding: 7px 9px 7px 29px;
+        border-color: transparent;
+        text-align: left;
+        background: transparent;
+      }
+
+      .pane-button:hover { background: var(--panel-2); }
+
+      .pane-button.selected {
+        border-color: rgb(104 168 255 / 30%);
+        background: rgb(104 168 255 / 12%);
+      }
+
+      .pane-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .pane-id { color: var(--muted); font: 11px ui-monospace, monospace; }
+
+      .activity-dot {
+        position: absolute;
+        left: 15px;
+        top: 13px;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--cyan);
+        box-shadow: 0 0 10px rgb(79 214 199 / 65%);
+      }
+
+      main {
+        grid-area: main;
+        min-width: 0;
+        overflow: hidden;
+      }
+
+      .view {
+        display: none;
+        height: 100%;
+      }
+
+      .view.active { display: flex; flex-direction: column; }
+
+      .view-heading {
+        display: flex;
+        align-items: center;
+        min-height: 58px;
+        gap: 12px;
+        padding: 0 22px;
+        border-bottom: 1px solid var(--line);
+        background: rgb(18 22 27 / 78%);
+      }
+
+      .view-heading h1 {
+        overflow: hidden;
+        margin: 0;
+        font-size: 15px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .view-heading .pane-target {
+        color: var(--muted);
+        font: 12px ui-monospace, "Cascadia Mono", monospace;
+      }
+
+      .interference {
+        display: none;
+        margin-left: auto;
+        padding: 5px 9px;
+        border: 1px solid rgb(244 189 98 / 35%);
+        border-radius: 7px;
+        color: var(--amber);
+        background: rgb(244 189 98 / 8%);
+        font-size: 12px;
+      }
+
+      .interference.visible { display: block; }
+
+      #message-list {
+        flex: 1;
+        overflow: auto;
+        padding: 18px 22px 72px;
+      }
+
+      .empty-state {
+        display: grid;
+        place-items: center;
+        min-height: 50%;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .message-card {
+        max-width: 1000px;
+        margin: 0 auto 13px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+        box-shadow: 0 8px 26px rgb(0 0 0 / 12%);
+      }
+
+      .message-card.human { border-color: rgb(79 214 199 / 32%); }
+      .message-card.failed, .message-card.rejected { border-color: rgb(255 115 115 / 38%); }
+
+      .card-header {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 10px 13px;
+        border-bottom: 1px solid var(--line);
+        background: #151a20;
+      }
+
+      .source-pill, .status-pill {
+        padding: 2px 7px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+      }
+
+      .source-pill { color: #09131a; background: var(--cyan); }
+      .source-pill.agent { background: var(--blue); }
+      .status-pill { margin-left: auto; color: var(--muted); background: #20262e; }
+      .card-time { color: var(--muted); font-size: 11px; }
+
+      .card-body { padding: 13px; }
+
+      .card-label {
+        margin: 0 0 6px;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 750;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+      }
+
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font: 13px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      }
+
+      .command-text, .input-text, .result-text {
+        padding: 10px 11px;
+        border: 1px solid #242c35;
+        border-radius: 8px;
+        background: #0c1014;
+      }
+
+      .result-block { margin-top: 12px; }
+
+      .command-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin: 10px 1px 0;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .truncated { color: var(--amber); }
+
+      .terminal-wrap {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        padding: 14px;
+        background: #07090b;
+      }
+
+      #terminal-snapshot {
+        width: 100%;
+        height: 100%;
+        overflow: auto;
+        padding: 16px;
+        border: 1px solid #222a32;
+        border-radius: 10px;
+        color: #d9e1ea;
+        background: #050607;
+        white-space: pre;
+        overflow-wrap: normal;
+        box-shadow: inset 0 0 42px rgb(0 0 0 / 45%);
+        cursor: text;
+        user-select: text;
+      }
+
+      .terminal-hint {
+        position: absolute;
+        right: 28px;
+        bottom: 25px;
+        padding: 5px 8px;
+        border-radius: 6px;
+        color: #738090;
+        background: rgb(11 14 18 / 88%);
+        font-size: 11px;
+        pointer-events: none;
+      }
+
+      dialog {
+        width: min(720px, calc(100vw - 48px));
+        max-height: min(760px, calc(100vh - 48px));
+        overflow: auto;
+        padding: 0;
+        border: 1px solid #37414d;
+        border-radius: 14px;
+        color: var(--text);
+        background: var(--panel);
+        box-shadow: var(--shadow);
+      }
+
+      dialog::backdrop { background: rgb(0 0 0 / 66%); backdrop-filter: blur(3px); }
+
+      .dialog-header {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 15px 17px;
+        border-bottom: 1px solid var(--line);
+        background: #161b21;
+      }
+
+      .dialog-header h2 { margin: 0; font-size: 16px; }
+      .dialog-header button { margin-left: auto; padding: 6px 10px; }
+      .dialog-body { padding: 17px; }
+
+      .approval-summary {
+        display: grid;
+        grid-template-columns: 110px 1fr;
+        gap: 8px 13px;
+        margin-bottom: 14px;
+      }
+
+      .approval-summary dt { color: var(--muted); }
+      .approval-summary dd { margin: 0; overflow-wrap: anywhere; }
+
+      .approval-arguments, .log-entry {
+        padding: 11px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #0c1014;
+      }
+
+      .dialog-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 9px;
+        padding: 0 17px 17px;
+      }
+
+      .dialog-actions button { min-width: 92px; padding: 9px 13px; }
+      .approve { color: #07120c; background: var(--green); }
+      .reject { color: white; background: #9b3f45; }
+
+      .log-entry { margin-bottom: 9px; }
+      .log-entry-head { display: flex; gap: 8px; margin-bottom: 7px; color: var(--muted); font-size: 11px; }
+      .log-entry-head strong { color: var(--text); }
+
+      .error-bar {
+        display: none;
+        padding: 8px 22px;
+        border-bottom: 1px solid rgb(255 115 115 / 38%);
+        color: #ffb1b1;
+        background: rgb(120 33 39 / 24%);
+        font-size: 12px;
+      }
+
+      .error-bar.visible { display: block; }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div class="brand">
+          <strong>tmux MCP</strong>
+          <span>本机控制台</span>
+        </div>
+        <div class="mode-switch" aria-label="显示模式">
+          <button id="mode-messages" class="active" type="button">消息</button>
+          <button id="mode-interactive" type="button">交互</button>
+        </div>
+        <div class="header-spacer"></div>
+        <div class="connection">
+          <span id="connection-dot" class="status-dot"></span>
+          <span id="connection-text">连接中</span>
+        </div>
+        <label class="gate-control" title="开启后，AI 的修改操作必须先得到批准">
+          <span>Gate</span>
+          <input id="gate-toggle" type="checkbox" aria-label="Gate 审批">
+        </label>
+        <button id="open-operation-log" class="log-button" type="button">操作日志</button>
+      </header>
+
+      <aside>
+        <div class="sidebar-heading">
+          <span>窗口与 Pane</span>
+          <span id="pane-count">0</span>
+        </div>
+        <nav id="pane-tree" aria-label="tmux 窗口与 pane"></nav>
+      </aside>
+
+      <main>
+        <div id="error-bar" class="error-bar"></div>
+
+        <section id="messages-view" class="view active">
+          <div class="view-heading">
+            <h1 id="messages-title">选择一个 pane</h1>
+            <span id="messages-target" class="pane-target"></span>
+            <span id="messages-interference" class="interference">AI 正在这个 pane 运行命令，人工输入可能造成干扰</span>
+          </div>
+          <div id="message-list"></div>
+        </section>
+
+        <section id="interactive-view" class="view">
+          <div class="view-heading">
+            <h1 id="interactive-title">选择一个 pane</h1>
+            <span id="interactive-target" class="pane-target"></span>
+            <span id="interactive-interference" class="interference">AI 正在这个 pane 运行命令，人工输入可能造成干扰</span>
+          </div>
+          <div class="terminal-wrap">
+            <pre id="terminal-snapshot" tabindex="0" aria-label="当前 tmux pane，可直接键入"></pre>
+            <span class="terminal-hint">点击后直接输入 · 每 250ms 刷新 · 800ms 内连续输入合并记录</span>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="approval-dialog">
+      <div class="dialog-header">
+        <h2>请求批准</h2>
+        <span id="approval-queue-count" class="subtle"></span>
+      </div>
+      <div class="dialog-body">
+        <dl id="approval-summary" class="approval-summary"></dl>
+        <p class="card-label">精确参数</p>
+        <pre id="approval-arguments" class="approval-arguments"></pre>
+      </div>
+      <div class="dialog-actions">
+        <button id="approval-reject" class="reject" type="button">拒绝</button>
+        <button id="approval-approve" class="approve" type="button">批准</button>
+      </div>
+    </dialog>
+
+    <dialog id="operation-log">
+      <div class="dialog-header">
+        <h2>操作日志</h2>
+        <button id="close-operation-log" type="button">关闭</button>
+      </div>
+      <div id="operation-log-list" class="dialog-body"></div>
+    </dialog>
+
+    <script>
+      "use strict";
+
+      const controlToken = "__TMUX_CONTROL_TOKEN__";
+      const byId = (id) => document.getElementById(id);
+      const elements = {
+        modeMessages: byId("mode-messages"),
+        modeInteractive: byId("mode-interactive"),
+        messagesView: byId("messages-view"),
+        interactiveView: byId("interactive-view"),
+        paneTree: byId("pane-tree"),
+        paneCount: byId("pane-count"),
+        messageList: byId("message-list"),
+        terminal: byId("terminal-snapshot"),
+        gate: byId("gate-toggle"),
+        connectionDot: byId("connection-dot"),
+        connectionText: byId("connection-text"),
+        error: byId("error-bar"),
+        messagesTitle: byId("messages-title"),
+        messagesTarget: byId("messages-target"),
+        interactiveTitle: byId("interactive-title"),
+        interactiveTarget: byId("interactive-target"),
+        messagesInterference: byId("messages-interference"),
+        interactiveInterference: byId("interactive-interference"),
+        approval: byId("approval-dialog"),
+        approvalCount: byId("approval-queue-count"),
+        approvalSummary: byId("approval-summary"),
+        approvalArguments: byId("approval-arguments"),
+        operationLog: byId("operation-log"),
+        operationList: byId("operation-log-list")
+      };
+
+      let mode = localStorage.getItem("tmux-mcp-mode") === "interactive" ? "interactive" : "messages";
+      let selectedPane = localStorage.getItem("tmux-mcp-pane") || "";
+      let latestState = null;
+      let previousActivity = {};
+      let activityInitialized = false;
+      let unseenPanes = new Set();
+      let stateBusy = false;
+      let captureBusy = false;
+      let keyQueue = Promise.resolve();
+
+      function node(tag, className, text) {
+        const value = document.createElement(tag);
+        if (className) value.className = className;
+        if (text !== undefined) value.textContent = String(text);
+        return value;
+      }
+
+      function clear(value) {
+        while (value.firstChild) value.removeChild(value.firstChild);
+      }
+
+      async function api(path, options = {}) {
+        const headers = new Headers(options.headers || {});
+        headers.set("x-tmux-mcp-token", controlToken);
+        if (options.body !== undefined) headers.set("content-type", "application/json");
+        const response = await fetch(path, {
+          method: options.method || "GET",
+          headers,
+          body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          cache: "no-store"
+        });
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || `HTTP ${response.status}`);
+        }
+        return response.json();
+      }
+
+      function setConnection(online, text) {
+        elements.connectionDot.classList.toggle("online", online);
+        elements.connectionDot.classList.toggle("offline", !online);
+        elements.connectionText.textContent = text;
+      }
+
+      function showError(message) {
+        elements.error.textContent = message || "";
+        elements.error.classList.toggle("visible", Boolean(message));
+      }
+
+      function flattenPanes(topology) {
+        const panes = [];
+        for (const sessionNode of topology?.sessions || []) {
+          for (const windowNode of sessionNode.windows || []) {
+            for (const pane of windowNode.panes || []) {
+              panes.push({
+                pane,
+                window: windowNode.window,
+                session: sessionNode.session
+              });
+            }
+          }
+        }
+        return panes;
+      }
+
+      function choosePane(panes) {
+        if (panes.some((item) => item.pane.id === selectedPane)) return false;
+        const preferred = panes.find((item) => item.pane.active && item.window.active) || panes[0];
+        selectedPane = preferred?.pane.id || "";
+        if (selectedPane) localStorage.setItem("tmux-mcp-pane", selectedPane);
+        return true;
+      }
+
+      function updateActivity(activity) {
+        if (activityInitialized) {
+          for (const [paneId, timestamp] of Object.entries(activity || {})) {
+            if ((previousActivity[paneId] || 0) < timestamp && paneId !== selectedPane) {
+              unseenPanes.add(paneId);
+            }
+          }
+        }
+        previousActivity = activity || {};
+        activityInitialized = true;
+        unseenPanes.delete(selectedPane);
+      }
+
+      function selectPane(paneId) {
+        if (selectedPane === paneId) return;
+        selectedPane = paneId;
+        unseenPanes.delete(paneId);
+        localStorage.setItem("tmux-mcp-pane", paneId);
+        elements.terminal.textContent = "";
+        renderTopology(latestState?.topology);
+        void refreshState();
+        if (mode === "interactive") {
+          elements.terminal.focus();
+          void refreshCapture();
+        }
+      }
+
+      function renderTopology(topology) {
+        clear(elements.paneTree);
+        let count = 0;
+        for (const sessionNode of topology?.sessions || []) {
+          const sessionWrap = node("section", "tree-session");
+          sessionWrap.appendChild(node("div", "tree-session-name", sessionNode.session.name));
+          for (const windowNode of sessionNode.windows || []) {
+            const windowLabel = node(
+              "div",
+              "tree-window-name",
+              `${windowNode.window.name} · ${windowNode.window.id}`
+            );
+            sessionWrap.appendChild(windowLabel);
+            for (const pane of windowNode.panes || []) {
+              count += 1;
+              const button = node("button", "pane-button");
+              button.type = "button";
+              button.classList.toggle("selected", pane.id === selectedPane);
+              button.title = pane.title || pane.id;
+              if (unseenPanes.has(pane.id)) button.appendChild(node("span", "activity-dot"));
+              button.appendChild(node("span", "pane-title", pane.title || "未命名 pane"));
+              button.appendChild(node("span", "pane-id", pane.id));
+              button.addEventListener("click", () => selectPane(pane.id));
+              sessionWrap.appendChild(button);
+            }
+          }
+          elements.paneTree.appendChild(sessionWrap);
+        }
+        elements.paneCount.textContent = String(count);
+        if (!count) {
+          elements.paneTree.appendChild(node("p", "empty-state", "没有可用的 tmux pane"));
+        }
+      }
+
+      function selectedPaneInfo() {
+        return flattenPanes(latestState?.topology).find((item) => item.pane.id === selectedPane);
+      }
+
+      function renderHeading(running) {
+        const info = selectedPaneInfo();
+        const title = info
+          ? `${info.session.name} / ${info.window.name} / ${info.pane.title || "pane"}`
+          : "选择一个 pane";
+        elements.messagesTitle.textContent = title;
+        elements.interactiveTitle.textContent = title;
+        elements.messagesTarget.textContent = selectedPane;
+        elements.interactiveTarget.textContent = selectedPane;
+        elements.messagesInterference.classList.toggle("visible", running);
+        elements.interactiveInterference.classList.toggle("visible", running);
+      }
+
+      function formatTime(timestamp) {
+        if (!timestamp) return "";
+        return new Intl.DateTimeFormat("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit"
+        }).format(new Date(timestamp));
+      }
+
+      function humanStatus(status) {
+        const labels = {
+          requested: "已请求",
+          waiting_approval: "等待批准",
+          approved: "已批准",
+          running: "运行中",
+          completed: "完成",
+          failed: "失败",
+          rejected: "已拒绝",
+          incomplete: "未完成"
+        };
+        return labels[status] || status;
+      }
+
+      function displayInput(record) {
+        const args = record.arguments || {};
+        const special = {
+          "send-cancel": "Ctrl-C",
+          "send-eof": "Ctrl-D",
+          "send-escape": "Escape",
+          "send-enter": "Enter",
+          "send-tab": "Tab",
+          "send-backspace": "Backspace",
+          "send-up": "↑",
+          "send-down": "↓",
+          "send-left": "←",
+          "send-right": "→",
+          "send-page-up": "Page Up",
+          "send-page-down": "Page Down",
+          "send-home": "Home",
+          "send-end": "End"
+        };
+        if (special[record.tool]) return special[record.tool];
+        if (typeof args.text === "string") return args.text;
+        if (typeof args.keys === "string") return args.keys;
+        if (typeof args.content === "string") return args.content;
+        if (typeof args.key === "string") return args.key;
+        if (typeof args.hex === "string") return args.hex;
+        return JSON.stringify(args, null, 2);
+      }
+
+      function genericResult(record) {
+        if (record.result === undefined || record.result === null) return "";
+        return typeof record.result === "string"
+          ? record.result
+          : JSON.stringify(record.result, null, 2);
+      }
+
+      function appendLabeledPre(parent, label, text, className) {
+        const block = node("div", "result-block");
+        block.appendChild(node("p", "card-label", label));
+        block.appendChild(node("pre", className, text));
+        parent.appendChild(block);
+      }
+
+      function renderCard(record) {
+        const card = node("article", `message-card ${record.status || ""}`);
+        if (record.source === "你") card.classList.add("human");
+
+        const header = node("div", "card-header");
+        const source = node("span", "source-pill", record.source || "未知来源");
+        if (record.source !== "你") source.classList.add("agent");
+        header.appendChild(source);
+        header.appendChild(node("strong", "", record.tool));
+        header.appendChild(node("span", "card-time", formatTime(record.updatedAtMs)));
+        header.appendChild(node("span", "status-pill", humanStatus(record.status)));
+        card.appendChild(header);
+
+        const body = node("div", "card-body");
+        if (record.kind === "command") {
+          const snapshot = record.commandSnapshot || {};
+          const command = snapshot.command || record.arguments?.command || "";
+          body.appendChild(node("p", "card-label", "命令"));
+          body.appendChild(node("pre", "command-text", command));
+          const meta = node("div", "command-meta");
+          meta.appendChild(node("span", "", `退出码 ${snapshot.exitCode ?? "未知"}`));
+          meta.appendChild(node("span", "", `耗时 ${snapshot.elapsedMs ?? 0}ms`));
+          meta.appendChild(node("span", "", `状态 ${snapshot.status || record.status}`));
+          if (snapshot.outputTruncated) {
+            meta.appendChild(node("span", "truncated", "输出不完整"));
+          }
+          body.appendChild(meta);
+          appendLabeledPre(
+            body,
+            snapshot.outputTruncated ? "输出（已截断）" : "完整输出",
+            snapshot.output ?? snapshot.reason ?? "",
+            "result-text"
+          );
+        } else {
+          body.appendChild(node("p", "card-label", record.source === "你" ? "你的输入" : "AI 输入"));
+          body.appendChild(node("pre", "input-text", displayInput(record)));
+          const result = genericResult(record);
+          if (result) appendLabeledPre(body, "结果", result, "result-text");
+        }
+        card.appendChild(body);
+        return card;
+      }
+
+      function renderMessages(records) {
+        clear(elements.messageList);
+        const running = records.some(
+          (record) => record.kind === "command" && ["requested", "approved", "running"].includes(record.status)
+        );
+        renderHeading(running);
+        const visible = records.filter(
+          (record) =>
+            record.kind !== "command" ||
+            ["completed", "failed", "rejected", "incomplete"].includes(record.status)
+        );
+        if (!selectedPane) {
+          elements.messageList.appendChild(node("div", "empty-state", "从左侧选择一个 pane"));
+          return;
+        }
+        if (!visible.length) {
+          elements.messageList.appendChild(
+            node("div", "empty-state", running ? "命令正在运行，完成后显示干净结果" : "这个 pane 还没有消息")
+          );
+          return;
+        }
+        for (const record of visible) elements.messageList.appendChild(renderCard(record));
+        elements.messageList.scrollTop = elements.messageList.scrollHeight;
+      }
+
+      function appendDefinition(list, term, value) {
+        list.appendChild(node("dt", "", term));
+        list.appendChild(node("dd", "", value || "—"));
+      }
+
+      function approvalTarget(record) {
+        const target = record.target || {};
+        const paneIds = target.paneIds || [];
+        const resolved = flattenPanes(latestState?.topology).find((item) =>
+          paneIds.includes(item.pane.id)
+        );
+        return {
+          session: resolved
+            ? `${resolved.session.name} · ${resolved.session.id}`
+            : target.sessionId,
+          window: resolved
+            ? `${resolved.window.name} · ${resolved.window.id}`
+            : target.windowId,
+          pane: resolved
+            ? `${resolved.pane.title || "pane"} · ${resolved.pane.id}`
+            : paneIds.join(", ")
+        };
+      }
+
+      function renderApproval(pending) {
+        const record = pending?.[0];
+        if (!record) {
+          if (elements.approval.open) elements.approval.close();
+          return;
+        }
+        elements.approvalCount.textContent =
+          pending.length > 1 ? `另有 ${pending.length - 1} 个请求` : "";
+        clear(elements.approvalSummary);
+        const target = approvalTarget(record);
+        appendDefinition(elements.approvalSummary, "来源", record.source);
+        appendDefinition(elements.approvalSummary, "工具", record.tool);
+        appendDefinition(elements.approvalSummary, "Session", target.session);
+        appendDefinition(elements.approvalSummary, "Window", target.window);
+        appendDefinition(elements.approvalSummary, "Pane", target.pane);
+        elements.approvalArguments.textContent = JSON.stringify(record.arguments || {}, null, 2);
+        elements.approval.dataset.requestId = record.id;
+        if (!elements.approval.open) elements.approval.showModal();
+      }
+
+      function renderOperations(records) {
+        clear(elements.operationList);
+        if (!records?.length) {
+          elements.operationList.appendChild(node("div", "empty-state", "还没有操作记录"));
+          return;
+        }
+        for (const record of [...records].reverse()) {
+          const entry = node("article", "log-entry");
+          const head = node("div", "log-entry-head");
+          head.appendChild(node("strong", "", record.source));
+          head.appendChild(node("span", "", record.tool));
+          head.appendChild(node("span", "", formatTime(record.updatedAtMs)));
+          head.appendChild(node("span", "", humanStatus(record.status)));
+          entry.appendChild(head);
+          entry.appendChild(node("pre", "", JSON.stringify(record.arguments || {}, null, 2)));
+          elements.operationList.appendChild(entry);
+        }
+      }
+
+      async function refreshState() {
+        if (stateBusy) return;
+        stateBusy = true;
+        const requestedPane = selectedPane;
+        try {
+          const query = requestedPane ? `?paneId=${encodeURIComponent(requestedPane)}` : "";
+          const state = await api(`/api/state${query}`);
+          latestState = state;
+          const panes = flattenPanes(state.topology);
+          const selectionChanged = choosePane(panes);
+          updateActivity(state.activity);
+          renderTopology(state.topology);
+          elements.gate.checked = Boolean(state.gateEnabled);
+          renderOperations(state.operations);
+          renderApproval(state.pending);
+          setConnection(true, "已连接");
+          showError(state.topologyError || "");
+          if (!selectionChanged && requestedPane === selectedPane) {
+            renderMessages(state.messages || []);
+          } else {
+            renderMessages([]);
+            setTimeout(() => void refreshState(), 0);
+          }
+        } catch (error) {
+          setConnection(false, "控制中心断线");
+          showError(error.message);
+        } finally {
+          stateBusy = false;
+        }
+      }
+
+      async function refreshCapture() {
+        if (mode !== "interactive" || !selectedPane || captureBusy) return;
+        captureBusy = true;
+        try {
+          const result = await api(`/api/panes/${encodeURIComponent(selectedPane)}/capture`);
+          if (mode === "interactive") {
+            elements.terminal.textContent = result.text || "";
+            elements.terminal.scrollTop = elements.terminal.scrollHeight;
+          }
+        } catch (error) {
+          showError(error.message);
+        } finally {
+          captureBusy = false;
+        }
+      }
+
+      function sendKey(key, literal) {
+        if (!selectedPane) return;
+        const paneId = selectedPane;
+        keyQueue = keyQueue
+          .then(() =>
+            api(`/api/panes/${encodeURIComponent(paneId)}/keys`, {
+              method: "POST",
+              body: { key, literal }
+            })
+          )
+          .catch((error) => showError(error.message));
+      }
+
+      function setMode(nextMode) {
+        mode = nextMode;
+        localStorage.setItem("tmux-mcp-mode", mode);
+        const interactive = mode === "interactive";
+        elements.modeMessages.classList.toggle("active", !interactive);
+        elements.modeInteractive.classList.toggle("active", interactive);
+        elements.messagesView.classList.toggle("active", !interactive);
+        elements.interactiveView.classList.toggle("active", interactive);
+        if (interactive) {
+          elements.terminal.focus();
+          void refreshCapture();
+        }
+      }
+
+      elements.modeMessages.addEventListener("click", () => setMode("messages"));
+      elements.modeInteractive.addEventListener("click", () => setMode("interactive"));
+
+      elements.gate.addEventListener("change", async () => {
+        const enabled = elements.gate.checked;
+        try {
+          await api("/api/gate", { method: "PUT", body: { enabled } });
+          await refreshState();
+        } catch (error) {
+          elements.gate.checked = !enabled;
+          showError(error.message);
+        }
+      });
+
+      async function decideApproval(approved) {
+        const id = elements.approval.dataset.requestId;
+        if (!id) return;
+        try {
+          await api(`/api/approvals/${encodeURIComponent(id)}`, {
+            method: "PUT",
+            body: { approved }
+          });
+          await refreshState();
+        } catch (error) {
+          showError(error.message);
+        }
+      }
+
+      byId("approval-approve").addEventListener("click", () => void decideApproval(true));
+      byId("approval-reject").addEventListener("click", () => void decideApproval(false));
+      byId("open-operation-log").addEventListener("click", () => elements.operationLog.showModal());
+      byId("close-operation-log").addEventListener("click", () => elements.operationLog.close());
+
+      const specialKeys = {
+        Enter: "Enter",
+        ArrowUp: "Up",
+        ArrowDown: "Down",
+        ArrowLeft: "Left",
+        ArrowRight: "Right",
+        Tab: "Tab",
+        Escape: "Escape",
+        Backspace: "BSpace",
+        PageUp: "PageUp",
+        PageDown: "PageDown",
+        Home: "Home",
+        End: "End"
+      };
+
+      elements.terminal.addEventListener("keydown", (event) => {
+        if (event.ctrlKey && !event.altKey && !event.metaKey) {
+          const key = event.key.toLowerCase();
+          if (key === "c" || key === "d") {
+            event.preventDefault();
+            sendKey(`C-${key}`, false);
+          }
+          return;
+        }
+        const special = specialKeys[event.key];
+        if (special) {
+          event.preventDefault();
+          sendKey(special, false);
+          return;
+        }
+        if (!event.altKey && !event.metaKey && event.key.length === 1) {
+          event.preventDefault();
+          sendKey(event.key, true);
+        }
+      });
+
+      elements.terminal.addEventListener("paste", (event) => {
+        const text = event.clipboardData?.getData("text");
+        if (text) {
+          event.preventDefault();
+          sendKey(text, true);
+        }
+      });
+
+      setMode(mode);
+      void refreshState();
+      setInterval(() => void refreshState(), 750);
+      setInterval(() => void refreshCapture(), 250);
+    </script>
+  </body>
+</html>

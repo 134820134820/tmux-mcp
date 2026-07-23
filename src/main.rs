@@ -5,6 +5,7 @@
 //! Ctrl-C / SIGTERM.
 
 mod commands;
+mod control;
 mod errors;
 mod security;
 mod server;
@@ -12,7 +13,9 @@ mod server;
 mod test_support;
 mod tmux;
 mod types;
+mod web;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -20,6 +23,9 @@ use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::commands::{CommandTracker, TrackingConfig};
+use crate::control::{
+    default_state_dir, load_or_create_token, validate_web_url, ControlClient, StatePaths,
+};
 use crate::security::{ConfigFile, SearchConfig, SecurityPolicy};
 use crate::server::TmuxMcpServer;
 use crate::types::ShellType;
@@ -46,6 +52,22 @@ struct Cli {
     /// Remote tmux via OpenSSH (`user@host` or extra ssh argv). Overrides config/env.
     #[arg(short = 'r', long = "ssh")]
     ssh: Option<String>,
+
+    /// Run the local web control center instead of the stdio MCP server.
+    #[arg(long)]
+    web: bool,
+
+    /// Loopback address for the local web control center.
+    #[arg(long, default_value = "127.0.0.1:38473")]
+    web_bind: SocketAddr,
+
+    /// Local web control center used to record and authorize stdio MCP actions.
+    #[arg(long)]
+    web_url: Option<String>,
+
+    /// Source name shown in the web control center (defaults to `mcp-<pid>`).
+    #[arg(long)]
+    client_name: Option<String>,
 }
 
 /// Map CLI/`config.toml` shell names to the tracker dialect (case-insensitive).
@@ -98,6 +120,21 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    if let Err(error) = crate::web::validate_bind_address(cli.web_bind) {
+        eprintln!("Error parsing web bind address: {error}");
+        std::process::exit(1);
+    }
+    if let Some(url) = &cli.web_url {
+        if let Err(error) = validate_web_url(url) {
+            eprintln!("Error parsing web URL: {error}");
+            std::process::exit(1);
+        }
+    }
+    if cli.web && cli.web_url.is_some() {
+        eprintln!("Error: --web and --web-url select different process modes");
+        std::process::exit(1);
+    }
 
     if let Some(socket) = &cli.socket {
         std::env::set_var("TMUX_MCP_SOCKET", socket);
@@ -187,12 +224,65 @@ async fn main() {
         }
     }
 
+    let state_paths = StatePaths::new(default_state_dir());
+    if cli.web {
+        let token = match load_or_create_token(&state_paths) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("Error creating web control token: {error}");
+                std::process::exit(1);
+            }
+        };
+        let hub = match crate::web::HubState::open(state_paths) {
+            Ok(hub) => hub,
+            Err(error) => {
+                eprintln!("Error opening web control state: {error}");
+                std::process::exit(1);
+            }
+        };
+        let socket = std::env::var("TMUX_MCP_SOCKET")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let app = crate::web::build_router(hub, token, security_policy, socket);
+        let listener = match tokio::net::TcpListener::bind(cli.web_bind).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("Failed to bind web control center: {error}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!("tmux MCP control center: http://{}", cli.web_bind);
+        if let Err(error) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        {
+            eprintln!("Web control center error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let tracker = if cli.config.is_some() {
         CommandTracker::with_tracking(shell_type, tracking_config)
     } else {
         CommandTracker::new(shell_type)
     };
-    let server = TmuxMcpServer::new_with_search(tracker, security_policy, search_config);
+    let control = match cli.web_url.as_deref() {
+        Some(url) => {
+            let source = cli
+                .client_name
+                .unwrap_or_else(|| format!("mcp-{}", std::process::id()));
+            match ControlClient::new(url, source, state_paths) {
+                Ok(control) => Some(control),
+                Err(error) => {
+                    eprintln!("Error creating web control client: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+    let server = TmuxMcpServer::new_with_control(tracker, security_policy, search_config, control);
 
     tracing::info!("Starting tmux-mcp-rs server with stdio transport");
 

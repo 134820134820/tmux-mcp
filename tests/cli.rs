@@ -41,6 +41,40 @@ fn run_with_stdin_closed(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn cli_help_lists_web_control_options() {
+    let output = command().arg("--help").output().expect("run binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--web"));
+    assert!(stdout.contains("--web-bind"));
+    assert!(stdout.contains("--web-url"));
+    assert!(stdout.contains("--client-name"));
+}
+
+#[test]
+fn cli_rejects_non_loopback_web_bind() {
+    let output = command()
+        .args(["--web", "--web-bind", "0.0.0.0:38473"])
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be loopback"));
+}
+
+#[test]
+fn cli_rejects_non_loopback_web_url() {
+    let output = command()
+        .args(["--web-url", "http://example.com:38473"])
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("loopback host"));
+}
+
+#[test]
 fn cli_rejects_missing_config() {
     let output = command()
         .args(["--config", "does-not-exist.toml"])
