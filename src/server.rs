@@ -109,6 +109,7 @@ impl Annotated {
 }
 
 use crate::commands::{CommandEventKind, CommandTracker};
+use crate::control::{ActionRecord, ControlClient, GateDecision};
 use crate::security::{SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
@@ -127,6 +128,7 @@ pub struct TmuxMcpServer {
     policy: Arc<SecurityPolicy>,
     search: SearchConfig,
     router: ToolRouter<Self>,
+    control: Option<ControlClient>,
     /// Connected MCP peer used for resource list/updated notifications.
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
     /// Resource URIs currently subscribed by the client.
@@ -808,6 +810,15 @@ impl TmuxMcpServer {
         policy: SecurityPolicy,
         search: SearchConfig,
     ) -> Self {
+        Self::new_with_control(tracker, policy, search, None)
+    }
+
+    pub fn new_with_control(
+        tracker: CommandTracker,
+        policy: SecurityPolicy,
+        search: SearchConfig,
+        control: Option<ControlClient>,
+    ) -> Self {
         #[allow(unused_mut)]
         let mut router = Self::tool_router();
         #[cfg(feature = "interactive")]
@@ -866,11 +877,41 @@ impl TmuxMcpServer {
             });
         }
 
+        if let Some(control) = control.clone() {
+            let mut events = tracker.subscribe_events();
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event)
+                            if event.kind == CommandEventKind::Terminal
+                                || (event.kind == CommandEventKind::Updated
+                                    && event.status.is_terminal()) =>
+                        {
+                            if let Some(execution) = tracker.get_command(&event.command_id).await {
+                                let snapshot = CommandSnapshot::from_execution(&execution, None);
+                                let recorded = control.complete_command(snapshot).await.is_ok();
+                                if recorded && event.kind == CommandEventKind::Updated {
+                                    control.forget_command(&event.command_id).await;
+                                }
+                            }
+                        }
+                        Ok(event) if event.kind == CommandEventKind::Evicted => {
+                            control.forget_command(&event.command_id).await;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         Self {
             tracker,
             policy: Arc::new(policy),
             search,
             router,
+            control,
             peer,
             subscriptions,
         }
@@ -894,6 +935,14 @@ impl TmuxMcpServer {
                 router.remove_route(&tool_name);
             }
         }
+    }
+
+    fn tool_is_read_only(&self, name: &str) -> bool {
+        self.router
+            .get(name)
+            .and_then(|tool| tool.annotations.as_ref())
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false)
     }
 
     fn resource_template(
@@ -3275,6 +3324,88 @@ impl TmuxMcpServer {
 
 #[rmcp::tool_handler(router = self.router)]
 impl rmcp::ServerHandler for TmuxMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let mut action: Option<ActionRecord> = None;
+        if let Some(control) = &self.control {
+            if !self.tool_is_read_only(&request.name) {
+                let arguments = request
+                    .arguments
+                    .clone()
+                    .map(serde_json::Value::Object)
+                    .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+                let mut record = control.action(request.name.to_string(), arguments);
+                match control.authorize(&record).await {
+                    Ok(GateDecision::Approved) => {
+                        record.mark_running();
+                        let _ = control.record(&record).await;
+                        action = Some(record);
+                    }
+                    Ok(GateDecision::Rejected) => {
+                        record.mark_rejected();
+                        let _ = control.record(&record).await;
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "{} rejected by Gate",
+                            request.name
+                        ))]));
+                    }
+                    Err(error) => {
+                        record.mark_failed(Some(serde_json::json!({"error": error})));
+                        let _ = control.record(&record).await;
+                        return Ok(CallToolResult::error(vec![Content::text(error)]));
+                    }
+                }
+            }
+        }
+
+        let tool_name = request.name.to_string();
+        let tool_call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let result = self.router.call(tool_call).await;
+
+        if let (Some(control), Some(mut record)) = (&self.control, action) {
+            if let Ok(tool_result) = &result {
+                if tool_name == "execute-command" && tool_result.is_error != Some(true) {
+                    if let Some(command_id) = tool_result
+                        .structured_content
+                        .as_ref()
+                        .and_then(|value| value.get("commandId"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let command_id = command_id.to_string();
+                        let _ = control.track_command(&command_id, record).await;
+                        if let Some(execution) = self.tracker.get_command(&command_id).await {
+                            if execution.status.is_terminal() {
+                                let presentation_ready =
+                                    execution.output.is_some() || !execution.output_truncated;
+                                let snapshot = CommandSnapshot::from_execution(&execution, None);
+                                let recorded = control.complete_command(snapshot).await.is_ok();
+                                if recorded && presentation_ready {
+                                    control.forget_command(&command_id).await;
+                                }
+                            }
+                        }
+                        return result;
+                    }
+                }
+
+                let value = serde_json::to_value(tool_result).ok();
+                if tool_result.is_error == Some(true) {
+                    record.mark_failed(value);
+                } else {
+                    record.mark_completed(value);
+                }
+            } else if let Err(error) = &result {
+                record.mark_failed(Some(serde_json::json!({"error": error.to_string()})));
+            }
+            let _ = control.record(&record).await;
+        }
+
+        result
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -4037,7 +4168,11 @@ impl rmcp::ServerHandler for TmuxMcpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{
+        load_or_create_token, set_gate_enabled, ControlClient, GateDecision, StatePaths,
+    };
     use crate::test_support::TmuxStub;
+    use crate::web::{build_router, HubState};
 
     // Keep buffer policy tests self-contained; the optional copyrighted search
     // corpus is intentionally not required for CI compilation or execution.
@@ -4050,6 +4185,8 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeSet;
     use std::io::Write;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tempfile::tempdir;
     use tempfile::NamedTempFile;
     use tokio::io::duplex;
 
@@ -4135,6 +4272,122 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.into_owned())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn gate_classification_uses_the_registered_read_only_hint() {
+        let server = server_default();
+
+        assert!(server.tool_is_read_only("list-sessions"));
+        assert!(server.tool_is_read_only("capture-pane"));
+        assert!(!server.tool_is_read_only("execute-command"));
+        assert!(!server.tool_is_read_only("send-keys"));
+        assert!(!server.tool_is_read_only("unknown-tool"));
+    }
+
+    async fn start_control_hub(
+        paths: StatePaths,
+    ) -> (
+        String,
+        HubState,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let token = load_or_create_token(&paths).expect("token");
+        let state = HubState::open(paths).expect("hub");
+        let app = build_router(state.clone(), token, SecurityPolicy::default(), None);
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("bind hub");
+        let address = listener.local_addr().expect("hub address");
+        let task = tokio::spawn(async move { axum::serve(listener, app).await });
+        (format!("http://{address}"), state, task)
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_bypasses_enabled_gate() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        set_gate_enabled(&paths, true).expect("enable gate");
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let control = ControlClient::new(&url, "Codex", paths).expect("control");
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(control),
+        );
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let arguments = serde_json::json!({"path": "/tmp/project"})
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            server.call_tool(
+                rmcp::model::CallToolRequestParams::new("socket-for-path")
+                    .with_arguments(arguments),
+                context,
+            ),
+        )
+        .await
+        .expect("read-only call must not wait")
+        .expect("tool result");
+
+        assert_ne!(result.is_error, Some(true));
+        assert!(hub.pending().await.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn gate_rejection_returns_before_mutating_route() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        set_gate_enabled(&paths, true).expect("enable gate");
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let control = ControlClient::new(&url, "Claude", paths).expect("control");
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(control),
+        );
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let arguments = serde_json::json!({"paneId": "%8", "keys": ["x"]})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let call = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .call_tool(
+                        rmcp::model::CallToolRequestParams::new("send-keys")
+                            .with_arguments(arguments),
+                        context,
+                    )
+                    .await
+            }
+        });
+
+        let pending = loop {
+            let pending = hub.pending().await;
+            if let Some(record) = pending.first() {
+                break record.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(hub.decide(&pending.id, GateDecision::Rejected).await);
+        let result = call.await.expect("call task").expect("tool result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("rejected by Gate"));
+        assert_eq!(
+            hub.records_for_pane("%8").await[0].status,
+            crate::control::ActionStatus::Rejected
+        );
+        task.abort();
     }
 
     fn context_for_server(

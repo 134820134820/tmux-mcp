@@ -242,6 +242,57 @@ For a remote tmux server, add `--ssh`:
 
 Every MCP tool except `socket-for-path` accepts an optional `socket` parameter. If a tool omits it, the server uses the process default socket.
 
+## Local web control center
+
+Run one separate process as the local control center. Give it the same SSH, socket, and policy options as the MCP processes whose tmux panes it will show:
+
+```bash
+tmux-mcp-rs --web --web-bind 127.0.0.1:38473 --ssh user@host --config /path/to/config.toml
+```
+
+Then open `http://127.0.0.1:38473`. The page has two views:
+
+- **Messages** shows clean terminal results for tracked commands and distinct cards for AI or human input. Session, window, layout, and other control operations stay in the operation log.
+- **Interactive** refreshes the selected pane with `capture-pane` every 250 ms and forwards typed characters and common control keys immediately through the existing `send-keys` path. It is a pane snapshot and key forwarder, not a browser PTY or xterm.
+
+Gate is global and starts disabled on a new installation. When enabled, explicitly read-only MCP tools still run immediately; every other MCP request waits for approval. Webpage input bypasses Gate but still follows the configured security policy.
+
+Point each stdio MCP process at the control center while preserving its existing SSH, socket, shell, and config arguments.
+
+Codex CLI:
+
+```bash
+codex mcp add tmux -- tmux-mcp-rs --ssh user@host --web-url http://127.0.0.1:38473 --client-name Codex
+```
+
+Claude Code:
+
+```bash
+claude mcp add --transport stdio tmux -- tmux-mcp-rs --ssh user@host --web-url http://127.0.0.1:38473 --client-name "Claude Code"
+```
+
+Generic MCP client:
+
+```json
+{
+  "mcpServers": {
+    "tmux": {
+      "command": "tmux-mcp-rs",
+      "args": [
+        "--ssh",
+        "user@host",
+        "--web-url",
+        "http://127.0.0.1:38473",
+        "--client-name",
+        "My client"
+      ]
+    }
+  }
+}
+```
+
+Without `--web-url`, stdio MCP behavior is unchanged. If the control center is unavailable, MCP mutations continue while Gate is off and are denied while Gate is on. The page and MCP processes share a generated local token and append-only state under `%LOCALAPPDATA%\tmux-mcp\` on Windows (with the platform state-directory fallback elsewhere). The web server rejects non-loopback bind addresses.
+
 ## Configuration reference
 
 `tmux-mcp-rs` does not auto-load a config file. Pass one with `--config /path/to/config.toml`.
@@ -254,6 +305,10 @@ Every MCP tool except `socket-for-path` accepts an optional `socket` parameter. 
 | `--config <PATH>` | unset | TOML configuration file to read. Invalid TOML, invalid regexes, and unknown tools or groups fail startup. |
 | `--socket <PATH>` | tmux default socket | Sets `TMUX_MCP_SOCKET` for this server process. A per-tool `socket` parameter still wins for that call. |
 | `--ssh <CONNECTION>` | unset | Routes tmux commands through SSH. This value wins over `[ssh].remote` and `TMUX_MCP_SSH`. |
+| `--web` | off | Runs the local web control center instead of the stdio MCP server. |
+| `--web-bind <ADDRESS>` | `127.0.0.1:38473` | Loopback-only address for the web control center. |
+| `--web-url <URL>` | unset | Sends stdio MCP action and Gate records to a loopback control center. |
+| `--client-name <NAME>` | `mcp-<pid>` | Source label shown for this stdio MCP process. |
 | `--help` | n/a | Prints CLI help. |
 | `--version` | n/a | Prints the binary version. |
 

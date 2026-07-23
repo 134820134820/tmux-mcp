@@ -6,6 +6,8 @@
 
 /// Side-channel command execution tracking across tmux panes.
 pub mod commands;
+/// Optional local web-control records and Gate state.
+pub mod control;
 /// Domain errors and the crate-wide `Result` alias.
 pub mod errors;
 /// Security policy: tool surface, allowlists, command filters, buffer path sandbox.
@@ -14,6 +16,8 @@ pub mod security;
 pub mod tmux;
 /// Shared session/window/pane/buffer/search DTOs used by tools and resources.
 pub mod types;
+/// Loopback-only web console state and HTTP service.
+pub mod web;
 
 #[cfg(test)]
 mod test_support;

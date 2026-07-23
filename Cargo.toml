@@ -34,7 +34,9 @@ special-keys = []
 
 [dependencies]
 rmcp = { version = "2.1.0", default-features = false, features = ["server", "transport-io", "macros", "base64"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1.2"
@@ -54,3 +56,4 @@ rapidfuzz = { version = "0.5", optional = true }
 
 [dev-dependencies]
 rstest = "0.26"
+tower = { version = "0.5", features = ["util"] }
