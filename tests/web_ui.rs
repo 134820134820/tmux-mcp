@@ -25,7 +25,8 @@ fn page_polls_snapshots_and_uses_the_control_api() {
         "/api/gate",
         "/api/approvals/",
         "250",
-        "800",
+        "Enter 或切换 pane",
+        "输入已清空",
     ] {
         assert!(PAGE.contains(marker), "missing behavior marker: {marker}");
     }

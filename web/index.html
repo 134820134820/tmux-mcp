@@ -504,7 +504,7 @@
           </div>
           <div class="terminal-wrap">
             <pre id="terminal-snapshot" tabindex="0" aria-label="当前 tmux pane，可直接键入"></pre>
-            <span class="terminal-hint">点击后直接输入 · 每 250ms 刷新 · 800ms 内连续输入合并记录</span>
+            <span class="terminal-hint">点击后直接输入 · 每 250ms 刷新 · 同一 pane 合并至 Enter 或切换 pane</span>
           </div>
         </section>
       </main>
@@ -759,7 +759,7 @@
           "send-end": "End"
         };
         if (special[record.tool]) return special[record.tool];
-        if (typeof args.text === "string") return args.text;
+        if (typeof args.text === "string") return args.text || "（输入已清空）";
         if (typeof args.keys === "string") return args.keys;
         if (typeof args.content === "string") return args.content;
         if (typeof args.key === "string") return args.key;
