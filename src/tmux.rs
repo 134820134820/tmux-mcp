@@ -249,10 +249,13 @@ fn build_remote_command(program: &str, args: &[&str]) -> String {
         .join(" ")
 }
 
-fn build_tmux_command(args: &[&str], socket: Option<&str>) -> Result<Command> {
+fn build_tmux_command(args: &[&str], socket: Option<&str>, pipe_stdin: bool) -> Result<Command> {
     let socket_args = get_socket_args(socket);
 
     if let Some(mut ssh_args) = get_ssh_args()? {
+        if !pipe_stdin {
+            ssh_args.insert(0, "-n".to_string());
+        }
         ssh_args.push(build_remote_tmux_command(&socket_args, args));
         let mut cmd = Command::new("ssh");
         cmd.args(&ssh_args);
@@ -276,7 +279,7 @@ async fn run_tmux_with_socket(
         message: format!("tmux semaphore closed: {e}"),
     })?;
 
-    let mut command = build_tmux_command(args, socket)?;
+    let mut command = build_tmux_command(args, socket, stdin.is_some())?;
 
     let output = if let Some(input) = stdin {
         let mut child = command
@@ -349,7 +352,7 @@ async fn execute_tmux_with_socket_to_file(
         message: format!("tmux semaphore closed: {e}"),
     })?;
 
-    let mut command = build_tmux_command(args, socket)?;
+    let mut command = build_tmux_command(args, socket, false)?;
 
     let mut child = command
         .stdout(Stdio::piped())
@@ -428,6 +431,7 @@ pub async fn canonicalize_remote_path(path: &str) -> Result<String> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
         message: "remote path canonicalization requires TMUX_MCP_SSH".to_string(),
     })?;
+    ssh_args.insert(0, "-n".to_string());
     ssh_args.push(build_remote_command("realpath", &["--", path]));
 
     let output = Command::new("ssh")
@@ -454,6 +458,7 @@ pub async fn remote_path_is_symlink(path: &str) -> Result<bool> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
         message: "remote symlink check requires TMUX_MCP_SSH".to_string(),
     })?;
+    ssh_args.insert(0, "-n".to_string());
     ssh_args.push(build_remote_command("test", &["-L", path]));
 
     let output = Command::new("ssh")
@@ -474,6 +479,7 @@ pub async fn create_remote_dir(path: &str) -> Result<()> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
         message: "remote directory creation requires TMUX_MCP_SSH".to_string(),
     })?;
+    ssh_args.insert(0, "-n".to_string());
     ssh_args.push(build_remote_command("mkdir", &["-p", "--", path]));
 
     let output = Command::new("ssh")
@@ -531,7 +537,19 @@ pub async fn tmux_version() -> Option<(u32, u32)> {
     parse_tmux_version(&output)
 }
 
-/// Parse `list-sessions -F '#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}'`
+fn decode_tmux_field(field: &str) -> String {
+    field.replace("%7C", "|").replace("%25", "%")
+}
+
+fn split_tmux_fields(line: &str) -> Vec<String> {
+    if line.contains('\t') {
+        line.split('\t').map(str::to_string).collect()
+    } else {
+        line.split('|').map(decode_tmux_field).collect()
+    }
+}
+
+/// Parse structured `list-sessions -F` output.
 pub fn parse_sessions(output: &str) -> Vec<Session> {
     if output.is_empty() {
         return Vec::new();
@@ -540,7 +558,7 @@ pub fn parse_sessions(output: &str) -> Vec<Session> {
     output
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
+            let parts = split_tmux_fields(line);
             if parts.len() == 4 {
                 Some(Session {
                     id: parts[0].to_string(),
@@ -555,7 +573,7 @@ pub fn parse_sessions(output: &str) -> Vec<Session> {
         .collect()
 }
 
-/// Parse `list-windows -F '#{window_id}\t#{window_name}\t#{?window_active,1,0}'`
+/// Parse structured `list-windows -F` output.
 pub fn parse_windows(output: &str, session_id: &str) -> Vec<Window> {
     if output.is_empty() {
         return Vec::new();
@@ -564,7 +582,7 @@ pub fn parse_windows(output: &str, session_id: &str) -> Vec<Window> {
     output
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
+            let parts = split_tmux_fields(line);
             if parts.len() == 3 {
                 Some(Window {
                     id: parts[0].to_string(),
@@ -579,7 +597,7 @@ pub fn parse_windows(output: &str, session_id: &str) -> Vec<Window> {
         .collect()
 }
 
-/// Parse `list-panes -F '#{pane_id}\t#{pane_title}\t#{?pane_active,1,0}'`
+/// Parse structured `list-panes -F` output.
 pub fn parse_panes(output: &str, window_id: &str) -> Vec<Pane> {
     if output.is_empty() {
         return Vec::new();
@@ -588,7 +606,7 @@ pub fn parse_panes(output: &str, window_id: &str) -> Vec<Pane> {
     output
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
+            let parts = split_tmux_fields(line);
             if parts.len() == 3 {
                 Some(Pane {
                     id: parts[0].to_string(),
@@ -609,19 +627,19 @@ fn parse_created_pane_line(output: &str, fallback_window_id: &str) -> Option<Pan
     if line.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = line.split('\t').collect();
+    let parts = split_tmux_fields(line);
     match parts.as_slice() {
         [id, title, active] => Some(Pane {
-            id: (*id).to_string(),
-            title: (*title).to_string(),
-            active: *active == "1",
+            id: id.to_string(),
+            title: title.to_string(),
+            active: active == "1",
             window_id: fallback_window_id.to_string(),
         }),
         [id, title, active, window_id] => Some(Pane {
-            id: (*id).to_string(),
-            title: (*title).to_string(),
-            active: *active == "1",
-            window_id: (*window_id).to_string(),
+            id: id.to_string(),
+            title: title.to_string(),
+            active: active == "1",
+            window_id: window_id.to_string(),
         }),
         _ => None,
     }
@@ -633,25 +651,25 @@ fn parse_created_window_line(output: &str, fallback_session_id: &str) -> Option<
     if line.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = line.split('\t').collect();
+    let parts = split_tmux_fields(line);
     match parts.as_slice() {
         [id, name, active] => Some(Window {
-            id: (*id).to_string(),
-            name: (*name).to_string(),
-            active: *active == "1",
+            id: id.to_string(),
+            name: name.to_string(),
+            active: active == "1",
             session_id: fallback_session_id.to_string(),
         }),
         [id, name, active, session_id] => Some(Window {
-            id: (*id).to_string(),
-            name: (*name).to_string(),
-            active: *active == "1",
-            session_id: (*session_id).to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            active: active == "1",
+            session_id: session_id.to_string(),
         }),
         _ => None,
     }
 }
 
-/// Parse `list-clients -F '#{client_tty}\t#{client_name}\t#{client_session}\t#{client_pid}\t#{?client_attached,1,0}'`
+/// Parse structured `list-clients -F` output.
 pub fn parse_clients(output: &str) -> Vec<ClientInfo> {
     if output.is_empty() {
         return Vec::new();
@@ -660,7 +678,7 @@ pub fn parse_clients(output: &str) -> Vec<ClientInfo> {
     output
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
+            let parts = split_tmux_fields(line);
             if parts.len() == 5 {
                 Some(ClientInfo {
                     tty: parts[0].to_string(),
@@ -676,7 +694,7 @@ pub fn parse_clients(output: &str) -> Vec<ClientInfo> {
         .collect()
 }
 
-/// Parse `list-buffers -F '#{buffer_name}\t#{buffer_size}\t#{buffer_created}'`
+/// Parse structured `list-buffers -F` output.
 pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
     if output.is_empty() {
         return Vec::new();
@@ -686,7 +704,7 @@ pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
         .lines()
         .enumerate()
         .filter_map(|(idx, line)| {
-            let parts: Vec<&str> = line.split('\t').collect();
+            let parts = split_tmux_fields(line);
             if parts.len() == 3 {
                 let size_u64: u64 = parts[1].parse().unwrap_or(0);
                 let size = std::cmp::min(size_u64, u32::MAX as u64) as u32;
@@ -704,9 +722,10 @@ pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
         .collect()
 }
 
-/// Enumerate sessions on a socket via tab-formatted `list-sessions`.
+/// Enumerate sessions on a socket via printable, percent-encoded fields.
 pub async fn list_sessions(socket: Option<&str>) -> Result<Vec<Session>> {
-    let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
+    let format =
+        "#{session_id}|#{s,%,%25,;s,\\|,%7C,:session_name}|#{?session_attached,1,0}|#{session_windows}";
     let output = execute_tmux_with_socket(&["list-sessions", "-F", format], socket).await?;
     Ok(parse_sessions(output.trim()))
 }
@@ -719,7 +738,7 @@ pub async fn find_session_by_name(name: &str, socket: Option<&str>) -> Result<Op
 
 /// Enumerate windows for a session target (`-t session_id`).
 pub async fn list_windows(session_id: &str, socket: Option<&str>) -> Result<Vec<Window>> {
-    let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}";
+    let format = "#{window_id}|#{s,%,%25,;s,\\|,%7C,:window_name}|#{?window_active,1,0}";
     let output =
         execute_tmux_with_socket(&["list-windows", "-t", session_id, "-F", format], socket).await?;
     Ok(parse_windows(output.trim(), session_id))
@@ -727,7 +746,7 @@ pub async fn list_windows(session_id: &str, socket: Option<&str>) -> Result<Vec<
 
 /// Enumerate panes for a window target (`-t window_id`).
 pub async fn list_panes(window_id: &str, socket: Option<&str>) -> Result<Vec<Pane>> {
-    let format = "#{pane_id}\t#{pane_title}\t#{?pane_active,1,0}";
+    let format = "#{pane_id}|#{s,%,%25,;s,\\|,%7C,:pane_title}|#{?pane_active,1,0}";
     let output =
         execute_tmux_with_socket(&["list-panes", "-t", window_id, "-F", format], socket).await?;
     Ok(parse_panes(output.trim(), window_id))
@@ -781,8 +800,7 @@ pub async fn capture_pane(
 
 /// List attached clients; maps tmux "no clients" to an empty vec rather than error.
 pub async fn list_clients(socket: Option<&str>) -> Result<Vec<ClientInfo>> {
-    let format =
-        "#{client_tty}\t#{client_name}\t#{client_session}\t#{client_pid}\t#{?client_attached,1,0}";
+    let format = "#{s,%,%25,;s,\\|,%7C,:client_tty}|#{s,%,%25,;s,\\|,%7C,:client_name}|#{s,%,%25,;s,\\|,%7C,:client_session}|#{client_pid}|#{?client_attached,1,0}";
     match execute_tmux_with_socket(&["list-clients", "-F", format], socket).await {
         Ok(output) => Ok(parse_clients(output.trim())),
         Err(Error::Tmux { ref message }) if message.contains("no clients") => Ok(Vec::new()),
@@ -798,7 +816,7 @@ pub async fn detach_client(client_tty: &str, socket: Option<&str>) -> Result<()>
 
 /// List named paste buffers; maps tmux "no buffers" to an empty vec.
 pub async fn list_buffers(socket: Option<&str>) -> Result<Vec<BufferInfo>> {
-    let format = "#{buffer_name}\t#{buffer_size}\t#{buffer_created}";
+    let format = "#{s,%,%25,;s,\\|,%7C,:buffer_name}|#{buffer_size}|#{buffer_created}";
     match execute_tmux_with_socket(&["list-buffers", "-F", format], socket).await {
         Ok(output) => Ok(parse_buffers(output.trim())),
         Err(Error::Tmux { ref message }) if message.contains("no buffers") => Ok(Vec::new()),
@@ -2111,10 +2129,10 @@ pub async fn subsearch_buffer(
 
 /// Fetch pane cwd/command/size/pid via `display-message` (used for targeting and shell detection).
 pub async fn pane_info(pane_id: &str, socket: Option<&str>) -> Result<PaneInfo> {
-    let format = "#{pane_id}\t#{window_id}\t#{session_id}\t#{?pane_active,1,0}\t#{pane_title}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{?pane_in_mode,1,0}";
+    let format = "#{pane_id}|#{window_id}|#{session_id}|#{?pane_active,1,0}|#{s,%,%25,;s,\\|,%7C,:pane_title}|#{s,%,%25,;s,\\|,%7C,:pane_current_path}|#{s,%,%25,;s,\\|,%7C,:pane_current_command}|#{pane_width}|#{pane_height}|#{pane_pid}|#{?pane_in_mode,1,0}";
     let output =
         execute_tmux_with_socket(&["display-message", "-p", "-t", pane_id, format], socket).await?;
-    let parts: Vec<&str> = output.split('\t').collect();
+    let parts = split_tmux_fields(output.trim());
     if parts.len() >= 11 {
         Ok(PaneInfo {
             id: parts[0].to_string(),
@@ -2138,11 +2156,11 @@ pub async fn pane_info(pane_id: &str, socket: Option<&str>) -> Result<PaneInfo> 
 
 /// Fetch window layout/zoom/active-pane metadata via `display-message`.
 pub async fn window_info(window_id: &str, socket: Option<&str>) -> Result<WindowInfo> {
-    let format = "#{window_id}\t#{window_name}\t#{session_id}\t#{?window_active,1,0}\t#{window_layout}\t#{window_panes}\t#{window_width}\t#{window_height}\t#{window_zoomed_flag}\t#{pane_id}";
+    let format = "#{window_id}|#{s,%,%25,;s,\\|,%7C,:window_name}|#{session_id}|#{?window_active,1,0}|#{s,%,%25,;s,\\|,%7C,:window_layout}|#{window_panes}|#{window_width}|#{window_height}|#{window_zoomed_flag}|#{pane_id}";
     let output =
         execute_tmux_with_socket(&["display-message", "-p", "-t", window_id, format], socket)
             .await?;
-    let parts: Vec<&str> = output.split('\t').collect();
+    let parts = split_tmux_fields(output.trim());
     if parts.len() >= 10 {
         Ok(WindowInfo {
             id: parts[0].to_string(),
@@ -2167,7 +2185,8 @@ pub async fn window_info(window_id: &str, socket: Option<&str>) -> Result<Window
 ///
 /// Falls back to `list-sessions` when tmux omits `-P` format output.
 pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session> {
-    let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
+    let format =
+        "#{session_id}|#{s,%,%25,;s,\\|,%7C,:session_name}|#{?session_attached,1,0}|#{session_windows}";
     let session_arg = format!("-s{name}");
     let output = execute_tmux_with_socket(
         &["new-session", "-d", "-P", "-F", format, &session_arg],
@@ -2190,7 +2209,7 @@ pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session>
 
 /// Create a named window in a session; falls back to listing when `-P` output is empty.
 pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -> Result<Window> {
-    let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}";
+    let format = "#{window_id}|#{s,%,%25,;s,\\|,%7C,:window_name}|#{?window_active,1,0}";
     let name_arg = format!("-n{name}");
     let output = execute_tmux_with_socket(
         &[
@@ -2245,7 +2264,7 @@ pub async fn split_pane(
         _ => "-v",
     };
 
-    let format = "#{pane_id}\t#{pane_title}\t#{?pane_active,1,0}\t#{window_id}";
+    let format = "#{pane_id}|#{s,%,%25,;s,\\|,%7C,:pane_title}|#{?pane_active,1,0}|#{window_id}";
     let mut args = vec!["split-window", "-P", "-F", format, dir_flag, "-t", pane_id];
 
     let size_str;
@@ -2317,7 +2336,7 @@ pub fn wait_signal_name(secret: &str) -> String {
 ///
 /// Does **not** use the global tmux semaphore so long waits do not stall other ops.
 pub async fn wait_for_signal(channel: &str, socket: Option<&str>) -> Result<()> {
-    let mut command = build_tmux_command(&["wait-for", channel], socket)?;
+    let mut command = build_tmux_command(&["wait-for", channel], socket, false)?;
     let output = command.output().await.map_err(|e| Error::Tmux {
         message: format!("failed to run tmux wait-for: {e}"),
     })?;
@@ -2496,7 +2515,8 @@ pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> R
 
 /// Resolve the session context for the default client via `display-message`.
 pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
-    let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
+    let format =
+        "#{session_id}|#{s,%,%25,;s,\\|,%7C,:session_name}|#{?session_attached,1,0}|#{session_windows}";
     let output = execute_tmux_with_socket(&["display-message", "-p", format], socket).await?;
 
     let sessions = parse_sessions(output.trim());
@@ -2605,7 +2625,8 @@ pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>)
         .map(|window| window.id)
         .collect();
 
-    let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}\t#{session_id}";
+    let format =
+        "#{window_id}|#{s,%,%25,;s,\\|,%7C,:window_name}|#{?window_active,1,0}|#{session_id}";
     let mut args = vec!["break-pane", "-P", "-F", format, "-s", pane_id];
     if let Some(name) = name {
         args.push("-n");
@@ -2731,6 +2752,30 @@ mod tests {
         assert_eq!(result[1].name, "dev");
     }
 
+    #[test]
+    fn parse_sessions_decodes_printable_ssh_record_format() {
+        let sessions = parse_sessions("$0|team%7Cops%25prod|0|1");
+
+        assert_eq!(
+            sessions,
+            vec![Session {
+                id: "$0".into(),
+                name: "team|ops%prod".into(),
+                attached: false,
+                windows: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_clients_preserves_empty_printable_fields() {
+        let clients = parse_clients("/dev/pts/0||shared|123|1");
+
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].name, "");
+        assert_eq!(clients[0].session_name, "shared");
+    }
+
     #[rstest]
     #[case("tmux 3.4", Some((3, 4)))]
     #[case("tmux 3.6b", Some((3, 6)))]
@@ -2761,6 +2806,21 @@ mod tests {
     fn test_parse_ssh_args_rejects_unbalanced_quotes() {
         let err = parse_ssh_args("user@host 'unbalanced").unwrap_err();
         assert!(matches!(err, Error::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn ssh_command_only_disconnects_stdin_without_payload() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+
+        let no_payload = build_tmux_command(&["-V"], None, false).expect("no-payload command");
+        let no_payload_args: Vec<_> = no_payload.as_std().get_args().collect();
+        assert!(no_payload_args.iter().any(|arg| *arg == "-n"));
+
+        let payload =
+            build_tmux_command(&["load-buffer", "-"], None, true).expect("payload command");
+        let payload_args: Vec<_> = payload.as_std().get_args().collect();
+        assert!(!payload_args.iter().any(|arg| *arg == "-n"));
     }
 
     #[test]
