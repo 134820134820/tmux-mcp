@@ -30,7 +30,6 @@ use crate::types::{Pane, Session, Window};
 const PER_PANE_LIMIT: usize = 200;
 const OPERATION_LIMIT: usize = 200;
 const COMPACT_AT_BYTES: u64 = 4 * 1024 * 1024;
-const HUMAN_GROUP_MS: u64 = 800;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const TOKEN_HEADER: &str = "x-tmux-mcp-token";
 
@@ -54,8 +53,6 @@ struct PendingApproval {
 struct HumanGroup {
     id: String,
     pane_id: String,
-    last_ms: u64,
-    closed: bool,
 }
 
 struct RecordStore {
@@ -674,19 +671,11 @@ impl HubState {
         literal: bool,
         at_ms: u64,
     ) -> io::Result<ActionRecord> {
-        let display = if !literal && key == "Enter" {
-            "\n"
-        } else {
-            key
-        };
         let mut last = self.inner.last_human.lock().await;
         let mut store = self.inner.store.lock().await;
-        let reusable_id = last.as_ref().and_then(|group| {
-            (group.pane_id == pane_id
-                && !group.closed
-                && at_ms.saturating_sub(group.last_ms) <= HUMAN_GROUP_MS)
-                .then(|| group.id.clone())
-        });
+        let reusable_id = last
+            .as_ref()
+            .and_then(|group| (group.pane_id == pane_id).then(|| group.id.clone()));
 
         let mut record = reusable_id
             .and_then(|id| store.records.get(&id).cloned())
@@ -699,23 +688,34 @@ impl HubState {
                 record.requested_at_ms = at_ms;
                 record
             });
-        let text = record
+        let mut text = record
             .arguments
             .get("text")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        record.arguments["text"] = Value::String(format!("{text}{display}"));
+            .unwrap_or_default()
+            .to_owned();
+        match (literal, key) {
+            (true, key) => text.push_str(key),
+            (false, "Enter") => text.push('\n'),
+            (false, "BSpace") => {
+                text.pop();
+            }
+            (false, key) => text.push_str(key),
+        }
+        record.arguments["text"] = Value::String(text);
         record.arguments["literal"] = Value::Bool(literal);
         record.updated_at_ms = at_ms;
         record.mark_completed(None);
         record.updated_at_ms = at_ms;
         store.upsert(record.clone())?;
-        *last = Some(HumanGroup {
-            id: record.id.clone(),
-            pane_id: pane_id.to_owned(),
-            last_ms: at_ms,
-            closed: !literal && key == "Enter",
-        });
+        *last = if !literal && key == "Enter" {
+            None
+        } else {
+            Some(HumanGroup {
+                id: record.id.clone(),
+                pane_id: pane_id.to_owned(),
+            })
+        };
         Ok(record)
     }
 

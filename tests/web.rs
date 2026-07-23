@@ -112,7 +112,7 @@ async fn jsonl_reload_uses_latest_snapshot_and_ignores_bad_tail() {
 }
 
 #[tokio::test]
-async fn human_keys_group_within_800ms_and_enter_closes_the_group() {
+async fn human_keys_stay_grouped_until_enter_even_after_a_long_pause() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
 
@@ -121,15 +121,15 @@ async fn human_keys_group_within_800ms_and_enter_closes_the_group() {
         .await
         .expect("record a");
     let second = state
-        .record_human_input_at("%4", "b", true, 1_700)
+        .record_human_input_at("%4", "b", true, 10_000)
         .await
         .expect("record b");
     let enter = state
-        .record_human_input_at("%4", "Enter", false, 1_800)
+        .record_human_input_at("%4", "Enter", false, 20_000)
         .await
         .expect("record enter");
     let after_enter = state
-        .record_human_input_at("%4", "c", true, 1_900)
+        .record_human_input_at("%4", "c", true, 20_100)
         .await
         .expect("record c");
 
@@ -138,6 +138,27 @@ async fn human_keys_group_within_800ms_and_enter_closes_the_group() {
     assert_ne!(enter.id, after_enter.id);
     assert_eq!(enter.arguments["text"], "ab\n");
     assert_eq!(after_enter.arguments["text"], "c");
+}
+
+#[tokio::test]
+async fn human_backspace_edits_the_group_instead_of_logging_its_key_name() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    state
+        .record_human_input_at("%4", "a", true, 1_000)
+        .await
+        .expect("record a");
+    state
+        .record_human_input_at("%4", "b", true, 1_100)
+        .await
+        .expect("record b");
+    let backspace = state
+        .record_human_input_at("%4", "BSpace", false, 1_200)
+        .await
+        .expect("record backspace");
+
+    assert_eq!(backspace.arguments["text"], "a");
 }
 
 #[tokio::test]
