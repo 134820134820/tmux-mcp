@@ -5,7 +5,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use tmux_mcp_rs::commands::CommandTracker;
 use tmux_mcp_rs::control::{
-    load_or_create_token, set_gate_enabled, ControlClient, GateDecision, StatePaths,
+    load_or_create_token, set_gate_enabled, ActionStatus, ControlClient, GateDecision, StatePaths,
 };
 use tmux_mcp_rs::security::SecurityPolicy;
 use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus, ShellType};
@@ -167,5 +167,52 @@ async fn terminal_command_snapshot_updates_the_original_action() {
             .and_then(|snapshot| snapshot.output.as_deref()),
         Some("clean")
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn large_terminal_output_is_truncated_before_agent_record_upload() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+    let (url, state, task) = start_hub(paths.clone()).await;
+    let client = ControlClient::new(&url, "Codex", paths).expect("control client");
+    let command = "x".repeat(900_000);
+    let mut record = client.action(
+        "execute-command",
+        json!({"paneId": "%large", "command": command}),
+    );
+    record.mark_running();
+    client
+        .track_command("command-large", record)
+        .await
+        .expect("track command");
+
+    client
+        .complete_command(CommandSnapshot {
+            command_id: "command-large".into(),
+            resource_uri: "tmux://command/command-large/result".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            command: command.clone(),
+            pane_id: "%large".into(),
+            socket: None,
+            output: Some("界".repeat(400_000)),
+            output_truncated: false,
+            elapsed_ms: 10,
+            reason: None,
+            wait_timed_out: None,
+            schema_version: CommandSnapshot::SCHEMA_VERSION,
+        })
+        .await
+        .expect("record bounded terminal lifecycle");
+
+    let records = state.records_for_pane("%large").await;
+    assert_eq!(records[0].status, ActionStatus::Completed);
+    let snapshot = records[0].command_snapshot.as_ref().expect("snapshot");
+    assert_eq!(snapshot.command, command);
+    assert!(records[0].arguments.get("command").is_none());
+    assert!(snapshot.output_truncated);
+    assert!(snapshot.output.as_ref().unwrap().ends_with('界'));
+    assert!(serde_json::to_vec(&records[0]).unwrap().len() < 1024 * 1024);
     task.abort();
 }

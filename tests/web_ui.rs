@@ -33,6 +33,34 @@ fn page_polls_snapshots_and_uses_the_control_api() {
 }
 
 #[test]
+fn capture_response_is_scoped_to_the_requested_pane_and_mode() {
+    let capture = PAGE
+        .split_once("async function refreshCapture()")
+        .expect("refreshCapture function")
+        .1
+        .split_once("function sendKey")
+        .expect("sendKey function")
+        .0;
+    for marker in [
+        "const paneId = selectedPane;",
+        "/api/panes/${encodeURIComponent(paneId)}/capture",
+        r#"mode === "interactive" && selectedPane === paneId"#,
+    ] {
+        assert!(
+            capture.contains(marker),
+            "missing scoped capture marker: {marker}"
+        );
+    }
+    assert_eq!(
+        capture
+            .matches(r#"mode === "interactive" && selectedPane === paneId"#)
+            .count(),
+        2,
+        "capture success and error rendering must both be scoped"
+    );
+}
+
+#[test]
 fn message_mode_contains_a_single_line_command_composer() {
     for marker in [
         r#"id="command-composer""#,

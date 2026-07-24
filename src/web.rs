@@ -22,7 +22,7 @@ use tokio::sync::{oneshot, Mutex};
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{
     set_gate_enabled, ActionKind, ActionRecord, AuthorizationResponse, GateDecision, StatePaths,
-    ACTION_SCHEMA_VERSION,
+    ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
@@ -31,7 +31,7 @@ use crate::types::{CommandSnapshot, Pane, Session, Window};
 const PER_PANE_LIMIT: usize = 200;
 const OPERATION_LIMIT: usize = 200;
 const COMPACT_AT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_BODY_BYTES: usize = AGENT_RECORD_MAX_BYTES;
 const TOKEN_HEADER: &str = "x-tmux-mcp-token";
 const TOPOLOGY_CACHE_TTL: Duration = Duration::from_secs(5);
 
@@ -183,6 +183,19 @@ pub fn validate_key_input(key: &str, literal: bool) -> Result<(), String> {
     }
 }
 
+fn validate_command_input(command: &str) -> Result<(), &'static str> {
+    if command.trim().is_empty() {
+        return Err("command must not be empty");
+    }
+    if command.contains(['\n', '\r']) {
+        return Err("command must be a single line");
+    }
+    if command.len() > 65_536 {
+        return Err("command must not exceed 65536 bytes");
+    }
+    Ok(())
+}
+
 pub fn build_router(
     hub: HubState,
     token: String,
@@ -214,7 +227,10 @@ pub fn build_router(
                 Ok(event) if event.kind == CommandEventKind::Evicted => {
                     event_hub.forget_web_command(&event.command_id).await;
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    reconcile_web_commands(&event_hub, &event_tracker).await;
+                }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -243,6 +259,34 @@ pub fn build_router(
         .route("/", get(index))
         .merge(api)
         .with_state(context)
+}
+
+async fn reconcile_web_commands(hub: &HubState, tracker: &CommandTracker) {
+    let command_ids = hub
+        .inner
+        .web_commands
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for command_id in command_ids {
+        let Some(execution) = tracker.get_command(&command_id).await else {
+            hub.forget_missing_web_command(&command_id).await;
+            continue;
+        };
+        if !execution.status.is_terminal() {
+            continue;
+        }
+        let presentation_ready = execution.output.is_some() || !execution.output_truncated;
+        let recorded = hub
+            .update_web_command(CommandSnapshot::from_execution(&execution, None))
+            .await
+            .unwrap_or(false);
+        if recorded && presentation_ready {
+            hub.forget_web_command(&command_id).await;
+        }
+    }
 }
 
 async fn index(State(context): State<AppContext>, headers: HeaderMap) -> Response {
@@ -309,7 +353,7 @@ async fn api_state(
 }
 
 async fn api_gate(State(context): State<AppContext>, Json(input): Json<GateToggle>) -> Response {
-    match set_gate_enabled(context.hub.paths(), input.enabled) {
+    match context.hub.set_gate_enabled(input.enabled).await {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -443,11 +487,8 @@ async fn send_command(
     if let Err(error) = validate_pane_id(&pane_id) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
-    if input.command.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "command must not be empty").into_response();
-    }
-    if input.command.contains(['\n', '\r']) {
-        return (StatusCode::BAD_REQUEST, "command must be a single line").into_response();
+    if let Err(error) = validate_command_input(&input.command) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
     }
     if let Err(error) = authorize_pane_action(&context, "execute-command", &pane_id).await {
         return error;
@@ -586,6 +627,8 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::types::{CommandExecution, CommandStatus, ShellType};
+    use std::time::Instant;
 
     #[test]
     fn topology_cache_reuses_fresh_errors_and_expires_stale_data() {
@@ -599,6 +642,14 @@ mod tests {
             Some(Err(error)) if error == "tmux unavailable"
         ));
         assert!(cache.get(loaded_at + Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn command_input_limit_is_measured_in_bytes() {
+        let accepted = "界".repeat(21_845) + "a";
+        let rejected = "界".repeat(21_845) + "ab";
+        assert!(validate_command_input(&accepted).is_ok());
+        assert!(validate_command_input(&rejected).is_err());
     }
 
     #[tokio::test]
@@ -627,6 +678,179 @@ mod tests {
         drop(store);
         registering.await.expect("registration task");
         assert!(hub.inner.web_commands.lock().await.contains_key("cmd-1"));
+    }
+
+    #[tokio::test]
+    async fn authorize_rechecks_gate_after_waiting_for_pending_lock() {
+        let dir = tempfile::tempdir().expect("temp state dir");
+        let paths = StatePaths::new(dir.path());
+        set_gate_enabled(&paths, true).expect("enable gate");
+        let hub = HubState::open(paths.clone()).expect("open hub");
+        let pending = hub.inner.pending.lock().await;
+        let authorizing = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                hub.authorize(ActionRecord::new(
+                    "Codex",
+                    "send-keys",
+                    json!({"paneId": "%race"}),
+                ))
+                .await
+            })
+        };
+        for _ in 0..100 {
+            if hub
+                .records_for_pane("%race")
+                .await
+                .first()
+                .is_some_and(|record| {
+                    record.status == crate::control::ActionStatus::WaitingApproval
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        set_gate_enabled(&paths, false).expect("disable gate");
+        drop(pending);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), authorizing)
+                .await
+                .expect("authorization must not remain pending")
+                .expect("authorization task"),
+            GateDecision::Approved
+        );
+        assert!(hub.pending().await.is_empty());
+        assert_eq!(
+            hub.records_for_pane("%race").await[0].status,
+            crate::control::ActionStatus::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_enable_waits_for_pending_transition_lock() {
+        let dir = tempfile::tempdir().expect("temp state dir");
+        let paths = StatePaths::new(dir.path());
+        let hub = HubState::open(paths.clone()).expect("open hub");
+        let pending = hub.inner.pending.lock().await;
+        let enabling = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.set_gate_enabled(true).await })
+        };
+        tokio::task::yield_now().await;
+
+        assert!(!paths.gate_enabled());
+
+        drop(pending);
+        enabling.await.expect("enable task").expect("enable gate");
+        assert!(paths.gate_enabled());
+    }
+
+    #[tokio::test]
+    async fn gate_off_authorize_waits_for_pending_transition_lock() {
+        let dir = tempfile::tempdir().expect("temp state dir");
+        let hub = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+        let pending = hub.inner.pending.lock().await;
+        let authorizing = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                hub.authorize(ActionRecord::new(
+                    "Codex",
+                    "send-keys",
+                    json!({"paneId": "%off-race"}),
+                ))
+                .await
+            })
+        };
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if authorizing.is_finished() {
+                break;
+            }
+        }
+
+        assert!(!authorizing.is_finished());
+
+        drop(pending);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), authorizing)
+                .await
+                .expect("authorization must complete after lock release")
+                .expect("authorization task"),
+            GateDecision::Approved
+        );
+        assert_eq!(
+            hub.records_for_pane("%off-race").await[0].status,
+            crate::control::ActionStatus::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn lag_reconciliation_updates_tracked_web_commands() {
+        let dir = tempfile::tempdir().expect("temp state dir");
+        let hub = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+        let mut record = ActionRecord::new(
+            "你",
+            "execute-command",
+            json!({"paneId": "%lagged", "command": "true"}),
+        );
+        record.mark_running();
+        hub.track_web_command("cmd-lagged".into(), record)
+            .await
+            .expect("track command");
+        let mut evicted = ActionRecord::new(
+            "你",
+            "execute-command",
+            json!({"paneId": "%evicted", "command": "true"}),
+        );
+        evicted.mark_running();
+        hub.track_web_command("cmd-evicted".into(), evicted)
+            .await
+            .expect("track evicted command");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let now = Instant::now();
+        tracker
+            .insert_test_execution(CommandExecution {
+                id: "cmd-lagged".into(),
+                pane_id: "%lagged".into(),
+                socket: None,
+                command: "true".into(),
+                status: CommandStatus::Completed,
+                exit_code: Some(0),
+                output: Some("done".into()),
+                output_truncated: false,
+                reason: None,
+                started_at: now,
+                completed_at: Some(now),
+                raw_mode: false,
+                tracking_disabled: false,
+            })
+            .await;
+
+        reconcile_web_commands(&hub, &tracker).await;
+
+        assert_eq!(
+            hub.records_for_pane("%lagged").await[0].status,
+            crate::control::ActionStatus::Completed
+        );
+        assert!(!hub
+            .inner
+            .web_commands
+            .lock()
+            .await
+            .contains_key("cmd-lagged"));
+        assert!(!hub
+            .inner
+            .web_commands
+            .lock()
+            .await
+            .contains_key("cmd-evicted"));
+        assert_eq!(
+            hub.records_for_pane("%evicted").await[0].status,
+            crate::control::ActionStatus::Incomplete
+        );
     }
 }
 
@@ -821,7 +1045,24 @@ impl HubState {
         self.inner.web_commands.lock().await.remove(command_id);
     }
 
+    async fn forget_missing_web_command(&self, command_id: &str) {
+        let Some(mut record) = self.inner.web_commands.lock().await.remove(command_id) else {
+            return;
+        };
+        if matches!(
+            record.status,
+            crate::control::ActionStatus::Requested
+                | crate::control::ActionStatus::WaitingApproval
+                | crate::control::ActionStatus::Approved
+                | crate::control::ActionStatus::Running
+        ) {
+            record.mark_incomplete();
+            let _ = self.upsert(record).await;
+        }
+    }
+
     pub async fn authorize(&self, mut record: ActionRecord) -> GateDecision {
+        let mut pending = self.inner.pending.lock().await;
         if !self.inner.paths.gate_enabled() {
             record.mark_approved();
             let _ = self.upsert(record).await;
@@ -832,14 +1073,39 @@ impl HubState {
         let _ = self.upsert(record.clone()).await;
         let id = record.id.clone();
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending.lock().await.insert(
+        pending.insert(
             id,
             PendingApproval {
                 record,
                 decision: sender,
             },
         );
+        drop(pending);
         receiver.await.unwrap_or(GateDecision::Rejected)
+    }
+
+    async fn set_gate_enabled(&self, enabled: bool) -> io::Result<()> {
+        if enabled {
+            let _pending = self.inner.pending.lock().await;
+            return set_gate_enabled(&self.inner.paths, true);
+        }
+        let approvals = {
+            let mut pending = self.inner.pending.lock().await;
+            set_gate_enabled(&self.inner.paths, false)?;
+            pending
+                .drain()
+                .map(|(_, approval)| approval)
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for mut approval in approvals {
+            approval.record.mark_approved();
+            if let Err(error) = self.upsert(approval.record).await {
+                first_error.get_or_insert(error);
+            }
+            let _ = approval.decision.send(GateDecision::Approved);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn decide(&self, id: &str, decision: GateDecision) -> bool {
@@ -966,6 +1232,7 @@ impl HubState {
 
 impl RecordStore {
     fn open(path: std::path::PathBuf) -> io::Result<Self> {
+        recover_compaction(&path)?;
         let mut records = HashMap::new();
         match File::open(&path) {
             Ok(file) => {
@@ -1014,6 +1281,7 @@ impl RecordStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        recover_compaction(&self.path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1086,19 +1354,86 @@ impl RecordStore {
                 keep.insert(record.id);
             }
         }
-        self.records.retain(|id, _| keep.contains(id));
-
         let temporary = self.path.with_extension("jsonl.tmp");
+        let backup = self.path.with_extension("jsonl.bak");
+        remove_file_if_exists(&temporary)?;
+        remove_file_if_exists(&backup)?;
         let mut file = File::create(&temporary)?;
-        for record in self.sorted_records() {
+        for record in self
+            .sorted_records()
+            .into_iter()
+            .filter(|record| keep.contains(&record.id))
+        {
             serde_json::to_writer(&mut file, &record)?;
             file.write_all(b"\n")?;
         }
         file.sync_all()?;
+        drop(file);
         if self.path.exists() {
-            fs::remove_file(&self.path)?;
+            fs::rename(&self.path, &backup)?;
         }
-        fs::rename(temporary, &self.path)
+        if let Err(error) = fs::rename(&temporary, &self.path) {
+            if !self.path.exists() && backup.exists() {
+                let _ = fs::rename(&backup, &self.path);
+            }
+            return Err(error);
+        }
+        self.records.retain(|id, _| keep.contains(id));
+        remove_file_if_exists(&backup)
+    }
+}
+
+fn recover_compaction(path: &std::path::Path) -> io::Result<()> {
+    let temporary = path.with_extension("jsonl.tmp");
+    let backup = path.with_extension("jsonl.bak");
+    if path.exists() {
+        remove_file_if_exists(&temporary)?;
+        remove_file_if_exists(&backup)?;
+        return Ok(());
+    }
+    if temporary.exists() && store_is_complete(&temporary)? {
+        fs::rename(&temporary, path)?;
+        remove_file_if_exists(&backup)?;
+        return Ok(());
+    }
+    if backup.exists() && store_is_complete(&backup)? {
+        fs::rename(&backup, path)?;
+        remove_file_if_exists(&temporary)?;
+        return Ok(());
+    }
+    if temporary.exists() || backup.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no complete event store remains after interrupted compaction",
+        ));
+    }
+    Ok(())
+}
+
+fn store_is_complete(path: &std::path::Path) -> io::Result<bool> {
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(true);
+    }
+    if !bytes.ends_with(b"\n") {
+        return Ok(false);
+    }
+    for line in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        let Ok(record) = serde_json::from_slice::<ActionRecord>(line) else {
+            return Ok(false);
+        };
+        if record.schema_version != ACTION_SCHEMA_VERSION {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn remove_file_if_exists(path: &std::path::Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
