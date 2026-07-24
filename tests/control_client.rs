@@ -1,12 +1,14 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use serde_json::json;
 use tempfile::tempdir;
+use tmux_mcp_rs::commands::CommandTracker;
 use tmux_mcp_rs::control::{
     load_or_create_token, set_gate_enabled, ControlClient, GateDecision, StatePaths,
 };
 use tmux_mcp_rs::security::SecurityPolicy;
-use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus};
+use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus, ShellType};
 use tmux_mcp_rs::web::{build_router, HubState};
 
 async fn start_hub(
@@ -18,7 +20,13 @@ async fn start_hub(
 ) {
     let token = load_or_create_token(&paths).expect("token");
     let state = HubState::open(paths).expect("open hub");
-    let app = build_router(state.clone(), token, SecurityPolicy::default(), None);
+    let app = build_router(
+        state.clone(),
+        token,
+        SecurityPolicy::default(),
+        None,
+        Arc::new(CommandTracker::new(ShellType::Bash)),
+    );
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await

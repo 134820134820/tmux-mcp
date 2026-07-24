@@ -17,6 +17,7 @@ mod web;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use rmcp::ServiceExt;
@@ -243,7 +244,12 @@ async fn main() {
         let socket = std::env::var("TMUX_MCP_SOCKET")
             .ok()
             .filter(|value| !value.is_empty());
-        let app = crate::web::build_router(hub, token, security_policy, socket);
+        let tracker = Arc::new(if cli.config.is_some() {
+            CommandTracker::with_tracking(shell_type, tracking_config)
+        } else {
+            CommandTracker::new(shell_type)
+        });
+        let app = crate::web::build_router(hub, token, security_policy, socket, tracker);
         let listener = match tokio::net::TcpListener::bind(cli.web_bind).await {
             Ok(listener) => listener,
             Err(error) => {

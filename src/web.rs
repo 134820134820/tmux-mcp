@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
+use crate::commands::CommandTracker;
 use crate::control::{
     set_gate_enabled, ActionKind, ActionRecord, AuthorizationResponse, GateDecision, StatePaths,
     ACTION_SCHEMA_VERSION,
@@ -66,6 +67,8 @@ struct AppContext {
     token: Arc<str>,
     policy: Arc<SecurityPolicy>,
     socket: Option<String>,
+    #[allow(dead_code)]
+    tracker: Arc<CommandTracker>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,12 +169,14 @@ pub fn build_router(
     token: String,
     policy: SecurityPolicy,
     socket: Option<String>,
+    tracker: Arc<CommandTracker>,
 ) -> Router {
     let context = AppContext {
         hub,
         token: Arc::from(token),
         policy: Arc::new(policy),
         socket,
+        tracker,
     };
     let api = Router::new()
         .route("/api/state", get(api_state))
