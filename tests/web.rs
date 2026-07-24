@@ -449,8 +449,10 @@ async fn command_endpoint_applies_existing_command_policy() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
     let token = "h".repeat(64);
-    let mut config = SecurityConfig::default();
-    config.allow_execute_command = false;
+    let config = SecurityConfig {
+        allow_execute_command: false,
+        ..SecurityConfig::default()
+    };
     let policy = SecurityPolicy::from_config(config).unwrap();
     let app = build_router(
         state.clone(),

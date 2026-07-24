@@ -252,8 +252,8 @@ tmux-mcp-rs --web --web-bind 127.0.0.1:38473 --ssh user@host --config /path/to/c
 
 Then open `http://127.0.0.1:38473`. The page has two views:
 
-- **Messages** shows clean terminal results for tracked commands and distinct cards for AI or human input. Session, window, layout, and other control operations stay in the operation log.
-- **Interactive** refreshes the selected pane with `capture-pane` every 250 ms and forwards typed characters and common control keys immediately through the existing `send-keys` path. It is a pane snapshot and key forwarder, not a browser PTY or xterm.
+- **Messages** has a composer at the bottom for submitting a complete single-line command. The command appears as a “You” card that updates in place from running to a clean terminal result. Raw key and `send-keys` activity shows the input only; it does not claim ownership of subsequent pane output. Session, window, layout, and other control operations stay in the operation log.
+- **Interactive** preserves the pane snapshot and per-key experience: it refreshes the selected pane with `capture-pane` every 250 ms and forwards typed characters and common control keys immediately through the existing `send-keys` path. It is a pane snapshot and key forwarder, not a browser PTY or xterm.
 
 Gate is global and starts disabled on a new installation. When enabled, explicitly read-only MCP tools still run immediately; every other MCP request waits for approval. Webpage input bypasses Gate but still follows the configured security policy.
 

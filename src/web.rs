@@ -583,6 +583,7 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
