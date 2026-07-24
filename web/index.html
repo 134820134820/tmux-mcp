@@ -385,6 +385,12 @@
         font: 700 13px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
       }
 
+      .shell-command { color: var(--blue); font-weight: 700; }
+      .shell-option { color: #a16207; }
+      .shell-string { color: #047857; }
+      .shell-operator { color: #7c3aed; font-weight: 700; }
+      .shell-assignment { color: #0e7490; }
+
       .command-output {
         min-height: 20px;
         margin-top: 10px;
@@ -870,6 +876,36 @@
           : JSON.stringify(record.result, null, 2);
       }
 
+      function renderCommand(command) {
+        const element = node("pre", "command-text");
+        const pattern = /'(?:[^']*)'|"(?:\\.|[^"\\])*"|&&|\|\||[|;<>]|--?[A-Za-z0-9][\w-]*|[^\s|;&<>]+/g;
+        let offset = 0;
+        let expectsCommand = true;
+        for (const match of command.matchAll(pattern)) {
+          element.appendChild(document.createTextNode(command.slice(offset, match.index)));
+          const token = match[0];
+          let className = "";
+          if (/^['"]/.test(token)) {
+            className = "shell-string";
+          } else if (/^--?/.test(token)) {
+            className = "shell-option";
+          } else if (/^(?:&&|\|\||[|;<>])$/.test(token)) {
+            className = "shell-operator";
+            if (["&&", "||", "|", ";"].includes(token)) expectsCommand = true;
+          } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+            className = "shell-assignment";
+          } else if (expectsCommand) {
+            className = "shell-command";
+            expectsCommand = false;
+          }
+          element.appendChild(node("span", className, token));
+          offset = match.index + token.length;
+        }
+        element.appendChild(document.createTextNode(command.slice(offset)));
+        element.setAttribute("aria-label", "命令");
+        return element;
+      }
+
       function appendLabeledPre(parent, label, text, className) {
         const block = node("div", "result-block");
         block.appendChild(node("p", "card-label", label));
@@ -899,9 +935,8 @@
           const running = ["requested", "approved", "running"].includes(record.status);
           const commandLine = node("div", "command-line");
           const prompt = node("span", "command-prompt", "$");
-          const commandText = node("pre", "command-text", command);
+          const commandText = renderCommand(command);
           prompt.setAttribute("aria-hidden", "true");
-          commandText.setAttribute("aria-label", "命令");
           commandLine.appendChild(prompt);
           commandLine.appendChild(commandText);
           body.appendChild(commandLine);
