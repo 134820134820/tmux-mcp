@@ -95,9 +95,7 @@ fn message_refresh_preserves_manual_scroll_position() {
 
 #[test]
 fn running_command_notice_names_its_actual_source() {
-    assert!(PAGE.contains(
-        r#"source === "你" ? "你正在提交命令" : `进程 ${source} 正在提交命令`"#
-    ));
+    assert!(PAGE.contains(r#"source === "你" ? "你正在提交命令" : `进程 ${source} 正在提交命令`"#));
     assert!(!PAGE.contains("AI 正在这个 pane"));
 }
 

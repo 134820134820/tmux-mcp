@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -39,6 +40,7 @@ const APPEND_INLINE_MAX_BYTES: u64 = 262_144;
 const PARALLEL_BUFFER_THRESHOLD: usize = 10;
 /// Fuzzy scoring skips individual lines larger than this to bound CPU.
 const FUZZY_MAX_LINE_BYTES: usize = 4_096;
+const READ_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 static TMUX_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TMUX_MAX_CONCURRENCY));
 
@@ -424,6 +426,143 @@ pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Re
 /// Run tmux on the process-default socket (`TMUX_MCP_SOCKET` / platform default).
 pub async fn execute_tmux(args: &[&str]) -> Result<String> {
     execute_tmux_with_socket(args, None).await
+}
+
+async fn execute_read_only_program(cwd: &str, program: &str, args: &[&str]) -> Result<Vec<u8>> {
+    let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
+        message: format!("tmux semaphore closed: {e}"),
+    })?;
+
+    let mut command = if let Some(mut ssh_args) = get_ssh_args()? {
+        ssh_args.insert(0, "-n".to_string());
+        ssh_args.push(format!(
+            "cd -- {} && {}",
+            quote_remote_arg(cwd),
+            build_remote_command(program, args)
+        ));
+        let mut command = Command::new("ssh");
+        command.args(ssh_args);
+        command
+    } else {
+        let mut command = Command::new(program);
+        command.current_dir(cwd).args(args);
+        command
+    };
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, command.output())
+        .await
+        .map_err(|_| Error::Tmux {
+            message: format!("{program} timed out after 10 seconds"),
+        })?
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to spawn {program}: {e}"),
+        })?;
+
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(Error::Tmux {
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+}
+
+fn validate_read_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(Error::InvalidArgument {
+            message: "path must not be empty".to_string(),
+        });
+    }
+    if path.contains('\0') {
+        return Err(Error::InvalidArgument {
+            message: "path must not contain NUL".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// List a local or remote directory without accepting arbitrary shell flags.
+pub async fn list_directory(
+    cwd: &str,
+    path: &str,
+    show_hidden: bool,
+    max_entries: usize,
+) -> Result<(Vec<String>, bool)> {
+    validate_read_path(path)?;
+    let mut entries = if ssh_enabled()? {
+        let flag = if show_hidden { "-1Ab" } else { "-1b" };
+        String::from_utf8_lossy(
+            &execute_read_only_program(cwd, "/bin/ls", &[flag, "--", path]).await?,
+        )
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    } else {
+        let path = if Path::new(path).is_absolute() {
+            Path::new(path).to_path_buf()
+        } else {
+            Path::new(cwd).join(path)
+        };
+        let mut directory = tokio::fs::read_dir(&path).await.map_err(|e| Error::Tmux {
+            message: format!("unable to list '{}': {e}", path.display()),
+        })?;
+        let mut entries = Vec::new();
+        while let Some(entry) = directory.next_entry().await.map_err(|e| Error::Tmux {
+            message: format!("unable to read '{}': {e}", path.display()),
+        })? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if show_hidden || !name.starts_with('.') {
+                entries.push(name);
+                if entries.len() > max_entries {
+                    break;
+                }
+            }
+        }
+        entries
+    };
+    let truncated = entries.len() > max_entries;
+    entries.truncate(max_entries);
+    Ok((entries, truncated))
+}
+
+/// Read a bounded byte prefix from a local or remote file.
+pub async fn read_file(cwd: &str, path: &str, max_bytes: usize) -> Result<(String, usize, bool)> {
+    validate_read_path(path)?;
+    let mut bytes = if ssh_enabled()? {
+        let count = (max_bytes + 1).to_string();
+        execute_read_only_program(cwd, "/usr/bin/head", &["-c", &count, "--", path]).await?
+    } else {
+        let path = if Path::new(path).is_absolute() {
+            Path::new(path).to_path_buf()
+        } else {
+            Path::new(cwd).join(path)
+        };
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| Error::Tmux {
+                message: format!("unable to open '{}': {e}", path.display()),
+            })?;
+        let mut bytes = Vec::new();
+        file.take((max_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| Error::Tmux {
+                message: format!("unable to read '{}': {e}", path.display()),
+            })?;
+        bytes
+    };
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    let bytes_read = bytes.len();
+    Ok((
+        String::from_utf8_lossy(&bytes).into_owned(),
+        bytes_read,
+        truncated,
+    ))
 }
 
 /// Resolve a remote path with `realpath` over SSH (requires `TMUX_MCP_SSH`).
@@ -2722,6 +2861,37 @@ mod tests {
     use rstest::rstest;
     use std::fs;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn readonly_filesystem_helpers_apply_visibility_and_size_limits() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SSH");
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("alpha.txt"), "hello world").expect("write alpha");
+        fs::write(dir.path().join("beta.txt"), "beta").expect("write beta");
+        fs::write(dir.path().join(".hidden"), "hidden").expect("write hidden");
+        let cwd = dir.path().to_string_lossy();
+
+        let (visible, truncated) = list_directory(&cwd, ".", false, 1)
+            .await
+            .expect("list visible files");
+        assert_eq!(visible.len(), 1);
+        assert!(truncated);
+        assert!(!visible.iter().any(|name| name == ".hidden"));
+
+        let (all, truncated) = list_directory(&cwd, ".", true, 10)
+            .await
+            .expect("list all files");
+        assert!(!truncated);
+        assert!(all.iter().any(|name| name == ".hidden"));
+
+        let (content, bytes_read, truncated) = read_file(&cwd, "alpha.txt", 5)
+            .await
+            .expect("read bounded file");
+        assert_eq!(content, "hello");
+        assert_eq!(bytes_read, 5);
+        assert!(truncated);
+    }
 
     #[rstest]
     #[case(
