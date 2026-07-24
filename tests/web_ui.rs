@@ -117,6 +117,22 @@ fn gate_approval_is_a_non_blocking_popover_above_the_composer() {
 }
 
 #[test]
+fn gate_control_uses_an_accessible_toggle_switch() {
+    for marker in [
+        r#"<span class="gate-switch" aria-hidden="true"></span>"#,
+        ".gate-switch::after",
+        ".gate-control input:checked + .gate-switch",
+        ".gate-control input:focus-visible + .gate-switch",
+        "transform: translateX(16px)",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing Gate switch marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn command_cards_use_unlabeled_streams_and_collapsed_run_details() {
     for marker in [
         r#"node("details", "command-details")"#,
