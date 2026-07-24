@@ -1062,6 +1062,10 @@
         const paneId = selectedPane;
         const command = elements.commandInput.value;
         if (!paneId || commandSubmitting || !command.trim()) return;
+        if (command.includes("\r") || command.includes("\n")) {
+          showError("命令只能包含一行");
+          return;
+        }
         commandSubmitting = true;
         updateComposer();
         try {
@@ -1076,7 +1080,7 @@
         } finally {
           commandSubmitting = false;
           updateComposer();
-          elements.commandInput.focus();
+          if (mode === "messages") elements.commandInput.focus();
         }
       });
 
