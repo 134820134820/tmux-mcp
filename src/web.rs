@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
@@ -19,20 +19,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{oneshot, Mutex};
 
-use crate::commands::CommandTracker;
+use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{
     set_gate_enabled, ActionKind, ActionRecord, AuthorizationResponse, GateDecision, StatePaths,
     ACTION_SCHEMA_VERSION,
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
-use crate::types::{Pane, Session, Window};
+use crate::types::{CommandSnapshot, Pane, Session, Window};
 
 const PER_PANE_LIMIT: usize = 200;
 const OPERATION_LIMIT: usize = 200;
 const COMPACT_AT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const TOKEN_HEADER: &str = "x-tmux-mcp-token";
+const TOPOLOGY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct HubState {
@@ -44,6 +45,7 @@ struct HubInner {
     store: Mutex<RecordStore>,
     pending: Mutex<HashMap<String, PendingApproval>>,
     last_human: Mutex<Option<HumanGroup>>,
+    web_commands: Mutex<HashMap<String, ActionRecord>>,
 }
 
 struct PendingApproval {
@@ -67,8 +69,13 @@ struct AppContext {
     token: Arc<str>,
     policy: Arc<SecurityPolicy>,
     socket: Option<String>,
-    #[allow(dead_code)]
     tracker: Arc<CommandTracker>,
+    topology_cache: Arc<Mutex<TopologyCache>>,
+}
+
+#[derive(Default)]
+struct TopologyCache {
+    value: Option<(Instant, Result<Topology, String>)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,20 +96,20 @@ struct StateResponse {
     activity: HashMap<String, u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Topology {
     sessions: Vec<SessionNode>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionNode {
     session: Session,
     windows: Vec<WindowNode>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WindowNode {
     window: Window,
@@ -183,12 +190,42 @@ pub fn build_router(
     socket: Option<String>,
     tracker: Arc<CommandTracker>,
 ) -> Router {
+    let mut events = tracker.subscribe_events();
+    let event_tracker = Arc::clone(&tracker);
+    let event_hub = hub.clone();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event)
+                    if event.kind == CommandEventKind::Terminal
+                        || (event.kind == CommandEventKind::Updated
+                            && event.status.is_terminal()) =>
+                {
+                    if let Some(execution) = event_tracker.get_command(&event.command_id).await {
+                        let recorded = event_hub
+                            .update_web_command(CommandSnapshot::from_execution(&execution, None))
+                            .await
+                            .unwrap_or(false);
+                        if recorded && event.kind == CommandEventKind::Updated {
+                            event_hub.forget_web_command(&event.command_id).await;
+                        }
+                    }
+                }
+                Ok(event) if event.kind == CommandEventKind::Evicted => {
+                    event_hub.forget_web_command(&event.command_id).await;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     let context = AppContext {
         hub,
         token: Arc::from(token),
         policy: Arc::new(policy),
         socket,
         tracker,
+        topology_cache: Arc::new(Mutex::new(TopologyCache::default())),
     };
     let api = Router::new()
         .route("/api/state", get(api_state))
@@ -245,7 +282,7 @@ async fn api_state(
         Some(pane_id) => context.hub.records_for_pane(pane_id).await,
         None => Vec::new(),
     };
-    let (topology, topology_error) = match load_topology(&context).await {
+    let (topology, topology_error) = match cached_topology(&context).await {
         Ok(topology) => (Some(topology), None),
         Err(error) => (None, Some(error)),
     };
@@ -418,7 +455,86 @@ async fn send_command(
     if let Err(error) = context.policy.check_command(&input.command) {
         return policy_response(error);
     }
-    StatusCode::NOT_IMPLEMENTED.into_response()
+    let mut record = ActionRecord::new(
+        "你",
+        "execute-command",
+        json!({"paneId": pane_id, "command": input.command}),
+    );
+    record.mark_running();
+    let command_id = match context
+        .tracker
+        .execute_command(
+            &pane_id,
+            &input.command,
+            false,
+            false,
+            None,
+            context.socket.clone(),
+        )
+        .await
+    {
+        Ok(command_id) => command_id,
+        Err(error) => {
+            record.mark_failed(Some(json!({"error": error.to_string()})));
+            return match context.hub.upsert(record).await {
+                Ok(()) => (
+                    StatusCode::BAD_GATEWAY,
+                    format!("unable to execute command: {error}"),
+                )
+                    .into_response(),
+                Err(store_error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("command failed and could not be recorded: {store_error}"),
+                )
+                    .into_response(),
+            };
+        }
+    };
+    if let Err(error) = context
+        .hub
+        .track_web_command(command_id.clone(), record)
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("command started but could not be recorded: {error}"),
+        )
+            .into_response();
+    }
+    if let Some(execution) = context.tracker.get_command(&command_id).await {
+        if execution.status.is_terminal() {
+            let presentation_ready = execution.output.is_some() || !execution.output_truncated;
+            let recorded = context
+                .hub
+                .update_web_command(CommandSnapshot::from_execution(&execution, None))
+                .await
+                .unwrap_or(false);
+            if recorded && presentation_ready {
+                context.hub.forget_web_command(&command_id).await;
+            }
+        }
+    }
+    (StatusCode::ACCEPTED, Json(CommandAccepted { command_id })).into_response()
+}
+
+async fn cached_topology(context: &AppContext) -> Result<Topology, String> {
+    let mut cache = context.topology_cache.lock().await;
+    let now = Instant::now();
+    if let Some(value) = cache.get(now) {
+        return value;
+    }
+    let value = load_topology(context).await;
+    cache.value = Some((Instant::now(), value.clone()));
+    value
+}
+
+impl TopologyCache {
+    fn get(&self, now: Instant) -> Option<Result<Topology, String>> {
+        self.value
+            .as_ref()
+            .filter(|(loaded_at, _)| now.duration_since(*loaded_at) < TOPOLOGY_CACHE_TTL)
+            .map(|(_, value)| value.clone())
+    }
 }
 
 async fn load_topology(context: &AppContext) -> Result<Topology, String> {
@@ -464,6 +580,25 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
         });
     }
     Ok(Topology { sessions: nodes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_cache_reuses_fresh_errors_and_expires_stale_data() {
+        let loaded_at = Instant::now();
+        let cache = TopologyCache {
+            value: Some((loaded_at, Err("tmux unavailable".into()))),
+        };
+
+        assert!(matches!(
+            cache.get(loaded_at + Duration::from_secs(4)),
+            Some(Err(error)) if error == "tmux unavailable"
+        ));
+        assert!(cache.get(loaded_at + Duration::from_secs(5)).is_none());
+    }
 }
 
 async fn authorize_pane_action(
@@ -616,6 +751,7 @@ impl HubState {
                 store: Mutex::new(store),
                 pending: Mutex::new(HashMap::new()),
                 last_human: Mutex::new(None),
+                web_commands: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -626,6 +762,37 @@ impl HubState {
 
     pub async fn upsert(&self, record: ActionRecord) -> io::Result<()> {
         self.inner.store.lock().await.upsert(record)
+    }
+
+    pub async fn track_web_command(
+        &self,
+        command_id: String,
+        record: ActionRecord,
+    ) -> io::Result<()> {
+        self.inner
+            .web_commands
+            .lock()
+            .await
+            .insert(command_id.clone(), record.clone());
+        if let Err(error) = self.upsert(record).await {
+            self.inner.web_commands.lock().await.remove(&command_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn update_web_command(&self, snapshot: CommandSnapshot) -> io::Result<bool> {
+        let mut commands = self.inner.web_commands.lock().await;
+        let Some(record) = commands.get_mut(&snapshot.command_id) else {
+            return Ok(false);
+        };
+        record.mark_command(snapshot);
+        self.upsert(record.clone()).await?;
+        Ok(true)
+    }
+
+    pub async fn forget_web_command(&self, command_id: &str) {
+        self.inner.web_commands.lock().await.remove(command_id);
     }
 
     pub async fn authorize(&self, mut record: ActionRecord) -> GateDecision {

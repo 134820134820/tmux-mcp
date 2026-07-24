@@ -12,12 +12,58 @@ use tmux_mcp_rs::control::{
     set_gate_enabled, ActionRecord, ActionStatus, GateDecision, StatePaths,
 };
 use tmux_mcp_rs::security::{SecurityConfig, SecurityPolicy};
-use tmux_mcp_rs::types::ShellType;
+use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus, ShellType};
 use tmux_mcp_rs::web::{build_router, validate_bind_address, validate_key_input, HubState};
 use tower::ServiceExt;
 
 fn test_tracker() -> Arc<CommandTracker> {
     Arc::new(CommandTracker::new(ShellType::Bash))
+}
+
+#[tokio::test]
+async fn web_command_terminal_snapshot_updates_same_record() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+    let mut record = ActionRecord::new(
+        "你",
+        "execute-command",
+        json!({"paneId": "%1", "command": "true"}),
+    );
+    record.mark_running();
+    let record_id = record.id.clone();
+
+    state
+        .track_web_command("cmd-1".into(), record)
+        .await
+        .expect("track command");
+    state
+        .update_web_command(CommandSnapshot {
+            command_id: "cmd-1".into(),
+            resource_uri: "tmux://command/cmd-1/result".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            command: "true".into(),
+            pane_id: "%1".into(),
+            socket: None,
+            output: Some("clean output\n".into()),
+            output_truncated: false,
+            elapsed_ms: 42,
+            reason: None,
+            wait_timed_out: None,
+            schema_version: CommandSnapshot::SCHEMA_VERSION,
+        })
+        .await
+        .expect("update command");
+
+    let records = state.records_for_pane("%1").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, record_id);
+    assert_eq!(records[0].status, ActionStatus::Completed);
+    let snapshot = records[0].command_snapshot.as_ref().expect("snapshot");
+    assert_eq!(snapshot.output.as_deref(), Some("clean output\n"));
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.elapsed_ms, 42);
+    assert!(!snapshot.output_truncated);
 }
 
 #[tokio::test]
