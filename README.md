@@ -1,18 +1,24 @@
 # tmux MCP 启动指南
 
-以下命令中的 `tmux-mcp-rs.exe` 可替换为 exe 的绝对路径，`user@host` 替换为 SSH 地址。
-
-## 启动网页控制中心
+## 构建
 
 ```powershell
-tmux-mcp-rs.exe --web --web-bind 127.0.0.1:38473 --ssh user@host
+& "D:\DaveWorks\tmux-mcp\scripts\build-release.ps1"
 ```
 
-打开：
+可直接使用和提交的产物：
 
 ```text
-http://127.0.0.1:38473/
+D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe
 ```
+
+## 控制中心
+
+```powershell
+& "D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe" --web --web-bind 127.0.0.1:38473 --ssh milab-ten
+```
+
+打开 `http://127.0.0.1:38473/`。
 
 ## Codex
 
@@ -20,30 +26,30 @@ http://127.0.0.1:38473/
 
 ```toml
 [mcp_servers.tmux]
-command = 'C:\path\to\tmux-mcp-rs.exe'
-args = ["--ssh", "user@host", "--web-url", "http://127.0.0.1:38473", "--client-name", "Codex"]
+command = 'D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe'
+args = ["--ssh", "milab-ten", "--web-url", "http://127.0.0.1:38473", "--client-name", "Codex"]
 ```
 
 重启 Codex。
 
 ## Claude Code
 
-```powershell
-claude mcp add --transport stdio tmux -- tmux-mcp-rs.exe --ssh user@host --web-url http://127.0.0.1:38473 --client-name "Claude Code"
-```
-
-## 不使用网页
-
-Codex：
-
-```toml
-[mcp_servers.tmux]
-command = 'C:\path\to\tmux-mcp-rs.exe'
-args = ["--ssh", "user@host"]
-```
-
-Claude Code：
+Claude 只记录 exe 路径，不会复制 exe。未加入 `PATH` 时必须使用绝对路径：
 
 ```powershell
-claude mcp add --transport stdio tmux -- tmux-mcp-rs.exe --ssh user@host
+claude mcp add --scope user --transport stdio tmux -- "D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe" --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code"
+```
+
+`--scope`：
+
+- `local`：默认值，仅当前项目、仅当前用户可用。
+- `project`：当前项目共享配置，写入项目 `.mcp.json`。
+- `user`：当前 Windows 用户的所有项目可用。
+
+## 不使用控制中心
+
+删除 `--web-url` 和 `--client-name` 即可：
+
+```powershell
+& "D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe" --ssh milab-ten
 ```
