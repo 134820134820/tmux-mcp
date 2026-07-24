@@ -33,6 +33,22 @@ fn page_polls_snapshots_and_uses_the_control_api() {
 }
 
 #[test]
+fn message_mode_contains_a_single_line_command_composer() {
+    for marker in [
+        r#"id="command-composer""#,
+        r#"id="command-input""#,
+        r#"id="command-send""#,
+        "/api/panes/${encodeURIComponent(paneId)}/commands",
+        "requestSubmit()",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing command composer marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn page_never_renders_remote_text_as_html() {
     assert!(PAGE.contains("textContent"));
     assert!(!PAGE.contains("innerHTML"));
