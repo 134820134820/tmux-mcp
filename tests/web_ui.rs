@@ -87,6 +87,30 @@ fn command_composer_only_restores_focus_in_message_mode() {
 }
 
 #[test]
+fn message_refresh_preserves_manual_scroll_position() {
+    assert!(PAGE.contains(
+        "elements.messageList.scrollTop = followLatest ? elements.messageList.scrollHeight : scrollTop;"
+    ));
+}
+
+#[test]
+fn command_cards_use_unlabeled_streams_and_collapsed_run_details() {
+    for marker in [
+        r#"node("details", "command-details")"#,
+        r#"node("summary", "", "运行详情")"#,
+        r#"node("span", "command-prompt", "$")"#,
+        r#"output.setAttribute("aria-label", "输出")"#,
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing command card marker: {marker}"
+        );
+    }
+    assert!(!PAGE.contains(r#"body.appendChild(node("p", "card-label", "命令"))"#));
+    assert!(!PAGE.contains(r#"snapshot.outputTruncated ? "输出（已截断）" : "完整输出""#));
+}
+
+#[test]
 fn page_never_renders_remote_text_as_html() {
     assert!(PAGE.contains("textContent"));
     assert!(!PAGE.contains("innerHTML"));

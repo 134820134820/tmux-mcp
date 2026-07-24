@@ -363,20 +363,53 @@
         font: 13px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
       }
 
-      .command-text, .input-text, .result-text {
+      .input-text, .result-text {
         padding: 10px 11px;
         border: 1px solid var(--line);
         border-radius: 8px;
         background: var(--panel);
       }
 
+      .command-line {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 9px;
+        padding: 10px 11px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel-2);
+      }
+
+      .command-prompt {
+        color: var(--green);
+        font: 700 13px/1.55 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      }
+
+      .command-output {
+        min-height: 20px;
+        margin-top: 10px;
+        padding: 10px 12px;
+        border-left: 3px solid var(--line);
+        color: var(--text);
+        background: var(--panel);
+      }
+
       .result-block { margin-top: 12px; }
+
+      .command-details {
+        width: fit-content;
+        margin-top: 9px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .command-details summary { cursor: pointer; user-select: none; }
 
       .command-meta {
         display: flex;
         flex-wrap: wrap;
         gap: 14px;
-        margin: 10px 1px 0;
+        margin: 8px 1px 0;
         color: var(--muted);
         font-size: 11px;
       }
@@ -854,33 +887,48 @@
         header.appendChild(source);
         header.appendChild(node("strong", "", record.tool));
         header.appendChild(node("span", "card-time", formatTime(record.updatedAtMs)));
-        header.appendChild(node("span", "status-pill", humanStatus(record.status)));
+        if (record.kind !== "command") {
+          header.appendChild(node("span", "status-pill", humanStatus(record.status)));
+        }
         card.appendChild(header);
 
         const body = node("div", "card-body");
         if (record.kind === "command") {
           const snapshot = record.commandSnapshot || {};
           const command = snapshot.command || record.arguments?.command || "";
-          body.appendChild(node("p", "card-label", "命令"));
-          body.appendChild(node("pre", "command-text", command));
-          if (["requested", "approved", "running"].includes(record.status)) {
-            body.appendChild(node("p", "subtle", "正在运行…"));
-          } else {
-            const meta = node("div", "command-meta");
+          const running = ["requested", "approved", "running"].includes(record.status);
+          const commandLine = node("div", "command-line");
+          const prompt = node("span", "command-prompt", "$");
+          const commandText = node("pre", "command-text", command);
+          prompt.setAttribute("aria-hidden", "true");
+          commandText.setAttribute("aria-label", "命令");
+          commandLine.appendChild(prompt);
+          commandLine.appendChild(commandText);
+          body.appendChild(commandLine);
+
+          if (!running) {
+            const output = node(
+              "pre",
+              "command-output",
+              snapshot.output ?? snapshot.reason ?? "（无输出）"
+            );
+            output.setAttribute("aria-label", "输出");
+            body.appendChild(output);
+          }
+
+          const details = node("details", "command-details");
+          details.appendChild(node("summary", "", "运行详情"));
+          const meta = node("div", "command-meta");
+          meta.appendChild(node("span", "", `状态 ${snapshot.status || record.status}`));
+          if (!running) {
             meta.appendChild(node("span", "", `退出码 ${snapshot.exitCode ?? "未知"}`));
             meta.appendChild(node("span", "", `耗时 ${snapshot.elapsedMs ?? 0}ms`));
-            meta.appendChild(node("span", "", `状态 ${snapshot.status || record.status}`));
             if (snapshot.outputTruncated) {
               meta.appendChild(node("span", "truncated", "输出不完整"));
             }
-            body.appendChild(meta);
-            appendLabeledPre(
-              body,
-              snapshot.outputTruncated ? "输出（已截断）" : "完整输出",
-              snapshot.output ?? snapshot.reason ?? "",
-              "result-text"
-            );
           }
+          details.appendChild(meta);
+          body.appendChild(details);
         } else {
           body.appendChild(node("p", "card-label", record.source === "你" ? "你的输入" : "AI 输入"));
           body.appendChild(node("pre", "input-text", displayInput(record)));
@@ -892,6 +940,9 @@
       }
 
       function renderMessages(records) {
+        const scrollTop = elements.messageList.scrollTop;
+        const followLatest =
+          elements.messageList.scrollHeight - scrollTop - elements.messageList.clientHeight <= 2;
         clear(elements.messageList);
         const running = records.some(
           (record) => record.kind === "command" && ["requested", "approved", "running"].includes(record.status)
@@ -906,7 +957,7 @@
           return;
         }
         for (const record of records) elements.messageList.appendChild(renderCard(record));
-        elements.messageList.scrollTop = elements.messageList.scrollHeight;
+        elements.messageList.scrollTop = followLatest ? elements.messageList.scrollHeight : scrollTop;
       }
 
       function appendDefinition(list, term, value) {
