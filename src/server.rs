@@ -114,8 +114,13 @@ use crate::security::{SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
     command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandSnapshot,
-    CommandStatus, Pane, SearchMode, Session, Window,
+    CommandStatus, Pane, PaneInfo, SearchMode, Session, Window,
 };
+
+const DEFAULT_DIRECTORY_ENTRIES: u32 = 200;
+const MAX_DIRECTORY_ENTRIES: u32 = 500;
+const DEFAULT_FILE_BYTES: u32 = 65_536;
+const MAX_FILE_BYTES: u32 = 262_144;
 
 /// stdio MCP server: policy-gated tool router, command tracker, and dynamic resources.
 ///
@@ -263,6 +268,27 @@ pub struct ListBuffersOutput {
     pub buffers: Vec<BufferInfo>,
 }
 
+/// `list-directory` structured payload.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDirectoryOutput {
+    pub cwd: String,
+    pub path: String,
+    pub entries: Vec<String>,
+    pub truncated: bool,
+}
+
+/// `read-file` structured payload.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadFileOutput {
+    pub cwd: String,
+    pub path: String,
+    pub content: String,
+    pub bytes_read: usize,
+    pub truncated: bool,
+}
+
 /// `get-command-result` payload (same schema as command resources).
 pub type GetCommandResultOutput = CommandSnapshot;
 
@@ -339,6 +365,39 @@ pub struct CapturePaneInput {
     pub end: Option<i32>,
     /// Join soft-wrapped lines when true.
     pub join: Option<bool>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `list-directory`: bounded non-recursive directory listing.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListDirectoryInput {
+    /// Pane whose current working directory resolves relative paths.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Absolute path or path relative to the pane's current working directory.
+    pub path: Option<String>,
+    /// Include dotfiles except `.` and `..` (default false).
+    #[serde(rename = "showHidden")]
+    pub show_hidden: Option<bool>,
+    /// Maximum entries to return (default 200, maximum 500).
+    #[serde(rename = "maxEntries")]
+    pub max_entries: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `read-file`: bounded text preview from a regular or special file.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadFileInput {
+    /// Pane whose current working directory resolves relative paths.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Absolute path or path relative to the pane's current working directory.
+    pub path: String,
+    /// Maximum bytes to return (default 65536, maximum 262144).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u32>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -1085,6 +1144,16 @@ impl TmuxMcpServer {
         self.enforce_session_target(&info.session_id, socket).await
     }
 
+    async fn checked_pane_info(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+    ) -> Result<PaneInfo, crate::errors::Error> {
+        self.policy.check_pane(pane_id)?;
+        self.enforce_session_for_pane(pane_id, socket).await?;
+        tmux::pane_info(pane_id, socket).await
+    }
+
     async fn enforce_session_for_window(
         &self,
         window_id: &str,
@@ -1442,6 +1511,101 @@ impl TmuxMcpServer {
             )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error capturing pane: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "list-directory",
+        description = "List one remote directory without running arbitrary shell text. Paths may be absolute or relative to the target pane cwd. Non-recursive, bounded, and Gate-safe; raw execute-command ls remains gated.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<ListDirectoryOutput>()
+    )]
+    async fn list_directory(
+        &self,
+        input: Parameters<ListDirectoryInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("list-directory") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let max_entries = input.0.max_entries.unwrap_or(DEFAULT_DIRECTORY_ENTRIES);
+        if !(1..=MAX_DIRECTORY_ENTRIES).contains(&max_entries) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxEntries must be between 1 and {MAX_DIRECTORY_ENTRIES}"
+            ))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let pane = match self
+            .checked_pane_info(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            Ok(pane) => pane,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        let path = input.0.path.unwrap_or_else(|| ".".to_string());
+        match tmux::list_directory(
+            &pane.current_path,
+            &path,
+            input.0.show_hidden.unwrap_or(false),
+            max_entries as usize,
+        )
+        .await
+        {
+            Ok((entries, truncated)) => Ok(structured_output(&ListDirectoryOutput {
+                cwd: pane.current_path,
+                path,
+                entries,
+                truncated,
+            })),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error listing directory: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "read-file",
+        description = "Read a bounded text prefix from a remote file without running arbitrary shell text. Paths may be absolute or relative to the target pane cwd. Read-only but may expose sensitive data such as keys or credentials.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<ReadFileOutput>()
+    )]
+    async fn read_file(
+        &self,
+        input: Parameters<ReadFileInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("read-file") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let max_bytes = input.0.max_bytes.unwrap_or(DEFAULT_FILE_BYTES);
+        if !(1..=MAX_FILE_BYTES).contains(&max_bytes) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxBytes must be between 1 and {MAX_FILE_BYTES}"
+            ))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let pane = match self
+            .checked_pane_info(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            Ok(pane) => pane,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        match tmux::read_file(&pane.current_path, &input.0.path, max_bytes as usize).await {
+            Ok((content, bytes_read, truncated)) => Ok(structured_output(&ReadFileOutput {
+                cwd: pane.current_path,
+                path: input.0.path,
+                content,
+                bytes_read,
+                truncated,
+            })),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error reading file: {e}"
             ))])),
         }
     }
@@ -3419,7 +3583,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 .build(),
         )
         .with_instructions(
-            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
+            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory and read-file for filesystem inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
         )
     }
 
@@ -4284,9 +4448,41 @@ mod tests {
 
         assert!(server.tool_is_read_only("list-sessions"));
         assert!(server.tool_is_read_only("capture-pane"));
+        assert!(server.tool_is_read_only("list-directory"));
+        assert!(server.tool_is_read_only("read-file"));
         assert!(!server.tool_is_read_only("execute-command"));
         assert!(!server.tool_is_read_only("send-keys"));
         assert!(!server.tool_is_read_only("unknown-tool"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_tools_reject_unbounded_requests_before_tmux() {
+        let server = server_default();
+
+        let listing = server
+            .list_directory(Parameters(ListDirectoryInput {
+                pane_id: "%1".into(),
+                path: None,
+                show_hidden: None,
+                max_entries: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("list-directory result");
+        assert_eq!(listing.is_error, Some(true));
+        assert!(first_text(&listing).contains("maxEntries"));
+
+        let reading = server
+            .read_file(Parameters(ReadFileInput {
+                pane_id: "%1".into(),
+                path: "/tmp/file".into(),
+                max_bytes: Some(MAX_FILE_BYTES + 1),
+                socket: None,
+            }))
+            .await
+            .expect("read-file result");
+        assert_eq!(reading.is_error, Some(true));
+        assert!(first_text(&reading).contains("maxBytes"));
     }
 
     async fn start_control_hub(

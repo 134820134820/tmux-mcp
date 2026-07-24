@@ -95,6 +95,14 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
         groups: &["capture", "read"],
     },
     ToolManifestEntry {
+        name: "list-directory",
+        groups: &["list", "file-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "read-file",
+        groups: &["file-read", "read"],
+    },
+    ToolManifestEntry {
         name: "show-buffer",
         groups: &["buffer-read", "read"],
     },
@@ -655,7 +663,7 @@ impl SecurityPolicy {
             | "set-synchronize-panes" => self.config.allow_move,
             "capture-pane" | "show-buffer" | "save-buffer" | "load-buffer" | "delete-buffer"
             | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
-            | "subsearch-buffer" => self.config.allow_capture,
+            | "subsearch-buffer" | "read-file" => self.config.allow_capture,
             "socket-for-path"
             | "list-sessions"
             | "list-windows"
@@ -663,7 +671,8 @@ impl SecurityPolicy {
             | "find-session"
             | "get-current-session"
             | "list-clients"
-            | "list-buffers" => self.config.allow_list,
+            | "list-buffers"
+            | "list-directory" => self.config.allow_list,
             _ => true,
         };
 
@@ -2000,6 +2009,8 @@ mod tests {
 
         assert!(policy.check_tool("list-sessions").is_ok());
         assert!(policy.check_tool("find-session").is_ok());
+        assert!(policy.check_tool("list-directory").is_ok());
+        assert!(policy.check_tool("read-file").is_err());
         assert!(policy.check_tool("capture-pane").is_err());
         assert!(policy.check_tool("execute-command").is_err());
     }
