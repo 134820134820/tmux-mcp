@@ -899,7 +899,10 @@ impl TmuxMcpServer {
                         Ok(event) if event.kind == CommandEventKind::Evicted => {
                             control.forget_command(&event.command_id).await;
                         }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            control.reconcile_commands(&tracker).await;
+                        }
+                        Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -4178,7 +4181,7 @@ mod tests {
     // corpus is intentionally not required for CI compilation or execution.
     const BUFFER_FILE_TEST_CONTENT: &str = "tmux-mcp buffer policy test payload\n";
     use crate::types::ShellType;
-    use crate::types::{Pane, Session, Window};
+    use crate::types::{CommandExecution, Pane, Session, Window};
     use rmcp::model::{NumberOrString, ReadResourceRequestParams, ResourceContents};
     use rmcp::service::{self, RequestContext, RoleServer};
     use rmcp::ServerHandler;
@@ -4186,6 +4189,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Instant;
     use tempfile::tempdir;
     use tempfile::NamedTempFile;
     use tokio::io::duplex;
@@ -4392,6 +4396,64 @@ mod tests {
         assert_eq!(
             hub.records_for_pane("%8").await[0].status,
             crate::control::ActionStatus::Rejected
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lag_reconciliation_updates_tracked_stdio_commands() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let control = ControlClient::new(&url, "Codex", paths).expect("control");
+        let mut record = control.action(
+            "execute-command",
+            serde_json::json!({"paneId": "%lagged", "command": "true"}),
+        );
+        record.mark_running();
+        control
+            .track_command("cmd-lagged", record)
+            .await
+            .expect("track command");
+        let mut evicted = control.action(
+            "execute-command",
+            serde_json::json!({"paneId": "%evicted", "command": "true"}),
+        );
+        evicted.mark_running();
+        control
+            .track_command("cmd-evicted", evicted)
+            .await
+            .expect("track evicted command");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let now = Instant::now();
+        tracker
+            .insert_test_execution(CommandExecution {
+                id: "cmd-lagged".into(),
+                pane_id: "%lagged".into(),
+                socket: None,
+                command: "true".into(),
+                status: CommandStatus::Completed,
+                exit_code: Some(0),
+                output: Some("done".into()),
+                output_truncated: false,
+                reason: None,
+                started_at: now,
+                completed_at: Some(now),
+                raw_mode: false,
+                tracking_disabled: false,
+            })
+            .await;
+
+        control.reconcile_commands(&tracker).await;
+
+        assert_eq!(
+            hub.records_for_pane("%lagged").await[0].status,
+            crate::control::ActionStatus::Completed
+        );
+        assert!(!control.has_test_command("cmd-evicted").await);
+        assert_eq!(
+            hub.records_for_pane("%evicted").await[0].status,
+            crate::control::ActionStatus::Incomplete
         );
         task.abort();
     }

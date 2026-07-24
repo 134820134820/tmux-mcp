@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::commands::CommandTracker;
 use crate::types::{CommandSnapshot, CommandStatus};
 
 pub const ACTION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const AGENT_RECORD_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +178,13 @@ impl ActionRecord {
     }
 
     pub fn mark_command(&mut self, snapshot: CommandSnapshot) {
+        if self.arguments.get("command").and_then(Value::as_str) == Some(snapshot.command.as_str())
+        {
+            self.arguments
+                .as_object_mut()
+                .expect("command arguments are an object")
+                .remove("command");
+        }
         self.status = match snapshot.status {
             CommandStatus::Completed => ActionStatus::Completed,
             CommandStatus::Failed | CommandStatus::Cancelled | CommandStatus::TrackingError => {
@@ -185,6 +194,21 @@ impl ActionRecord {
         };
         self.command_snapshot = Some(snapshot);
         self.touch();
+        let encoded_len = serde_json::to_vec(&self).map_or(0, |encoded| encoded.len());
+        let excess = encoded_len.saturating_sub(AGENT_RECORD_MAX_BYTES - 1);
+        if excess == 0 {
+            return;
+        }
+        if let Some(snapshot) = &mut self.command_snapshot {
+            if let Some(output) = &mut snapshot.output {
+                let mut keep = output.len().saturating_sub(excess);
+                while !output.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                output.truncate(keep);
+                snapshot.output_truncated = true;
+            }
+        }
     }
 
     fn touch(&mut self) {
@@ -292,8 +316,59 @@ impl ControlClient {
         self.record(&record).await
     }
 
+    // The binary server uses this; the standalone library target has no server module.
+    #[allow(dead_code)]
+    pub(crate) async fn reconcile_commands(&self, tracker: &CommandTracker) {
+        let command_ids = self
+            .commands
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for command_id in command_ids {
+            let Some(execution) = tracker.get_command(&command_id).await else {
+                self.forget_missing_command(&command_id).await;
+                continue;
+            };
+            if !execution.status.is_terminal() {
+                continue;
+            }
+            let presentation_ready = execution.output.is_some() || !execution.output_truncated;
+            let recorded = self
+                .complete_command(CommandSnapshot::from_execution(&execution, None))
+                .await
+                .is_ok();
+            if recorded && presentation_ready {
+                self.forget_command(&command_id).await;
+            }
+        }
+    }
+
+    async fn forget_missing_command(&self, command_id: &str) {
+        let Some(mut record) = self.commands.lock().await.remove(command_id) else {
+            return;
+        };
+        if matches!(
+            record.status,
+            ActionStatus::Requested
+                | ActionStatus::WaitingApproval
+                | ActionStatus::Approved
+                | ActionStatus::Running
+        ) {
+            record.mark_incomplete();
+            let _ = self.record(&record).await;
+        }
+    }
+
     pub async fn forget_command(&self, command_id: &str) {
         self.commands.lock().await.remove(command_id);
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn has_test_command(&self, command_id: &str) -> bool {
+        self.commands.lock().await.contains_key(command_id)
     }
 
     async fn authorize_request(

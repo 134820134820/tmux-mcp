@@ -165,6 +165,60 @@ async fn jsonl_reload_uses_latest_snapshot_and_ignores_bad_tail() {
 }
 
 #[tokio::test]
+async fn missing_main_recovers_complete_temporary_compaction_before_backup() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+    let temporary = paths.events.with_extension("jsonl.tmp");
+    let backup = paths.events.with_extension("jsonl.bak");
+    let mut temporary_record =
+        ActionRecord::new("Codex", "send-keys", json!({"paneId": "%temporary"}));
+    temporary_record.mark_completed(None);
+    let mut backup_record = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%backup"}));
+    backup_record.mark_completed(None);
+    std::fs::write(
+        &temporary,
+        format!("{}\n", serde_json::to_string(&temporary_record).unwrap()),
+    )
+    .expect("write complete temporary store");
+    std::fs::write(
+        &backup,
+        format!("{}\n", serde_json::to_string(&backup_record).unwrap()),
+    )
+    .expect("write backup store");
+
+    let state = HubState::open(paths.clone()).expect("recover compacted store");
+
+    assert_eq!(state.records_for_pane("%temporary").await.len(), 1);
+    assert!(state.records_for_pane("%backup").await.is_empty());
+    assert!(paths.events.is_file());
+    assert!(!temporary.exists());
+    assert!(!backup.exists());
+}
+
+#[tokio::test]
+async fn upsert_recovers_interrupted_compaction_before_appending() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+    let state = HubState::open(paths.clone()).expect("open hub");
+    let mut before = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%before"}));
+    before.mark_completed(None);
+    state.upsert(before).await.expect("persist earlier record");
+    let temporary = paths.events.with_extension("jsonl.tmp");
+    let backup = paths.events.with_extension("jsonl.bak");
+    std::fs::copy(&paths.events, &temporary).expect("stage complete compacted store");
+    std::fs::rename(&paths.events, &backup).expect("simulate interrupted publish");
+    let mut after = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%after"}));
+    after.mark_completed(None);
+
+    state.upsert(after).await.expect("append after recovery");
+    drop(state);
+    let reopened = HubState::open(paths).expect("reopen recovered store");
+
+    assert_eq!(reopened.records_for_pane("%before").await.len(), 1);
+    assert_eq!(reopened.records_for_pane("%after").await.len(), 1);
+}
+
+#[tokio::test]
 async fn human_keys_stay_grouped_until_enter_even_after_a_long_pause() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
@@ -445,6 +499,40 @@ async fn command_endpoint_rejects_empty_and_multiline_commands() {
 }
 
 #[tokio::test]
+async fn command_endpoint_rejects_65537_bytes_before_touching_tmux() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+    let token = "j".repeat(64);
+    let app = build_router(
+        state.clone(),
+        token.clone(),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/panes/%251/commands")
+                .header(header::HOST, "127.0.0.1:38473")
+                .header(header::ORIGIN, "http://127.0.0.1:38473")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tmux-mcp-token", token)
+                .body(Body::from(
+                    json!({ "command": "x".repeat(65_537) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(state.records_for_pane("%1").await.is_empty());
+}
+
+#[tokio::test]
 async fn command_endpoint_applies_existing_command_policy() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
@@ -559,6 +647,71 @@ async fn browser_gate_toggle_requires_matching_origin_and_json() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(paths.gate_enabled());
+}
+
+#[tokio::test]
+async fn disabling_gate_approves_and_wakes_pending_requests() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+    set_gate_enabled(&paths, true).expect("enable gate");
+    let state = HubState::open(paths.clone()).expect("open hub");
+    let token = "i".repeat(64);
+    let app = build_router(
+        state.clone(),
+        token.clone(),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
+    let waiting = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state
+                .authorize(ActionRecord::new(
+                    "Codex",
+                    "send-keys",
+                    json!({"paneId": "%pending"}),
+                ))
+                .await
+        })
+    };
+    for _ in 0..100 {
+        if !state.pending().await.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(state.pending().await.len(), 1);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/gate")
+                .header(header::HOST, "127.0.0.1:38473")
+                .header(header::ORIGIN, "http://127.0.0.1:38473")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tmux-mcp-token", token)
+                .body(Body::from(r#"{"enabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!paths.gate_enabled());
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("authorization must be woken")
+            .expect("authorization task"),
+        GateDecision::Approved
+    );
+    assert!(state.pending().await.is_empty());
+    assert_eq!(
+        state.records_for_pane("%pending").await[0].status,
+        ActionStatus::Approved
+    );
 }
 
 #[tokio::test]

@@ -1005,15 +1005,16 @@
 
       async function refreshCapture() {
         if (mode !== "interactive" || !selectedPane || captureBusy) return;
+        const paneId = selectedPane;
         captureBusy = true;
         try {
-          const result = await api(`/api/panes/${encodeURIComponent(selectedPane)}/capture`);
-          if (mode === "interactive") {
+          const result = await api(`/api/panes/${encodeURIComponent(paneId)}/capture`);
+          if (mode === "interactive" && selectedPane === paneId) {
             elements.terminal.textContent = result.text || "";
             elements.terminal.scrollTop = elements.terminal.scrollHeight;
           }
         } catch (error) {
-          showError(error.message);
+          if (mode === "interactive" && selectedPane === paneId) showError(error.message);
         } finally {
           captureBusy = false;
         }

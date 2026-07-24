@@ -500,6 +500,14 @@ impl CommandTracker {
         commands.get(id).cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_test_execution(&self, execution: CommandExecution) {
+        self.active_commands
+            .write()
+            .await
+            .insert(execution.id.clone(), execution);
+    }
+
     /// List ids currently held in the tracker map.
     pub async fn get_active_ids(&self) -> Vec<String> {
         let commands = self.active_commands.read().await;
