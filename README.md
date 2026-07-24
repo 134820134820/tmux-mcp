@@ -1,21 +1,23 @@
 # tmux MCP 启动指南
 
+以下 PowerShell 命令均在仓库根目录执行。
+
 ## 构建
 
 ```powershell
-& "D:\DaveWorks\tmux-mcp\scripts\build-release.ps1"
+.\scripts\build-release.ps1
 ```
 
 可直接使用和提交的产物：
 
 ```text
-D:\DaveWorks\tmux-mcp\tmux-mcp.exe
+.\tmux-mcp.exe
 ```
 
 ## 控制中心
 
 ```powershell
-& "D:\DaveWorks\tmux-mcp\tmux-mcp.exe" --web --web-bind 127.0.0.1:38473 --ssh milab-ten
+.\tmux-mcp.exe --web --web-bind 127.0.0.1:38473 --ssh milab-ten
 ```
 
 打开 `http://127.0.0.1:38473/`。
@@ -26,7 +28,7 @@ D:\DaveWorks\tmux-mcp\tmux-mcp.exe
 
 ```toml
 [mcp_servers.tmux]
-command = 'D:\DaveWorks\tmux-mcp\tmux-mcp.exe'
+command = 'C:\填写仓库的绝对路径\tmux-mcp.exe'
 args = ["--ssh", "milab-ten", "--web-url", "http://127.0.0.1:38473", "--client-name", "Codex"]
 ```
 
@@ -34,10 +36,11 @@ args = ["--ssh", "milab-ten", "--web-url", "http://127.0.0.1:38473", "--client-n
 
 ## Claude Code
 
-Claude 只记录 exe 路径，不会复制 exe。未加入 `PATH` 时必须使用绝对路径：
+Claude 只记录 exe 路径，不会复制 exe。以下命令自动把当前仓库中的 exe 转成绝对路径：
 
 ```powershell
-claude mcp add --scope user --transport stdio tmux -- "D:\DaveWorks\tmux-mcp\tmux-mcp.exe" --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code"
+$exe = (Resolve-Path .\tmux-mcp.exe).Path
+claude mcp add --scope user --transport stdio tmux -- $exe --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code"
 ```
 
 `--scope`：
@@ -51,5 +54,5 @@ claude mcp add --scope user --transport stdio tmux -- "D:\DaveWorks\tmux-mcp\tmu
 删除 `--web-url` 和 `--client-name` 即可：
 
 ```powershell
-& "D:\DaveWorks\tmux-mcp\tmux-mcp.exe" --ssh milab-ten
+.\tmux-mcp.exe --ssh milab-ten
 ```
