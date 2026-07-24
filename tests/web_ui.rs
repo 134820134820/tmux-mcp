@@ -70,5 +70,8 @@ fn page_uses_the_light_theme_contract() {
     assert!(PAGE.contains(r#"name="color-scheme" content="light""#));
     assert!(PAGE.contains("--bg: #ffffff"));
     assert!(PAGE.contains("--panel-2: #f7f7f8"));
+    assert!(PAGE.contains("color: #854d0e"));
+    assert!(PAGE.contains("border-left: 3px solid var(--text)"));
+    assert!(PAGE.contains("background: #ececf1"));
     assert!(!PAGE.contains("--bg: #0b0d10"));
 }
