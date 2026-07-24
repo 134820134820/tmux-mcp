@@ -11,7 +11,7 @@ try {
     exit $LASTEXITCODE
   }
   if ($Target -eq 'x86_64-pc-windows-msvc') {
-    Copy-Item 'target/x86_64-pc-windows-msvc/release/tmux-mcp-rs.exe' 'bin/tmux-mcp-rs-windows-x64.exe' -Force
+    Copy-Item 'target/x86_64-pc-windows-msvc/release/tmux-mcp-rs.exe' 'tmux-mcp.exe' -Force
   }
 } finally {
   Pop-Location
