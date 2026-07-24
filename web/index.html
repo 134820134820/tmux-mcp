@@ -567,7 +567,7 @@
           <div class="view-heading">
             <h1 id="messages-title">选择一个 pane</h1>
             <span id="messages-target" class="pane-target"></span>
-            <span id="messages-interference" class="interference">AI 正在这个 pane 运行命令，人工输入可能造成干扰</span>
+            <span id="messages-interference" class="interference"></span>
           </div>
           <div id="message-list"></div>
           <form id="command-composer" class="command-composer">
@@ -587,7 +587,7 @@
           <div class="view-heading">
             <h1 id="interactive-title">选择一个 pane</h1>
             <span id="interactive-target" class="pane-target"></span>
-            <span id="interactive-interference" class="interference">AI 正在这个 pane 运行命令，人工输入可能造成干扰</span>
+            <span id="interactive-interference" class="interference"></span>
           </div>
           <div class="terminal-wrap">
             <pre id="terminal-snapshot" tabindex="0" aria-label="当前 tmux pane，可直接键入"></pre>
@@ -802,17 +802,25 @@
         elements.commandSend.disabled = disabled;
       }
 
-      function renderHeading(running) {
+      function renderHeading(runningSources) {
         const info = selectedPaneInfo();
         const title = info
           ? `${info.session.name} / ${info.window.name} / ${info.pane.title || "pane"}`
           : "选择一个 pane";
+        const interference = runningSources
+          .map((source) => source === "你" ? "你正在提交命令" : `进程 ${source} 正在提交命令`)
+          .join("；");
+        const interferenceText = interference
+          ? `${interference}，目标为这个 pane，人工输入可能造成干扰`
+          : "";
         elements.messagesTitle.textContent = title;
         elements.interactiveTitle.textContent = title;
         elements.messagesTarget.textContent = selectedPane;
         elements.interactiveTarget.textContent = selectedPane;
-        elements.messagesInterference.classList.toggle("visible", running);
-        elements.interactiveInterference.classList.toggle("visible", running);
+        elements.messagesInterference.textContent = interferenceText;
+        elements.interactiveInterference.textContent = interferenceText;
+        elements.messagesInterference.classList.toggle("visible", Boolean(interference));
+        elements.interactiveInterference.classList.toggle("visible", Boolean(interference));
         updateComposer();
       }
 
@@ -976,10 +984,13 @@
         const followLatest =
           elements.messageList.scrollHeight - scrollTop - elements.messageList.clientHeight <= 2;
         clear(elements.messageList);
-        const running = records.some(
-          (record) => record.kind === "command" && ["requested", "approved", "running"].includes(record.status)
-        );
-        renderHeading(running);
+        const runningSources = [...new Set(records
+          .filter((record) =>
+            record.kind === "command" &&
+            ["requested", "approved", "running"].includes(record.status)
+          )
+          .map((record) => record.source || "未知"))];
+        renderHeading(runningSources);
         if (!selectedPane) {
           elements.messageList.appendChild(node("div", "empty-state", "从左侧选择一个 pane"));
           return;
