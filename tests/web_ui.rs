@@ -49,6 +49,16 @@ fn message_mode_contains_a_single_line_command_composer() {
 }
 
 #[test]
+fn command_composer_rejects_embedded_newlines() {
+    assert!(PAGE.contains(r#"command.includes("\r") || command.includes("\n")"#));
+}
+
+#[test]
+fn command_composer_only_restores_focus_in_message_mode() {
+    assert!(PAGE.contains(r#"if (mode === "messages") elements.commandInput.focus();"#));
+}
+
+#[test]
 fn page_never_renders_remote_text_as_html() {
     assert!(PAGE.contains("textContent"));
     assert!(!PAGE.contains("innerHTML"));
