@@ -130,6 +130,18 @@ struct KeyInput {
     literal: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommandInput {
+    command: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandAccepted {
+    command_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CaptureResponse {
@@ -186,6 +198,7 @@ pub fn build_router(
         .route("/api/agent/record", post(agent_record))
         .route("/api/panes/:id/capture", get(api_capture))
         .route("/api/panes/:id/keys", post(api_keys))
+        .route("/api/panes/:id/commands", post(send_command))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(context.clone(), api_guard));
 
@@ -383,6 +396,29 @@ async fn api_keys(
             .into_response();
     }
     Json(OkResponse { ok: true }).into_response()
+}
+
+async fn send_command(
+    State(context): State<AppContext>,
+    AxumPath(pane_id): AxumPath<String>,
+    Json(input): Json<CommandInput>,
+) -> Response {
+    if let Err(error) = validate_pane_id(&pane_id) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    if input.command.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "command must not be empty").into_response();
+    }
+    if input.command.contains(['\n', '\r']) {
+        return (StatusCode::BAD_REQUEST, "command must be a single line").into_response();
+    }
+    if let Err(error) = authorize_pane_action(&context, "execute-command", &pane_id).await {
+        return error;
+    }
+    if let Err(error) = context.policy.check_command(&input.command) {
+        return policy_response(error);
+    }
+    StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 async fn load_topology(context: &AppContext) -> Result<Topology, String> {
