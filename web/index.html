@@ -409,6 +409,17 @@
 
       .command-details summary { cursor: pointer; user-select: none; }
 
+      .long-content { min-width: 0; }
+      .long-content > summary {
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 12px;
+        user-select: none;
+      }
+      .long-content[open] > summary { margin-bottom: 8px; }
+      .command-line + .long-content { margin-top: 10px; }
+      .long-content > .command-output { margin-top: 0; }
+
       .command-meta {
         display: flex;
         flex-wrap: wrap;
@@ -692,6 +703,9 @@
       let captureBusy = false;
       let commandSubmitting = false;
       let keyQueue = Promise.resolve();
+      const expandedContent = new Set();
+      const LONG_CONTENT_CHARS = 1200;
+      const LONG_CONTENT_LINES = 12;
 
       function node(tag, className, text) {
         const value = document.createElement(tag);
@@ -937,10 +951,34 @@
         return element;
       }
 
-      function appendLabeledPre(parent, label, text, className) {
+      function collapsibleContent(record, part, label, text, content) {
+        const lines = text.split("\n").length;
+        if (text.length <= LONG_CONTENT_CHARS && lines <= LONG_CONTENT_LINES) return content;
+        const key = `${record.id}:${part}`;
+        const details = node("details", "long-content");
+        const summary = node("summary");
+        const size = lines > LONG_CONTENT_LINES ? `${lines} 行` : `${text.length} 字符`;
+        const updateSummary = () => {
+          summary.textContent = details.open ? `收起${label}` : `展开${label}（${size}）`;
+        };
+        details.open = expandedContent.has(key);
+        details.appendChild(summary);
+        details.appendChild(content);
+        details.addEventListener("toggle", () => {
+          if (details.open) expandedContent.add(key);
+          else expandedContent.delete(key);
+          updateSummary();
+        });
+        updateSummary();
+        return details;
+      }
+
+      function appendLabeledPre(parent, record, part, label, text, className) {
         const block = node("div", "result-block");
         block.appendChild(node("p", "card-label", label));
-        block.appendChild(node("pre", className, text));
+        block.appendChild(
+          collapsibleContent(record, part, label, text, node("pre", className, text))
+        );
         parent.appendChild(block);
       }
 
@@ -969,17 +1007,22 @@
           const commandText = renderCommand(command);
           prompt.setAttribute("aria-hidden", "true");
           commandLine.appendChild(prompt);
-          commandLine.appendChild(commandText);
+          commandLine.appendChild(
+            collapsibleContent(record, "command", "命令", command, commandText)
+          );
           body.appendChild(commandLine);
 
           if (!running) {
+            const outputText = snapshot.output ?? snapshot.reason ?? "（无输出）";
             const output = node(
               "pre",
               "command-output",
-              snapshot.output ?? snapshot.reason ?? "（无输出）"
+              outputText
             );
             output.setAttribute("aria-label", "输出");
-            body.appendChild(output);
+            body.appendChild(
+              collapsibleContent(record, "output", "输出", outputText, output)
+            );
           }
 
           const details = node("details", "command-details");
@@ -997,9 +1040,12 @@
           body.appendChild(details);
         } else {
           body.appendChild(node("p", "card-label", record.source === "你" ? "你的输入" : "AI 输入"));
-          body.appendChild(node("pre", "input-text", displayInput(record)));
+          const input = displayInput(record);
+          body.appendChild(
+            collapsibleContent(record, "input", "输入", input, node("pre", "input-text", input))
+          );
           const result = genericResult(record);
-          if (result) appendLabeledPre(body, "结果", result, "result-text");
+          if (result) appendLabeledPre(body, record, "result", "结果", result, "result-text");
         }
         card.appendChild(body);
         return card;

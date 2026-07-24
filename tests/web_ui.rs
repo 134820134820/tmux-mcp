@@ -152,6 +152,26 @@ fn command_cards_use_safe_basic_shell_highlighting() {
 }
 
 #[test]
+fn long_message_inputs_and_outputs_can_expand_without_resetting_on_refresh() {
+    for marker in [
+        "const expandedContent = new Set()",
+        "const LONG_CONTENT_CHARS = 1200",
+        "const LONG_CONTENT_LINES = 12",
+        r#"node("details", "long-content")"#,
+        "details.open = expandedContent.has(key)",
+        r#"collapsibleContent(record, "command", "命令", command, commandText)"#,
+        r#"collapsibleContent(record, "output", "输出", outputText, output)"#,
+        r#"collapsibleContent(record, "input", "输入", input, node("pre", "input-text", input))"#,
+        r#"appendLabeledPre(body, record, "result", "结果", result, "result-text")"#,
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing collapsible content marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn message_view_uses_a_flat_wide_layout() {
     let card_css = PAGE
         .split_once(".message-card {")
