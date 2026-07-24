@@ -4294,7 +4294,13 @@ mod tests {
     ) {
         let token = load_or_create_token(&paths).expect("token");
         let state = HubState::open(paths).expect("hub");
-        let app = build_router(state.clone(), token, SecurityPolicy::default(), None);
+        let app = build_router(
+            state.clone(),
+            token,
+            SecurityPolicy::default(),
+            None,
+            Arc::new(CommandTracker::new(ShellType::Bash)),
+        );
         let listener =
             tokio::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
                 .await

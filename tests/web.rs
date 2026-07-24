@@ -1,17 +1,24 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use serde_json::json;
 use tempfile::tempdir;
+use tmux_mcp_rs::commands::CommandTracker;
 use tmux_mcp_rs::control::{
     set_gate_enabled, ActionRecord, ActionStatus, GateDecision, StatePaths,
 };
 use tmux_mcp_rs::security::SecurityPolicy;
+use tmux_mcp_rs::types::ShellType;
 use tmux_mcp_rs::web::{build_router, validate_bind_address, validate_key_input, HubState};
 use tower::ServiceExt;
+
+fn test_tracker() -> Arc<CommandTracker> {
+    Arc::new(CommandTracker::new(ShellType::Bash))
+}
 
 #[tokio::test]
 async fn gate_off_approves_immediately_and_persists_record() {
@@ -236,7 +243,13 @@ fn interactive_key_input_is_small_and_explicit() {
 async fn index_rejects_dns_rebinding_host() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
-    let app = build_router(state, "a".repeat(64), SecurityPolicy::default(), None);
+    let app = build_router(
+        state,
+        "a".repeat(64),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
 
     let response = app
         .oneshot(
@@ -256,7 +269,13 @@ async fn index_rejects_dns_rebinding_host() {
 async fn index_is_loopback_only_and_never_cached() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
-    let app = build_router(state, "f".repeat(64), SecurityPolicy::default(), None);
+    let app = build_router(
+        state,
+        "f".repeat(64),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
 
     let response = app
         .oneshot(
@@ -278,7 +297,13 @@ async fn index_is_loopback_only_and_never_cached() {
 async fn api_rejects_missing_token_and_non_loopback_host() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
-    let app = build_router(state, "a".repeat(64), SecurityPolicy::default(), None);
+    let app = build_router(
+        state,
+        "a".repeat(64),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
 
     let missing_token = app
         .clone()
@@ -312,7 +337,13 @@ async fn key_endpoint_rejects_unknown_special_key_before_touching_tmux() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
     let token = "d".repeat(64);
-    let app = build_router(state, token.clone(), SecurityPolicy::default(), None);
+    let app = build_router(
+        state,
+        token.clone(),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
 
     let response = app
         .oneshot(
@@ -337,7 +368,13 @@ async fn api_rejects_non_json_and_oversized_mutations() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
     let token = "e".repeat(64);
-    let app = build_router(state, token.clone(), SecurityPolicy::default(), None);
+    let app = build_router(
+        state,
+        token.clone(),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
 
     let non_json = app
         .clone()
@@ -379,7 +416,13 @@ async fn browser_gate_toggle_requires_matching_origin_and_json() {
     let paths = StatePaths::new(dir.path());
     let state = HubState::open(paths.clone()).expect("open hub");
     let token = "b".repeat(64);
-    let app = build_router(state, token.clone(), SecurityPolicy::default(), None);
+    let app = build_router(
+        state,
+        token.clone(),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
 
     let response = app
         .oneshot(
@@ -410,6 +453,7 @@ async fn agent_authorize_returns_immediate_approval_when_gate_is_off() {
         token.clone(),
         SecurityPolicy::default(),
         None,
+        test_tracker(),
     );
     let record = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%7"}));
 
