@@ -11,7 +11,7 @@ use tmux_mcp_rs::commands::CommandTracker;
 use tmux_mcp_rs::control::{
     set_gate_enabled, ActionRecord, ActionStatus, GateDecision, StatePaths,
 };
-use tmux_mcp_rs::security::SecurityPolicy;
+use tmux_mcp_rs::security::{SecurityConfig, SecurityPolicy};
 use tmux_mcp_rs::types::ShellType;
 use tmux_mcp_rs::web::{build_router, validate_bind_address, validate_key_input, HubState};
 use tower::ServiceExt;
@@ -361,6 +361,76 @@ async fn key_endpoint_rejects_unknown_special_key_before_touching_tmux() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn command_endpoint_rejects_empty_and_multiline_commands() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+    let token = "g".repeat(64);
+    let app = build_router(
+        state.clone(),
+        token.clone(),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
+
+    for command in ["   ", "printf one\nprintf two"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/panes/%251/commands")
+                    .header(header::HOST, "127.0.0.1:38473")
+                    .header(header::ORIGIN, "http://127.0.0.1:38473")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-tmux-mcp-token", token.clone())
+                    .body(Body::from(json!({ "command": command }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(state.records_for_pane("%1").await.is_empty());
+}
+
+#[tokio::test]
+async fn command_endpoint_applies_existing_command_policy() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+    let token = "h".repeat(64);
+    let mut config = SecurityConfig::default();
+    config.allow_execute_command = false;
+    let policy = SecurityPolicy::from_config(config).unwrap();
+    let app = build_router(
+        state.clone(),
+        token.clone(),
+        policy,
+        Some("must-not-be-called".into()),
+        test_tracker(),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/panes/%251/commands")
+                .header(header::HOST, "127.0.0.1:38473")
+                .header(header::ORIGIN, "http://127.0.0.1:38473")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-tmux-mcp-token", token)
+                .body(Body::from(r#"{"command":"printf one"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(state.records_for_pane("%1").await.is_empty());
 }
 
 #[tokio::test]
