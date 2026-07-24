@@ -64,3 +64,11 @@ fn page_never_renders_remote_text_as_html() {
     assert!(!PAGE.contains("innerHTML"));
     assert!(!PAGE.contains("insertAdjacentHTML"));
 }
+
+#[test]
+fn page_uses_the_light_theme_contract() {
+    assert!(PAGE.contains(r#"name="color-scheme" content="light""#));
+    assert!(PAGE.contains("--bg: #ffffff"));
+    assert!(PAGE.contains("--panel-2: #f7f7f8"));
+    assert!(!PAGE.contains("--bg: #0b0d10"));
+}
