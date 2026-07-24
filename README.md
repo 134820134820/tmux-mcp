@@ -49,6 +49,27 @@ claude mcp add --scope user --transport stdio tmux -- $exe --ssh milab-ten --web
 - `project`：当前项目共享配置，写入项目 `.mcp.json`。
 - `user`：当前 Windows 用户的所有项目可用。
 
+### 移除
+
+`local` 和 `project` 配置与项目目录有关，先进入当初添加 MCP 的项目目录，再查看名称：
+
+```powershell
+claude mcp list
+claude mcp get tmux
+```
+
+删除命令格式为 `claude mcp remove [--scope local|project|user] <名称>`。例如删除名为 `tmux` 的项目级配置：
+
+```powershell
+claude mcp remove --scope project tmux
+```
+
+不确定 scope 时可省略 `--scope`，Claude 会删除当前项目上下文中找到的该名称配置：
+
+```powershell
+claude mcp remove tmux
+```
+
 ## 不使用控制中心
 
 删除 `--web-url` 和 `--client-name` 即可：
