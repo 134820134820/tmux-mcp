@@ -259,19 +259,17 @@
       #message-list {
         flex: 1;
         overflow: auto;
-        padding: 24px 22px;
+        padding: 20px 28px;
       }
 
       .command-composer {
         display: flex;
         gap: 9px;
-        width: min(880px, calc(100% - 44px));
+        width: min(1120px, calc(100% - 56px));
         margin: 0 auto 16px;
-        padding: 10px;
-        border: 1px solid var(--line);
-        border-radius: 14px;
-        background: var(--panel);
-        box-shadow: var(--shadow);
+        padding: 0;
+        border: 0;
+        background: transparent;
       }
 
       .command-composer textarea {
@@ -312,24 +310,25 @@
       }
 
       .message-card {
-        max-width: 880px;
-        margin: 0 auto 13px;
-        overflow: hidden;
-        border: 1px solid var(--line);
-        border-radius: 12px;
-        background: var(--panel);
-        box-shadow: none;
+        max-width: 1120px;
+        margin: 0 auto 18px;
+        padding-bottom: 18px;
+        border: 0;
+        border-bottom: 1px solid var(--line);
+        background: transparent;
       }
 
-      .message-card.human { background: var(--panel-2); }
-      .message-card.failed, .message-card.rejected { border-color: var(--red); }
+      .message-card.human { background: transparent; }
+      .message-card.failed, .message-card.rejected {
+        padding-left: 12px;
+        border-left: 3px solid var(--red);
+      }
 
       .card-header {
         display: flex;
         align-items: center;
         gap: 9px;
-        padding: 10px 13px;
-        border-bottom: 1px solid var(--line);
+        padding: 0 0 8px;
         background: transparent;
       }
 
@@ -345,7 +344,7 @@
       .status-pill { margin-left: auto; color: var(--muted); background: var(--panel-2); }
       .card-time { color: var(--muted); font-size: 11px; }
 
-      .card-body { padding: 13px; }
+      .card-body { padding: 0; }
 
       .card-label {
         margin: 0 0 6px;
@@ -365,9 +364,8 @@
 
       .input-text, .result-text {
         padding: 10px 11px;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        background: var(--panel);
+        border: 0;
+        background: var(--panel-2);
       }
 
       .command-line {
@@ -375,8 +373,7 @@
         grid-template-columns: auto minmax(0, 1fr);
         gap: 9px;
         padding: 10px 11px;
-        border: 1px solid var(--line);
-        border-radius: 8px;
+        border: 0;
         background: var(--panel-2);
       }
 
@@ -397,7 +394,7 @@
         padding: 10px 12px;
         border-left: 3px solid var(--line);
         color: var(--text);
-        background: var(--panel);
+        background: transparent;
       }
 
       .result-block { margin-top: 12px; }

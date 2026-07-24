@@ -129,6 +129,30 @@ fn command_cards_use_safe_basic_shell_highlighting() {
 }
 
 #[test]
+fn message_view_uses_a_flat_wide_layout() {
+    let card_css = PAGE
+        .split_once(".message-card {")
+        .expect("message card CSS")
+        .1
+        .split_once('}')
+        .expect("message card CSS end")
+        .0;
+    assert!(card_css.contains("max-width: 1120px"));
+    assert!(card_css.contains("border: 0"));
+    assert!(!card_css.contains("border-radius"));
+
+    let command_css = PAGE
+        .split_once(".command-line {")
+        .expect("command line CSS")
+        .1
+        .split_once('}')
+        .expect("command line CSS end")
+        .0;
+    assert!(command_css.contains("border: 0"));
+    assert!(!command_css.contains("border-radius"));
+}
+
+#[test]
 fn page_never_renders_remote_text_as_html() {
     assert!(PAGE.contains("textContent"));
     assert!(!PAGE.contains("innerHTML"));
