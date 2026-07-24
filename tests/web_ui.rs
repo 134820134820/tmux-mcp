@@ -111,6 +111,24 @@ fn command_cards_use_unlabeled_streams_and_collapsed_run_details() {
 }
 
 #[test]
+fn command_cards_use_safe_basic_shell_highlighting() {
+    for marker in [
+        "function renderCommand(command)",
+        "document.createTextNode",
+        r#"className = "shell-command""#,
+        r#"className = "shell-option""#,
+        r#"className = "shell-string""#,
+        r#"className = "shell-operator""#,
+        "const commandText = renderCommand(command)",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing shell highlight marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn page_never_renders_remote_text_as_html() {
     assert!(PAGE.contains("textContent"));
     assert!(!PAGE.contains("innerHTML"));
