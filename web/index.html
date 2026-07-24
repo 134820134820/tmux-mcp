@@ -208,6 +208,7 @@
       }
 
       main {
+        position: relative;
         grid-area: main;
         min-width: 0;
         overflow: hidden;
@@ -455,6 +456,24 @@
         pointer-events: none;
       }
 
+      .approval-popover {
+        position: absolute;
+        z-index: 10;
+        left: 50%;
+        bottom: 72px;
+        width: min(720px, calc(100% - 56px));
+        max-height: min(520px, calc(100% - 96px));
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        color: var(--text);
+        background: var(--panel);
+        box-shadow: 0 14px 40px rgb(0 0 0 / 18%);
+        transform: translateX(-50%);
+      }
+
+      .approval-popover[hidden] { display: none; }
+
       dialog {
         width: min(720px, calc(100vw - 48px));
         max-height: min(760px, calc(100vh - 48px));
@@ -594,24 +613,31 @@
             <span class="terminal-hint">点击后直接输入 · 每 250ms 刷新 · 同一 pane 合并至 Enter 或切换 pane</span>
           </div>
         </section>
+
+        <section
+          id="approval-dialog"
+          class="approval-popover"
+          role="region"
+          aria-label="Gate 审批请求"
+          aria-live="polite"
+          hidden
+        >
+          <div class="dialog-header">
+            <h2>请求批准</h2>
+            <span id="approval-queue-count" class="subtle"></span>
+          </div>
+          <div class="dialog-body">
+            <dl id="approval-summary" class="approval-summary"></dl>
+            <p class="card-label">精确参数</p>
+            <pre id="approval-arguments" class="approval-arguments"></pre>
+          </div>
+          <div class="dialog-actions">
+            <button id="approval-reject" class="reject" type="button">拒绝</button>
+            <button id="approval-approve" class="approve" type="button">批准</button>
+          </div>
+        </section>
       </main>
     </div>
-
-    <dialog id="approval-dialog">
-      <div class="dialog-header">
-        <h2>请求批准</h2>
-        <span id="approval-queue-count" class="subtle"></span>
-      </div>
-      <div class="dialog-body">
-        <dl id="approval-summary" class="approval-summary"></dl>
-        <p class="card-label">精确参数</p>
-        <pre id="approval-arguments" class="approval-arguments"></pre>
-      </div>
-      <div class="dialog-actions">
-        <button id="approval-reject" class="reject" type="button">拒绝</button>
-        <button id="approval-approve" class="approve" type="button">批准</button>
-      </div>
-    </dialog>
 
     <dialog id="operation-log">
       <div class="dialog-header">
@@ -1030,7 +1056,8 @@
       function renderApproval(pending) {
         const record = pending?.[0];
         if (!record) {
-          if (elements.approval.open) elements.approval.close();
+          elements.approval.hidden = true;
+          delete elements.approval.dataset.requestId;
           return;
         }
         elements.approvalCount.textContent =
@@ -1044,7 +1071,7 @@
         appendDefinition(elements.approvalSummary, "Pane", target.pane);
         elements.approvalArguments.textContent = JSON.stringify(record.arguments || {}, null, 2);
         elements.approval.dataset.requestId = record.id;
-        if (!elements.approval.open) elements.approval.showModal();
+        elements.approval.hidden = false;
       }
 
       function renderOperations(records) {

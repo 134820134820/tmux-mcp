@@ -102,6 +102,23 @@ fn running_command_notice_names_its_actual_source() {
 }
 
 #[test]
+fn gate_approval_is_a_non_blocking_popover_above_the_composer() {
+    assert!(PAGE.contains(r#"id="approval-dialog""#));
+    assert!(PAGE.contains(r#"class="approval-popover""#));
+    assert!(PAGE.contains("bottom: 72px"));
+    assert!(PAGE.contains("elements.approval.hidden = false"));
+    let approval = PAGE
+        .split_once("function renderApproval(pending)")
+        .expect("renderApproval function")
+        .1
+        .split_once("function renderOperations")
+        .expect("renderApproval function end")
+        .0;
+    assert!(!approval.contains("showModal"));
+    assert!(!approval.contains(".close()"));
+}
+
+#[test]
 fn command_cards_use_unlabeled_streams_and_collapsed_run_details() {
     for marker in [
         r#"node("details", "command-details")"#,
