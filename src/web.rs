@@ -599,6 +599,34 @@ mod tests {
         ));
         assert!(cache.get(loaded_at + Duration::from_secs(5)).is_none());
     }
+
+    #[tokio::test]
+    async fn web_command_mapping_is_published_after_running_record_is_persisted() {
+        let dir = tempfile::tempdir().expect("temp state dir");
+        let hub = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+        let store = hub.inner.store.lock().await;
+        let mut record = ActionRecord::new(
+            "你",
+            "execute-command",
+            json!({"paneId": "%1", "command": "true"}),
+        );
+        record.mark_running();
+        let registering = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                hub.track_web_command("cmd-1".into(), record)
+                    .await
+                    .expect("track command");
+            })
+        };
+        tokio::task::yield_now().await;
+
+        assert!(!hub.inner.web_commands.lock().await.contains_key("cmd-1"));
+
+        drop(store);
+        registering.await.expect("registration task");
+        assert!(hub.inner.web_commands.lock().await.contains_key("cmd-1"));
+    }
 }
 
 async fn authorize_pane_action(
@@ -769,15 +797,12 @@ impl HubState {
         command_id: String,
         record: ActionRecord,
     ) -> io::Result<()> {
+        self.upsert(record.clone()).await?;
         self.inner
             .web_commands
             .lock()
             .await
-            .insert(command_id.clone(), record.clone());
-        if let Err(error) = self.upsert(record).await {
-            self.inner.web_commands.lock().await.remove(&command_id);
-            return Err(error);
-        }
+            .insert(command_id, record);
         Ok(())
     }
 
