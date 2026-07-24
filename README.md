@@ -9,13 +9,13 @@
 可直接使用和提交的产物：
 
 ```text
-D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe
+D:\DaveWorks\tmux-mcp\tmux-mcp.exe
 ```
 
 ## 控制中心
 
 ```powershell
-& "D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe" --web --web-bind 127.0.0.1:38473 --ssh milab-ten
+& "D:\DaveWorks\tmux-mcp\tmux-mcp.exe" --web --web-bind 127.0.0.1:38473 --ssh milab-ten
 ```
 
 打开 `http://127.0.0.1:38473/`。
@@ -26,7 +26,7 @@ D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe
 
 ```toml
 [mcp_servers.tmux]
-command = 'D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe'
+command = 'D:\DaveWorks\tmux-mcp\tmux-mcp.exe'
 args = ["--ssh", "milab-ten", "--web-url", "http://127.0.0.1:38473", "--client-name", "Codex"]
 ```
 
@@ -37,7 +37,7 @@ args = ["--ssh", "milab-ten", "--web-url", "http://127.0.0.1:38473", "--client-n
 Claude 只记录 exe 路径，不会复制 exe。未加入 `PATH` 时必须使用绝对路径：
 
 ```powershell
-claude mcp add --scope user --transport stdio tmux -- "D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe" --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code"
+claude mcp add --scope user --transport stdio tmux -- "D:\DaveWorks\tmux-mcp\tmux-mcp.exe" --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code"
 ```
 
 `--scope`：
@@ -51,5 +51,5 @@ claude mcp add --scope user --transport stdio tmux -- "D:\DaveWorks\tmux-mcp\bin
 删除 `--web-url` 和 `--client-name` 即可：
 
 ```powershell
-& "D:\DaveWorks\tmux-mcp\bin\tmux-mcp-rs-windows-x64.exe" --ssh milab-ten
+& "D:\DaveWorks\tmux-mcp\tmux-mcp.exe" --ssh milab-ten
 ```
