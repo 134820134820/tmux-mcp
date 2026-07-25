@@ -290,12 +290,49 @@ async fn state_views_keep_only_the_latest_200_records() {
         state.upsert(operation).await.expect("persist operation");
     }
 
+    for index in 0..205_u64 {
+        let mut read_only = ActionRecord::new("Claude", "list-sessions", json!({"call": index}));
+        read_only.read_only = true;
+        read_only.requested_at_ms = 1_000 + index;
+        read_only.updated_at_ms = 1_000 + index;
+        state.upsert(read_only).await.expect("persist full log");
+    }
+
     let messages = state.records_for_pane("%5").await;
     let operations = state.operations().await;
+    let full_log = state.full_log().await;
     assert_eq!(messages.len(), 200);
     assert_eq!(messages[0].arguments["keys"], 5);
     assert_eq!(operations.len(), 200);
     assert_eq!(operations[0].arguments["paneId"], "%5");
+    assert_eq!(full_log.len(), 200);
+    assert_eq!(full_log[0].arguments["call"], 5);
+}
+
+#[tokio::test]
+async fn operation_logs_separate_critical_and_full_mcp_requests() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+    let critical = ActionRecord::new("Codex", "select-pane", json!({"paneId": "%1"}));
+    let mut read_only = ActionRecord::new("Claude", "list-sessions", json!({}));
+    read_only.read_only = true;
+    let input = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%1", "keys": ["x"]}));
+    let command = ActionRecord::new("Codex", "execute-command", json!({"paneId": "%1"}));
+    let web_input = ActionRecord::new("你", "web-input", json!({"paneId": "%1", "text": "x"}));
+
+    for record in [critical, read_only, input, command, web_input] {
+        state.upsert(record).await.expect("persist record");
+    }
+
+    assert_eq!(state.operations().await.len(), 1);
+    let mut tools = state
+        .full_log()
+        .await
+        .into_iter()
+        .map(|record| record.tool)
+        .collect::<Vec<_>>();
+    tools.sort();
+    assert_eq!(tools, ["list-sessions", "select-pane", "send-keys"]);
 }
 
 #[tokio::test]

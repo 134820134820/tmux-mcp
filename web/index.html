@@ -593,6 +593,8 @@
       .dialog-header h2 { margin: 0; font-size: 16px; }
       .dialog-header button { margin-left: auto; padding: 6px 10px; }
       .dialog-body { padding: 17px; }
+      .log-switch { margin-left: 4px; }
+      .log-switch button { min-width: 64px; margin-left: 0; padding: 5px 10px; }
 
       .approval-summary {
         display: grid;
@@ -737,6 +739,10 @@
     <dialog id="operation-log">
       <div class="dialog-header">
         <h2>操作日志</h2>
+        <div class="mode-switch log-switch" role="tablist" aria-label="日志范围">
+          <button id="log-critical" class="active" type="button" role="tab" aria-selected="true">关键</button>
+          <button id="log-full" type="button" role="tab" aria-selected="false">全面</button>
+        </div>
         <button id="close-operation-log" type="button">关闭</button>
       </div>
       <div id="operation-log-list" class="dialog-body"></div>
@@ -776,10 +782,13 @@
         approvalSummary: byId("approval-summary"),
         approvalArguments: byId("approval-arguments"),
         operationLog: byId("operation-log"),
-        operationList: byId("operation-log-list")
+        operationList: byId("operation-log-list"),
+        logCritical: byId("log-critical"),
+        logFull: byId("log-full")
       };
 
       let mode = localStorage.getItem("tmux-mcp-mode") === "interactive" ? "interactive" : "messages";
+      let operationLogMode = "critical";
       let selectedPane = localStorage.getItem("tmux-mcp-pane") || "";
       let latestState = null;
       let previousActivity = {};
@@ -1228,7 +1237,9 @@
         elements.approval.hidden = false;
       }
 
-      function renderOperations(records) {
+      function renderOperations() {
+        const records =
+          operationLogMode === "full" ? latestState?.fullLog : latestState?.operations;
         clear(elements.operationList);
         if (!records?.length) {
           elements.operationList.appendChild(node("div", "empty-state", "还没有操作记录"));
@@ -1268,7 +1279,7 @@
           updateActivity(state.activity);
           renderTopology(state.topology);
           elements.gate.checked = Boolean(state.gateEnabled);
-          renderOperations(state.operations);
+          renderOperations();
           renderApproval(state.pending);
           setConnection(true, "已连接");
           showError(state.topologyError || "");
@@ -1415,6 +1426,19 @@
       byId("approval-reject").addEventListener("click", () => void decideApproval(false));
       byId("open-operation-log").addEventListener("click", () => elements.operationLog.showModal());
       byId("close-operation-log").addEventListener("click", () => elements.operationLog.close());
+      for (const [button, value] of [
+        [elements.logCritical, "critical"],
+        [elements.logFull, "full"]
+      ]) {
+        button.addEventListener("click", () => {
+          operationLogMode = value;
+          elements.logCritical.classList.toggle("active", value === "critical");
+          elements.logFull.classList.toggle("active", value === "full");
+          elements.logCritical.setAttribute("aria-selected", String(value === "critical"));
+          elements.logFull.setAttribute("aria-selected", String(value === "full"));
+          renderOperations();
+        });
+      }
 
       const specialKeys = {
         Enter: "Enter",

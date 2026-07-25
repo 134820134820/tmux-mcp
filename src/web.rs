@@ -30,6 +30,7 @@ use crate::types::{CommandSnapshot, Pane, PaneInfo, Session, Window};
 
 const PER_PANE_LIMIT: usize = 200;
 const OPERATION_LIMIT: usize = 200;
+const FULL_LOG_LIMIT: usize = 200;
 const COMPACT_AT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = AGENT_RECORD_MAX_BYTES;
 const TOKEN_HEADER: &str = "x-tmux-mcp-token";
@@ -91,6 +92,7 @@ struct StateResponse {
     pending: Vec<ActionRecord>,
     messages: Vec<ActionRecord>,
     operations: Vec<ActionRecord>,
+    full_log: Vec<ActionRecord>,
     topology: Option<Topology>,
     topology_error: Option<String>,
     pane_info: Option<PaneInfo>,
@@ -362,6 +364,7 @@ async fn api_state(
         pending: context.hub.pending().await,
         messages,
         operations: context.hub.operations().await,
+        full_log: context.hub.full_log().await,
         topology,
         topology_error,
         pane_info,
@@ -1177,6 +1180,10 @@ impl HubState {
         self.inner.store.lock().await.operations()
     }
 
+    pub async fn full_log(&self) -> Vec<ActionRecord> {
+        self.inner.store.lock().await.full_log()
+    }
+
     pub async fn all_records(&self) -> Vec<ActionRecord> {
         self.inner.store.lock().await.sorted_records()
     }
@@ -1346,7 +1353,7 @@ impl RecordStore {
         let mut records: Vec<_> = self
             .records
             .values()
-            .filter(|record| record.kind == ActionKind::Operation)
+            .filter(|record| record.kind == ActionKind::Operation && !record.read_only)
             .cloned()
             .collect();
         records.sort_by_key(|record| (record.requested_at_ms, record.updated_at_ms));
@@ -1356,9 +1363,26 @@ impl RecordStore {
         records
     }
 
+    fn full_log(&self) -> Vec<ActionRecord> {
+        let mut records: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| record.tool != "execute-command" && record.tool != "web-input")
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| (record.requested_at_ms, record.updated_at_ms));
+        if records.len() > FULL_LOG_LIMIT {
+            records.drain(..records.len() - FULL_LOG_LIMIT);
+        }
+        records
+    }
+
     fn compact(&mut self) -> io::Result<()> {
         let mut keep = HashSet::new();
         for record in self.operations() {
+            keep.insert(record.id);
+        }
+        for record in self.full_log() {
             keep.insert(record.id);
         }
         let pane_ids: HashSet<_> = self

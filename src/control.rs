@@ -109,6 +109,8 @@ pub struct ActionRecord {
     pub source: String,
     pub tool: String,
     pub kind: ActionKind,
+    #[serde(default)]
+    pub read_only: bool,
     pub target: ActionTarget,
     pub arguments: Value,
     pub status: ActionStatus,
@@ -129,6 +131,7 @@ impl ActionRecord {
             id: Uuid::new_v4().to_string(),
             source: source.into(),
             kind: ActionKind::for_tool(&tool),
+            read_only: false,
             target: ActionTarget::from_arguments(&arguments),
             tool,
             arguments,
