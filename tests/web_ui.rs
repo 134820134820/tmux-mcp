@@ -123,8 +123,17 @@ fn message_refresh_preserves_manual_scroll_position() {
 }
 
 #[test]
-fn running_command_notice_names_its_actual_source() {
-    assert!(PAGE.contains(r#"source === "你" ? "你正在提交命令" : `进程 ${source} 正在提交命令`"#));
+fn running_command_notice_uses_a_compact_accessible_spinner() {
+    for marker in [
+        r#"const interferenceText = runningSources.length ? "命令执行中" : "";"#,
+        r#"source === "你" ? "你提交的命令正在执行" : `进程 ${source} 提交的命令正在执行`"#,
+        "elements.messagesInterference.title = interferenceTitle;",
+        ".interference::before",
+        "@keyframes spin",
+        "@media (prefers-reduced-motion: reduce)",
+    ] {
+        assert!(PAGE.contains(marker), "missing running indicator: {marker}");
+    }
     assert!(!PAGE.contains("AI 正在这个 pane"));
 }
 
