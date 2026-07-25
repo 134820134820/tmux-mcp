@@ -77,6 +77,35 @@ fn message_mode_contains_a_single_line_command_composer() {
 }
 
 #[test]
+fn shell_cwd_sits_between_message_history_and_command_composer() {
+    let message_view = PAGE
+        .split_once(r#"<section id="messages-view""#)
+        .expect("messages view")
+        .1
+        .split_once(r#"<section id="interactive-view""#)
+        .expect("messages view end")
+        .0;
+    let history = message_view
+        .find(r#"id="message-list""#)
+        .expect("message list");
+    let cwd = message_view.find(r#"id="messages-cwd""#).expect("cwd");
+    let composer = message_view
+        .find(r#"id="command-composer""#)
+        .expect("command composer");
+    assert!(history < cwd && cwd < composer);
+
+    for marker in [
+        "function isShellCommand(command)",
+        "paneInfo?.id === selectedPane",
+        "isShellCommand(paneInfo.currentCommand)",
+        "elements.messagesCwd.hidden = !showCwd",
+        "elements.messagesCwdPath.textContent = showCwd ? paneInfo.currentPath : \"\"",
+    ] {
+        assert!(PAGE.contains(marker), "missing cwd marker: {marker}");
+    }
+}
+
+#[test]
 fn command_composer_rejects_embedded_newlines() {
     assert!(PAGE.contains(r#"command.includes("\r") || command.includes("\n")"#));
 }
