@@ -778,6 +778,7 @@
       let captureBusy = false;
       let commandSubmitting = false;
       let decidingApprovalId = "";
+      let approvalCooldown = false;
       const decidedApprovalIds = new Set();
       let keyQueue = Promise.resolve();
       const expandedContent = new Set();
@@ -1191,8 +1192,10 @@
 
       function renderApproval(pending) {
         const record = pending?.find((item) => !decidedApprovalIds.has(item.id));
-        if (decidingApprovalId || !record) {
+        if (decidingApprovalId || approvalCooldown || !record) {
           elements.approval.hidden = true;
+          const focused = document.activeElement;
+          if (focused && elements.approval.contains(focused)) focused.blur();
           delete elements.approval.dataset.requestId;
           return;
         }
@@ -1367,8 +1370,13 @@
 
       async function decideApproval(approved) {
         const id = elements.approval.dataset.requestId;
-        if (!id || decidingApprovalId) return;
+        if (!id || decidingApprovalId || approvalCooldown) return;
         decidingApprovalId = id;
+        approvalCooldown = true;
+        setTimeout(() => {
+          approvalCooldown = false;
+          renderApproval(latestState?.pending || []);
+        }, 600);
         renderApproval(latestState?.pending || []);
         try {
           await api(`/api/approvals/${encodeURIComponent(id)}`, {
