@@ -3498,13 +3498,17 @@ impl rmcp::ServerHandler for TmuxMcpServer {
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
         let mut action: Option<ActionRecord> = None;
         if let Some(control) = &self.control {
-            if !self.tool_is_read_only(&request.name) {
-                let arguments = request
-                    .arguments
-                    .clone()
-                    .map(serde_json::Value::Object)
-                    .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-                let mut record = control.action(request.name.to_string(), arguments);
+            let read_only = self.tool_is_read_only(&request.name);
+            let arguments = request
+                .arguments
+                .clone()
+                .map(serde_json::Value::Object)
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            let mut record = control.action(request.name.to_string(), arguments);
+            record.read_only = read_only;
+            if read_only {
+                action = Some(record);
+            } else {
                 match control.authorize(&record).await {
                     Ok(GateDecision::Approved) => {
                         record.mark_running();
@@ -4543,6 +4547,10 @@ mod tests {
 
         assert_ne!(result.is_error, Some(true));
         assert!(hub.pending().await.is_empty());
+        let records = hub.full_log().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool, "socket-for-path");
+        assert!(records[0].read_only);
         task.abort();
     }
 

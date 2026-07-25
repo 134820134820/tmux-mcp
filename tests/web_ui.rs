@@ -17,6 +17,21 @@ fn page_contains_both_pane_modes_and_gate_controls() {
 }
 
 #[test]
+fn operation_log_switches_between_critical_and_full_records() {
+    for marker in [
+        r#"id="log-critical""#,
+        r#"id="log-full""#,
+        r#"operationLogMode === "full" ? latestState?.fullLog : latestState?.operations"#,
+        r#"operationLogMode = value;"#,
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing operation log marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn page_polls_snapshots_and_uses_the_control_api() {
     for marker in [
         "/api/state",
