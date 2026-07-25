@@ -303,6 +303,33 @@
         padding: 20px 28px;
       }
 
+      .pane-cwd {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: min(1120px, calc(100% - 56px));
+        margin: 0 auto 7px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .pane-cwd[hidden] { display: none; }
+      .pane-cwd span {
+        padding: 2px 6px;
+        border-radius: 5px;
+        background: var(--panel-2);
+        font-weight: 700;
+      }
+
+      .pane-cwd code {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--text);
+        font: 12px ui-monospace, "Cascadia Mono", monospace;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .command-composer {
         display: flex;
         gap: 9px;
@@ -641,6 +668,10 @@
             <span id="messages-interference" class="interference"></span>
           </div>
           <div id="message-list"></div>
+          <div id="messages-cwd" class="pane-cwd" hidden>
+            <span>cwd</span>
+            <code id="messages-cwd-path"></code>
+          </div>
           <form id="command-composer" class="command-composer">
             <label class="sr-only" for="command-input">向当前 pane 发送命令</label>
             <textarea
@@ -726,6 +757,8 @@
         interactiveTarget: byId("interactive-target"),
         messagesInterference: byId("messages-interference"),
         interactiveInterference: byId("interactive-interference"),
+        messagesCwd: byId("messages-cwd"),
+        messagesCwdPath: byId("messages-cwd-path"),
         approval: byId("approval-dialog"),
         approvalCount: byId("approval-queue-count"),
         approvalSummary: byId("approval-summary"),
@@ -883,8 +916,18 @@
         elements.commandSend.disabled = disabled;
       }
 
+      function isShellCommand(command) {
+        const name = (command || "").split("/").pop().replace(/^-/, "");
+        return ["sh", "bash", "zsh", "fish", "dash", "ksh", "ash", "csh", "tcsh", "nu"].includes(name);
+      }
+
       function renderHeading(runningSources) {
         const info = selectedPaneInfo();
+        const paneInfo = latestState?.paneInfo;
+        const showCwd =
+          paneInfo?.id === selectedPane &&
+          Boolean(paneInfo.currentPath) &&
+          isShellCommand(paneInfo.currentCommand);
         const title = info
           ? `${info.session.name} / ${info.window.name} / ${info.pane.title || "pane"}`
           : "选择一个 pane";
@@ -902,6 +945,9 @@
         elements.interactiveInterference.textContent = interferenceText;
         elements.messagesInterference.classList.toggle("visible", Boolean(interference));
         elements.interactiveInterference.classList.toggle("visible", Boolean(interference));
+        elements.messagesCwd.hidden = !showCwd;
+        elements.messagesCwdPath.textContent = showCwd ? paneInfo.currentPath : "";
+        elements.messagesCwd.title = showCwd ? paneInfo.currentPath : "";
         updateComposer();
       }
 

@@ -26,7 +26,7 @@ use crate::control::{
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
-use crate::types::{CommandSnapshot, Pane, Session, Window};
+use crate::types::{CommandSnapshot, Pane, PaneInfo, Session, Window};
 
 const PER_PANE_LIMIT: usize = 200;
 const OPERATION_LIMIT: usize = 200;
@@ -93,6 +93,7 @@ struct StateResponse {
     operations: Vec<ActionRecord>,
     topology: Option<Topology>,
     topology_error: Option<String>,
+    pane_info: Option<PaneInfo>,
     activity: HashMap<String, u64>,
 }
 
@@ -330,6 +331,21 @@ async fn api_state(
         Ok(topology) => (Some(topology), None),
         Err(error) => (None, Some(error)),
     };
+    let pane_info = match (query.pane_id.as_deref(), topology.as_ref()) {
+        (Some(pane_id), Some(topology))
+            if topology.sessions.iter().any(|session| {
+                session
+                    .windows
+                    .iter()
+                    .any(|window| window.panes.iter().any(|pane| pane.id == pane_id))
+            }) =>
+        {
+            tmux::pane_info(pane_id, context.socket.as_deref())
+                .await
+                .ok()
+        }
+        _ => None,
+    };
     let mut activity = HashMap::new();
     for record in context.hub.all_records().await {
         for pane_id in &record.target.pane_ids {
@@ -348,6 +364,7 @@ async fn api_state(
         operations: context.hub.operations().await,
         topology,
         topology_error,
+        pane_info,
         activity,
     })
 }
