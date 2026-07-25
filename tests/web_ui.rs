@@ -146,6 +146,28 @@ fn gate_approval_is_a_non_blocking_popover_above_the_composer() {
 }
 
 #[test]
+fn delayed_approval_hides_immediately_and_cannot_drop_its_refresh() {
+    for marker in [
+        r#"let stateRefreshQueued = false;"#,
+        r#"let decidingApprovalId = "";"#,
+        "const decidedApprovalIds = new Set();",
+        "pending?.find((item) => !decidedApprovalIds.has(item.id))",
+        "if (!id || decidingApprovalId) return;",
+        "decidingApprovalId = id;",
+        "decidedApprovalIds.add(id);",
+        "renderApproval(latestState?.pending || []);",
+        "latestState.pending = (latestState.pending || []).filter((record) => record.id !== id);",
+        "stateRefreshQueued = true;",
+        "if (stateRefreshQueued)",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing delayed approval guard: {marker}"
+        );
+    }
+}
+
+#[test]
 fn gate_control_uses_an_accessible_toggle_switch() {
     for marker in [
         r#"<span class="gate-switch" aria-hidden="true"></span>"#,

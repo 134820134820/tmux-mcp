@@ -774,8 +774,11 @@
       let activityInitialized = false;
       let unseenPanes = new Set();
       let stateBusy = false;
+      let stateRefreshQueued = false;
       let captureBusy = false;
       let commandSubmitting = false;
+      let decidingApprovalId = "";
+      const decidedApprovalIds = new Set();
       let keyQueue = Promise.resolve();
       const expandedContent = new Set();
       const LONG_CONTENT_CHARS = 1200;
@@ -1187,8 +1190,8 @@
       }
 
       function renderApproval(pending) {
-        const record = pending?.[0];
-        if (!record) {
+        const record = pending?.find((item) => !decidedApprovalIds.has(item.id));
+        if (decidingApprovalId || !record) {
           elements.approval.hidden = true;
           delete elements.approval.dataset.requestId;
           return;
@@ -1227,13 +1230,21 @@
       }
 
       async function refreshState() {
-        if (stateBusy) return;
+        if (stateBusy) {
+          stateRefreshQueued = true;
+          return;
+        }
         stateBusy = true;
         const requestedPane = selectedPane;
         try {
           const query = requestedPane ? `?paneId=${encodeURIComponent(requestedPane)}` : "";
           const state = await api(`/api/state${query}`);
           latestState = state;
+          for (const id of decidedApprovalIds) {
+            if (!(state.pending || []).some((record) => record.id === id)) {
+              decidedApprovalIds.delete(id);
+            }
+          }
           const panes = flattenPanes(state.topology);
           const selectionChanged = choosePane(panes);
           updateActivity(state.activity);
@@ -1254,6 +1265,10 @@
           showError(error.message);
         } finally {
           stateBusy = false;
+          if (stateRefreshQueued) {
+            stateRefreshQueued = false;
+            void refreshState();
+          }
         }
       }
 
@@ -1352,15 +1367,24 @@
 
       async function decideApproval(approved) {
         const id = elements.approval.dataset.requestId;
-        if (!id) return;
+        if (!id || decidingApprovalId) return;
+        decidingApprovalId = id;
+        renderApproval(latestState?.pending || []);
         try {
           await api(`/api/approvals/${encodeURIComponent(id)}`, {
             method: "PUT",
             body: { approved }
           });
-          await refreshState();
+          decidedApprovalIds.add(id);
+          if (latestState) {
+            latestState.pending = (latestState.pending || []).filter((record) => record.id !== id);
+          }
         } catch (error) {
           showError(error.message);
+        } finally {
+          decidingApprovalId = "";
+          renderApproval(latestState?.pending || []);
+          await refreshState();
         }
       }
 
