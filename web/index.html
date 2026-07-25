@@ -286,16 +286,28 @@
 
       .interference {
         display: none;
+        align-items: center;
+        gap: 7px;
         margin-left: auto;
-        padding: 5px 9px;
-        border: 1px solid var(--amber);
-        border-radius: 7px;
-        color: #854d0e;
-        background: #fffbeb;
+        color: var(--muted);
         font-size: 12px;
       }
 
-      .interference.visible { display: block; }
+      .interference.visible { display: flex; }
+      .interference::before {
+        content: "";
+        width: 14px;
+        height: 14px;
+        border: 2px solid var(--line);
+        border-top-color: var(--text);
+        border-radius: 50%;
+        animation: spin .75s linear infinite;
+      }
+
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        .interference::before { animation: none; }
+      }
 
       #message-list {
         flex: 1;
@@ -935,11 +947,12 @@
         const title = info
           ? `${info.session.name} / ${info.window.name} / ${info.pane.title || "pane"}`
           : "选择一个 pane";
-        const interference = runningSources
-          .map((source) => source === "你" ? "你正在提交命令" : `进程 ${source} 正在提交命令`)
+        const interferenceDetail = runningSources
+          .map((source) => source === "你" ? "你提交的命令正在执行" : `进程 ${source} 提交的命令正在执行`)
           .join("；");
-        const interferenceText = interference
-          ? `${interference}，目标为这个 pane，人工输入可能造成干扰`
+        const interferenceText = runningSources.length ? "命令执行中" : "";
+        const interferenceTitle = interferenceDetail
+          ? `${interferenceDetail}；人工输入可能造成干扰`
           : "";
         elements.messagesTitle.textContent = title;
         elements.interactiveTitle.textContent = title;
@@ -947,8 +960,10 @@
         elements.interactiveTarget.textContent = selectedPane;
         elements.messagesInterference.textContent = interferenceText;
         elements.interactiveInterference.textContent = interferenceText;
-        elements.messagesInterference.classList.toggle("visible", Boolean(interference));
-        elements.interactiveInterference.classList.toggle("visible", Boolean(interference));
+        elements.messagesInterference.title = interferenceTitle;
+        elements.interactiveInterference.title = interferenceTitle;
+        elements.messagesInterference.classList.toggle("visible", Boolean(interferenceText));
+        elements.interactiveInterference.classList.toggle("visible", Boolean(interferenceText));
         elements.messagesCwd.hidden = !showCwd;
         elements.messagesCwdPath.textContent = showCwd ? paneInfo.currentPath : "";
         elements.messagesCwd.title = showCwd ? paneInfo.currentPath : "";
