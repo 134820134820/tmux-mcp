@@ -76,6 +76,45 @@ fn capture_response_is_scoped_to_the_requested_pane_and_mode() {
 }
 
 #[test]
+fn pane_switch_clears_old_history_before_requesting_the_new_history() {
+    let select = PAGE
+        .split_once("function selectPane(paneId)")
+        .expect("selectPane function")
+        .1
+        .split_once("function renderTopology")
+        .expect("selectPane function end")
+        .0;
+    let clear = select
+        .find("renderMessages([], true);")
+        .expect("loading history");
+    let refresh = select.find("void refreshState();").expect("state refresh");
+    assert!(clear < refresh);
+    assert!(PAGE.contains("正在载入这个 pane 的消息…"));
+}
+
+#[test]
+fn stale_message_responses_are_never_rendered_for_another_pane() {
+    let refresh = PAGE
+        .split_once("async function refreshState()")
+        .expect("refreshState function")
+        .1
+        .split_once("async function refreshCapture()")
+        .expect("refreshState function end")
+        .0;
+    for marker in [
+        "const requestedPane = selectedPane;",
+        "requestedPane === selectedPane",
+        "renderMessages(state.messages || []);",
+        "renderMessages([], true);",
+    ] {
+        assert!(
+            refresh.contains(marker),
+            "missing pane scope marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn message_mode_contains_a_single_line_command_composer() {
     for marker in [
         r#"id="command-composer""#,

@@ -21,8 +21,8 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{
-    set_gate_enabled, ActionKind, ActionRecord, AuthorizationResponse, GateDecision, StatePaths,
-    ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
+    set_gate_enabled, ActionKind, ActionRecord, ActionStatus, AuthorizationResponse, GateDecision,
+    StatePaths, ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
@@ -102,6 +102,7 @@ struct StateResponse {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Topology {
+    server_started_at_ms: Option<u64>,
     sessions: Vec<SessionNode>,
 }
 
@@ -325,23 +326,30 @@ async fn api_state(
     State(context): State<AppContext>,
     Query(query): Query<StateQuery>,
 ) -> Json<StateResponse> {
-    let messages = match query.pane_id.as_deref() {
-        Some(pane_id) => context.hub.records_for_pane(pane_id).await,
-        None => Vec::new(),
-    };
     let (topology, topology_error) = match cached_topology(&context).await {
         Ok(topology) => (Some(topology), None),
         Err(error) => (None, Some(error)),
     };
+    let pane_exists = |pane_id: &str, topology: &Topology| {
+        topology.sessions.iter().any(|session| {
+            session
+                .windows
+                .iter()
+                .any(|window| window.panes.iter().any(|pane| pane.id == pane_id))
+        })
+    };
+    let messages = match (query.pane_id.as_deref(), topology.as_ref()) {
+        (Some(pane_id), Some(topology)) if pane_exists(pane_id, topology) => {
+            context
+                .hub
+                .records_for_pane_since(pane_id, topology.server_started_at_ms)
+                .await
+        }
+        (Some(pane_id), None) => context.hub.records_for_pane(pane_id).await,
+        _ => Vec::new(),
+    };
     let pane_info = match (query.pane_id.as_deref(), topology.as_ref()) {
-        (Some(pane_id), Some(topology))
-            if topology.sessions.iter().any(|session| {
-                session
-                    .windows
-                    .iter()
-                    .any(|window| window.panes.iter().any(|pane| pane.id == pane_id))
-            }) =>
-        {
+        (Some(pane_id), Some(topology)) if pane_exists(pane_id, topology) => {
             tmux::pane_info(pane_id, context.socket.as_deref())
                 .await
                 .ok()
@@ -413,14 +421,26 @@ async fn agent_record(
     State(context): State<AppContext>,
     Json(record): Json<ActionRecord>,
 ) -> Response {
+    let refresh_topology = record_changes_topology(&record);
     match context.hub.upsert(record).await {
-        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Ok(()) => {
+            if refresh_topology {
+                context.topology_cache.lock().await.invalidate();
+            }
+            Json(OkResponse { ok: true }).into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("unable to persist record: {error}"),
         )
             .into_response(),
     }
+}
+
+fn record_changes_topology(record: &ActionRecord) -> bool {
+    record.kind == ActionKind::Operation
+        && !record.read_only
+        && record.status == ActionStatus::Completed
 }
 
 async fn api_capture(
@@ -596,6 +616,10 @@ impl TopologyCache {
             .filter(|(loaded_at, _)| now.duration_since(*loaded_at) < TOPOLOGY_CACHE_TTL)
             .map(|(_, value)| value.clone())
     }
+
+    fn invalidate(&mut self) {
+        self.value = None;
+    }
 }
 
 async fn load_topology(context: &AppContext) -> Result<Topology, String> {
@@ -613,6 +637,11 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
     let sessions = tmux::list_sessions(context.socket.as_deref())
         .await
         .map_err(|error| error.to_string())?;
+    let server_started_at_ms = tmux::server_start_time(context.socket.as_deref())
+        .await
+        .ok()
+        .flatten()
+        .map(|seconds| seconds.saturating_mul(1000));
     let mut nodes = Vec::new();
     for session in sessions {
         if context
@@ -640,7 +669,10 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
             windows: window_nodes,
         });
     }
-    Ok(Topology { sessions: nodes })
+    Ok(Topology {
+        server_started_at_ms,
+        sessions: nodes,
+    })
 }
 
 #[cfg(test)]
@@ -662,6 +694,23 @@ mod tests {
             Some(Err(error)) if error == "tmux unavailable"
         ));
         assert!(cache.get(loaded_at + Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn only_completed_mutating_operations_refresh_topology() {
+        let mut split = ActionRecord::new("Codex", "split-pane", json!({"paneId": "%1"}));
+        assert!(!record_changes_topology(&split));
+        split.mark_completed(None);
+        assert!(record_changes_topology(&split));
+
+        let mut read_only = ActionRecord::new("Codex", "list-panes", json!({"windowId": "@1"}));
+        read_only.read_only = true;
+        read_only.mark_completed(None);
+        assert!(!record_changes_topology(&read_only));
+
+        let mut input = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%1"}));
+        input.mark_completed(None);
+        assert!(!record_changes_topology(&input));
     }
 
     #[test]
@@ -1173,7 +1222,19 @@ impl HubState {
     }
 
     pub async fn records_for_pane(&self, pane_id: &str) -> Vec<ActionRecord> {
-        self.inner.store.lock().await.records_for_pane(pane_id)
+        self.records_for_pane_since(pane_id, None).await
+    }
+
+    pub async fn records_for_pane_since(
+        &self,
+        pane_id: &str,
+        minimum_requested_at_ms: Option<u64>,
+    ) -> Vec<ActionRecord> {
+        self.inner
+            .store
+            .lock()
+            .await
+            .records_for_pane_since(pane_id, minimum_requested_at_ms)
     }
 
     pub async fn operations(&self) -> Vec<ActionRecord> {
@@ -1324,16 +1385,26 @@ impl RecordStore {
 
     fn sorted_records(&self) -> Vec<ActionRecord> {
         let mut records: Vec<_> = self.records.values().cloned().collect();
-        records.sort_by_key(|record| (record.requested_at_ms, record.updated_at_ms));
+        sort_records(&mut records);
         records
     }
 
     fn records_for_pane(&self, pane_id: &str) -> Vec<ActionRecord> {
+        self.records_for_pane_since(pane_id, None)
+    }
+
+    fn records_for_pane_since(
+        &self,
+        pane_id: &str,
+        minimum_requested_at_ms: Option<u64>,
+    ) -> Vec<ActionRecord> {
         let mut records: Vec<_> = self
             .records
             .values()
             .filter(|record| {
                 record.kind != ActionKind::Operation
+                    && minimum_requested_at_ms
+                        .map_or(true, |minimum| record.requested_at_ms >= minimum)
                     && record
                         .target
                         .pane_ids
@@ -1342,7 +1413,7 @@ impl RecordStore {
             })
             .cloned()
             .collect();
-        records.sort_by_key(|record| (record.requested_at_ms, record.updated_at_ms));
+        sort_records(&mut records);
         if records.len() > PER_PANE_LIMIT {
             records.drain(..records.len() - PER_PANE_LIMIT);
         }
@@ -1356,7 +1427,7 @@ impl RecordStore {
             .filter(|record| record.kind == ActionKind::Operation && !record.read_only)
             .cloned()
             .collect();
-        records.sort_by_key(|record| (record.requested_at_ms, record.updated_at_ms));
+        sort_records(&mut records);
         if records.len() > OPERATION_LIMIT {
             records.drain(..records.len() - OPERATION_LIMIT);
         }
@@ -1370,7 +1441,7 @@ impl RecordStore {
             .filter(|record| record.tool != "execute-command" && record.tool != "web-input")
             .cloned()
             .collect();
-        records.sort_by_key(|record| (record.requested_at_ms, record.updated_at_ms));
+        sort_records(&mut records);
         if records.len() > FULL_LOG_LIMIT {
             records.drain(..records.len() - FULL_LOG_LIMIT);
         }
@@ -1422,6 +1493,16 @@ impl RecordStore {
         self.records.retain(|id, _| keep.contains(id));
         remove_file_if_exists(&backup)
     }
+}
+
+fn sort_records(records: &mut [ActionRecord]) {
+    records.sort_by(|left, right| {
+        (left.requested_at_ms, left.updated_at_ms, left.id.as_str()).cmp(&(
+            right.requested_at_ms,
+            right.updated_at_ms,
+            right.id.as_str(),
+        ))
+    });
 }
 
 fn recover_compaction(path: &std::path::Path) -> io::Result<()> {

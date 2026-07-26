@@ -676,6 +676,16 @@ pub async fn tmux_version() -> Option<(u32, u32)> {
     parse_tmux_version(&output)
 }
 
+pub fn parse_server_start_time(output: &str) -> Option<u64> {
+    output.trim().parse().ok()
+}
+
+pub async fn server_start_time(socket: Option<&str>) -> Result<Option<u64>> {
+    let output =
+        execute_tmux_with_socket(&["display-message", "-p", "#{start_time}"], socket).await?;
+    Ok(parse_server_start_time(&output))
+}
+
 fn decode_tmux_field(field: &str) -> String {
     field.replace("%7C", "|").replace("%25", "%")
 }
@@ -2957,6 +2967,14 @@ mod tests {
     #[case("", None)]
     fn test_parse_tmux_version(#[case] input: &str, #[case] expected: Option<(u32, u32)>) {
         assert_eq!(parse_tmux_version(input), expected);
+    }
+
+    #[rstest]
+    #[case("1784900000\n", Some(1_784_900_000))]
+    #[case("", None)]
+    #[case("not-a-time", None)]
+    fn test_parse_server_start_time(#[case] input: &str, #[case] expected: Option<u64>) {
+        assert_eq!(parse_server_start_time(input), expected);
     }
 
     #[rstest]

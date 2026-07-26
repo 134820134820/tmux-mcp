@@ -890,6 +890,7 @@
         elements.terminal.textContent = "";
         renderTopology(latestState?.topology);
         updateComposer();
+        renderMessages([], true);
         void refreshState();
         if (mode === "interactive") {
           elements.terminal.focus();
@@ -1166,7 +1167,7 @@
         return card;
       }
 
-      function renderMessages(records) {
+      function renderMessages(records, loading = false) {
         const scrollTop = elements.messageList.scrollTop;
         const followLatest =
           elements.messageList.scrollHeight - scrollTop - elements.messageList.clientHeight <= 2;
@@ -1180,6 +1181,10 @@
         renderHeading(runningSources);
         if (!selectedPane) {
           elements.messageList.appendChild(node("div", "empty-state", "从左侧选择一个 pane"));
+          return;
+        }
+        if (loading) {
+          elements.messageList.appendChild(node("div", "empty-state", "正在载入这个 pane 的消息…"));
           return;
         }
         if (!records.length) {
@@ -1286,7 +1291,7 @@
           if (!selectionChanged && requestedPane === selectedPane) {
             renderMessages(state.messages || []);
           } else {
-            renderMessages([]);
+            renderMessages([], true);
             setTimeout(() => void refreshState(), 0);
           }
         } catch (error) {
