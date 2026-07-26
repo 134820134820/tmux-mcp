@@ -345,6 +345,23 @@ async fn pane_histories_stay_isolated_when_a_new_pane_appears() {
 }
 
 #[tokio::test]
+async fn safe_read_tools_appear_in_their_pane_message_history() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    for (tool, pane_id) in [("list-directory", "%1"), ("read-file", "%2")] {
+        let mut record = ActionRecord::new("Codex", tool, json!({"paneId": pane_id, "path": "."}));
+        record.read_only = true;
+        state.upsert(record).await.expect("persist safe read");
+    }
+
+    assert_eq!(state.records_for_pane("%1").await[0].tool, "list-directory");
+    assert_eq!(state.records_for_pane("%2").await[0].tool, "read-file");
+    assert!(state.records_for_pane("%3").await.is_empty());
+    assert!(state.operations().await.is_empty());
+}
+
+#[tokio::test]
 async fn pane_history_order_is_stable_when_timestamps_match() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
