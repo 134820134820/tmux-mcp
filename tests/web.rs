@@ -310,6 +310,108 @@ async fn state_views_keep_only_the_latest_200_records() {
 }
 
 #[tokio::test]
+async fn pane_histories_stay_isolated_when_a_new_pane_appears() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    for (pane_id, text) in [("%1", "one"), ("%2", "two")] {
+        let record = ActionRecord::new(
+            "Codex",
+            "send-keys",
+            json!({"paneId": pane_id, "keys": [text]}),
+        );
+        state.upsert(record).await.expect("persist pane input");
+    }
+
+    assert_eq!(state.records_for_pane("%1").await.len(), 1);
+    assert_eq!(state.records_for_pane("%2").await.len(), 1);
+    assert!(state.records_for_pane("%3").await.is_empty());
+
+    let new_pane = ActionRecord::new(
+        "Claude",
+        "execute-command",
+        json!({"paneId": "%3", "command": "pwd"}),
+    );
+    state
+        .upsert(new_pane)
+        .await
+        .expect("persist new pane command");
+
+    assert_eq!(state.records_for_pane("%1").await.len(), 1);
+    assert_eq!(state.records_for_pane("%2").await.len(), 1);
+    let new_history = state.records_for_pane("%3").await;
+    assert_eq!(new_history.len(), 1);
+    assert_eq!(new_history[0].arguments["command"], "pwd");
+}
+
+#[tokio::test]
+async fn pane_history_order_is_stable_when_timestamps_match() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    for id in ["b", "a"] {
+        let mut record =
+            ActionRecord::new("Codex", "send-keys", json!({"paneId": "%1", "keys": [id]}));
+        record.id = id.into();
+        record.requested_at_ms = 1_000;
+        record.updated_at_ms = 1_000;
+        state.upsert(record).await.expect("persist pane input");
+    }
+
+    assert_eq!(
+        state
+            .records_for_pane("%1")
+            .await
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+}
+
+#[tokio::test]
+async fn reused_pane_id_hides_history_from_an_older_tmux_server() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    for (id, requested_at_ms) in [("old-server", 1_000), ("current-server", 3_000)] {
+        let mut record =
+            ActionRecord::new("Codex", "send-keys", json!({"paneId": "%0", "keys": [id]}));
+        record.id = id.into();
+        record.requested_at_ms = requested_at_ms;
+        record.updated_at_ms = requested_at_ms;
+        state.upsert(record).await.expect("persist pane input");
+    }
+
+    let history = state.records_for_pane_since("%0", Some(2_000)).await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, "current-server");
+}
+
+#[tokio::test]
+async fn switching_panes_ends_the_previous_human_input_group() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    let first = state
+        .record_human_input_at("%1", "a", true, 1_000)
+        .await
+        .expect("record first pane");
+    state
+        .record_human_input_at("%2", "b", true, 1_100)
+        .await
+        .expect("record second pane");
+    let returned = state
+        .record_human_input_at("%1", "c", true, 1_200)
+        .await
+        .expect("return to first pane");
+
+    assert_ne!(first.id, returned.id);
+    assert_eq!(state.records_for_pane("%1").await.len(), 2);
+    assert_eq!(state.records_for_pane("%2").await.len(), 1);
+}
+
+#[tokio::test]
 async fn operation_logs_separate_critical_and_full_mcp_requests() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
