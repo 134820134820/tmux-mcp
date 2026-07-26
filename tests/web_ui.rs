@@ -55,6 +55,23 @@ fn safe_read_tools_render_as_clean_pane_messages() {
 }
 
 #[test]
+fn safe_git_tools_render_as_clean_pane_messages() {
+    for marker in [
+        r#"record.tool === "git-status""#,
+        r#"record.tool === "git-diff""#,
+        r#"record.tool === "git-log""#,
+        r#"record.tool === "git-show""#,
+        r#"record.tool?.startsWith("git-")"#,
+        "structured?.output",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing safe Git message marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn page_polls_snapshots_and_uses_the_control_api() {
     for marker in [
         "/api/state",

@@ -362,6 +362,30 @@ async fn safe_read_tools_appear_in_their_pane_message_history() {
 }
 
 #[tokio::test]
+async fn safe_git_tools_appear_in_their_pane_message_history() {
+    let dir = tempdir().expect("temp state dir");
+    let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
+
+    for tool in ["git-status", "git-diff", "git-log", "git-show"] {
+        let mut record = ActionRecord::new("Codex", tool, json!({"paneId": "%1", "repoPath": "."}));
+        record.read_only = true;
+        state.upsert(record).await.expect("persist Git query");
+    }
+
+    assert_eq!(
+        state
+            .records_for_pane("%1")
+            .await
+            .iter()
+            .map(|record| record.tool.as_str())
+            .collect::<Vec<_>>(),
+        ["git-status", "git-diff", "git-log", "git-show"]
+    );
+    assert!(state.records_for_pane("%2").await.is_empty());
+    assert!(state.operations().await.is_empty());
+}
+
+#[tokio::test]
 async fn pane_history_order_is_stable_when_timestamps_match() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");

@@ -1403,7 +1403,15 @@ impl RecordStore {
             .values()
             .filter(|record| {
                 (record.kind != ActionKind::Operation
-                    || matches!(record.tool.as_str(), "list-directory" | "read-file"))
+                    || matches!(
+                        record.tool.as_str(),
+                        "list-directory"
+                            | "read-file"
+                            | "git-status"
+                            | "git-diff"
+                            | "git-log"
+                            | "git-show"
+                    ))
                     && minimum_requested_at_ms
                         .map_or(true, |minimum| record.requested_at_ms >= minimum)
                     && record
