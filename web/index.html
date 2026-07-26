@@ -1010,6 +1010,16 @@
           return `ls${args.showHidden ? " -a" : ""} ${args.path || "."}`;
         }
         if (record.tool === "read-file") return `read ${args.path || ""}`;
+        const git = args.repoPath ? `git -C ${args.repoPath}` : "git";
+        if (record.tool === "git-status") return `${git} status`;
+        if (record.tool === "git-diff") {
+          const paths = Array.isArray(args.paths) && args.paths.length
+            ? ` -- ${args.paths.join(" ")}`
+            : "";
+          return `${git} diff${args.staged ? " --cached" : ""}${paths}`;
+        }
+        if (record.tool === "git-log") return `${git} log --oneline -n ${args.maxCount || 20}`;
+        if (record.tool === "git-show") return `${git} show ${args.revision || "HEAD"}`;
         const special = {
           "send-cancel": "Ctrl-C",
           "send-eof": "Ctrl-D",
@@ -1045,6 +1055,10 @@
         if (record.tool === "read-file" && typeof structured?.content === "string") {
           const output = structured.content || "（空文件）";
           return structured.truncated ? `${output}\n…（内容已截断）` : output;
+        }
+        if (record.tool?.startsWith("git-") && typeof structured?.output === "string") {
+          const output = structured.output || "（无输出）";
+          return structured.truncated ? `${output}\n…（结果已截断）` : output;
         }
         const text = record.result?.content
           ?.filter((item) => item.type === "text" && typeof item.text === "string")

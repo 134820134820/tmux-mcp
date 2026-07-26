@@ -103,6 +103,22 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
         groups: &["file-read", "read"],
     },
     ToolManifestEntry {
+        name: "git-status",
+        groups: &["git-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "git-diff",
+        groups: &["git-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "git-log",
+        groups: &["git-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "git-show",
+        groups: &["git-read", "read"],
+    },
+    ToolManifestEntry {
         name: "show-buffer",
         groups: &["buffer-read", "read"],
     },
@@ -663,7 +679,8 @@ impl SecurityPolicy {
             | "set-synchronize-panes" => self.config.allow_move,
             "capture-pane" | "show-buffer" | "save-buffer" | "load-buffer" | "delete-buffer"
             | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
-            | "subsearch-buffer" | "read-file" => self.config.allow_capture,
+            | "subsearch-buffer" | "read-file" | "git-status" | "git-diff" | "git-log"
+            | "git-show" => self.config.allow_capture,
             "socket-for-path"
             | "list-sessions"
             | "list-windows"
@@ -2029,6 +2046,24 @@ mod tests {
         assert!(policy.check_tool("send-keys").is_err());
         assert!(policy.check_tool("send-enter").is_err());
         assert!(policy.check_tool("execute-command").is_ok());
+    }
+
+    #[test]
+    fn test_tool_filter_can_allow_only_git_reads() {
+        let config = SecurityConfig {
+            tools: ToolFilter {
+                mode: ToolFilterMode::Allow,
+                items: vec!["@git-read".to_string()],
+            },
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_config(config).expect("compile policy");
+
+        for tool in ["git-status", "git-diff", "git-log", "git-show"] {
+            assert!(policy.check_tool(tool).is_ok());
+        }
+        assert!(policy.check_tool("execute-command").is_err());
+        assert!(policy.check_tool("read-file").is_err());
     }
 
     #[test]

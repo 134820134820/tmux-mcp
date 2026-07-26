@@ -121,6 +121,11 @@ const DEFAULT_DIRECTORY_ENTRIES: u32 = 200;
 const MAX_DIRECTORY_ENTRIES: u32 = 500;
 const DEFAULT_FILE_BYTES: u32 = 65_536;
 const MAX_FILE_BYTES: u32 = 262_144;
+const DEFAULT_GIT_BYTES: u32 = 65_536;
+const MAX_GIT_BYTES: u32 = 262_144;
+const DEFAULT_GIT_LOG_COUNT: u32 = 20;
+const MAX_GIT_LOG_COUNT: u32 = 100;
+const MAX_GIT_PATHS: usize = 100;
 
 /// stdio MCP server: policy-gated tool router, command tracker, and dynamic resources.
 ///
@@ -192,6 +197,35 @@ fn structured_error_output<T: Serialize>(value: &T) -> CallToolResult {
             "Error serializing output: {e}"
         ))]),
     }
+}
+
+fn git_tool_output(
+    action: &str,
+    cwd: String,
+    result: crate::errors::Result<tmux::GitReadOutput>,
+) -> CallToolResult {
+    match result {
+        Ok(output) => structured_output(&GitQueryOutput {
+            cwd,
+            repo_root: output.repo_root,
+            output: output.output,
+            bytes_read: output.bytes_read,
+            truncated: output.truncated,
+        }),
+        Err(error) => CallToolResult::error(vec![Content::text(format!(
+            "Error running git {action}: {error}"
+        ))]),
+    }
+}
+
+fn git_max_bytes(value: Option<u32>) -> std::result::Result<usize, CallToolResult> {
+    let value = value.unwrap_or(DEFAULT_GIT_BYTES);
+    if !(1..=MAX_GIT_BYTES).contains(&value) {
+        return Err(CallToolResult::error(vec![Content::text(format!(
+            "maxBytes must be between 1 and {MAX_GIT_BYTES}"
+        ))]));
+    }
+    Ok(value as usize)
 }
 
 fn truncate_command_label(command: &str) -> String {
@@ -285,6 +319,17 @@ pub struct ReadFileOutput {
     pub cwd: String,
     pub path: String,
     pub content: String,
+    pub bytes_read: usize,
+    pub truncated: bool,
+}
+
+/// Shared structured payload for bounded Git queries.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitQueryOutput {
+    pub cwd: String,
+    pub repo_root: String,
+    pub output: String,
     pub bytes_read: usize,
     pub truncated: bool,
 }
@@ -396,6 +441,79 @@ pub struct ReadFileInput {
     /// Absolute path or path relative to the pane's current working directory.
     pub path: String,
     /// Maximum bytes to return (default 65536, maximum 262144).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `git-status`: bounded repository status.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GitStatusInput {
+    /// Pane whose current working directory supplies the default repository path.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Repository path, absolute or relative to the pane cwd (default `.`).
+    #[serde(rename = "repoPath")]
+    pub repo_path: Option<String>,
+    /// Maximum output bytes (default 65536, maximum 262144).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `git-diff`: bounded working-tree or staged diff.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GitDiffInput {
+    /// Pane whose current working directory supplies the default repository path.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Repository path, absolute or relative to the pane cwd (default `.`).
+    #[serde(rename = "repoPath")]
+    pub repo_path: Option<String>,
+    /// Compare the index to HEAD (`git diff --cached`) instead of the working tree.
+    pub staged: Option<bool>,
+    /// Optional literal repository-relative paths (maximum 100).
+    pub paths: Option<Vec<String>>,
+    /// Maximum output bytes (default 65536, maximum 262144).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `git-log`: bounded fixed-format commit history.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GitLogInput {
+    /// Pane whose current working directory supplies the default repository path.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Repository path, absolute or relative to the pane cwd (default `.`).
+    #[serde(rename = "repoPath")]
+    pub repo_path: Option<String>,
+    /// Maximum commits (default 20, maximum 100).
+    #[serde(rename = "maxCount")]
+    pub max_count: Option<u32>,
+    /// Maximum output bytes (default 65536, maximum 262144).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `git-show`: bounded single-commit display.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GitShowInput {
+    /// Pane whose current working directory supplies the default repository path.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Repository path, absolute or relative to the pane cwd (default `.`).
+    #[serde(rename = "repoPath")]
+    pub repo_path: Option<String>,
+    /// One revision resolving to a commit (default `HEAD`).
+    pub revision: Option<String>,
+    /// Maximum output bytes (default 65536, maximum 262144).
     #[serde(rename = "maxBytes")]
     pub max_bytes: Option<u32>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
@@ -1154,6 +1272,29 @@ impl TmuxMcpServer {
         tmux::pane_info(pane_id, socket).await
     }
 
+    async fn checked_git_cwd(
+        &self,
+        tool: &str,
+        pane_id: &str,
+        socket: Option<&str>,
+    ) -> std::result::Result<String, CallToolResult> {
+        if let Err(error) = self.policy.check_tool(tool) {
+            return Err(CallToolResult::error(vec![Content::text(format!(
+                "{error}"
+            ))]));
+        }
+        let socket = tmux::resolve_socket(socket);
+        if let Err(error) = self.policy.check_socket(socket.as_deref()) {
+            return Err(CallToolResult::error(vec![Content::text(format!(
+                "{error}"
+            ))]));
+        }
+        self.checked_pane_info(pane_id, socket.as_deref())
+            .await
+            .map(|pane| pane.current_path)
+            .map_err(|error| CallToolResult::error(vec![Content::text(format!("{error}"))]))
+    }
+
     async fn enforce_session_for_window(
         &self,
         window_id: &str,
@@ -1608,6 +1749,138 @@ impl TmuxMcpServer {
                 "Error reading file: {e}"
             ))])),
         }
+    }
+
+    #[tool(
+        name = "git-status",
+        description = "Read bounded Git status for the repository at repoPath or the target pane cwd. Uses fixed non-interactive arguments; raw shell Git commands remain gated.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GitQueryOutput>()
+    )]
+    async fn git_status(
+        &self,
+        input: Parameters<GitStatusInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let max_bytes = match git_max_bytes(input.0.max_bytes) {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let cwd = match self
+            .checked_git_cwd("git-status", &input.0.pane_id, input.0.socket.as_deref())
+            .await
+        {
+            Ok(cwd) => cwd,
+            Err(error) => return Ok(error),
+        };
+        Ok(git_tool_output(
+            "status",
+            cwd.clone(),
+            tmux::git_status(&cwd, input.0.repo_path.as_deref(), max_bytes).await,
+        ))
+    }
+
+    #[tool(
+        name = "git-diff",
+        description = "Read a bounded unstaged or staged Git diff with literal optional paths. External diff and textconv helpers, pagers, network fetches, and optional index writes are disabled.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GitQueryOutput>()
+    )]
+    async fn git_diff(&self, input: Parameters<GitDiffInput>) -> Result<CallToolResult, McpError> {
+        let max_bytes = match git_max_bytes(input.0.max_bytes) {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let paths = input.0.paths.unwrap_or_default();
+        if paths.len() > MAX_GIT_PATHS {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "paths must contain at most {MAX_GIT_PATHS} entries"
+            ))]));
+        }
+        let cwd = match self
+            .checked_git_cwd("git-diff", &input.0.pane_id, input.0.socket.as_deref())
+            .await
+        {
+            Ok(cwd) => cwd,
+            Err(error) => return Ok(error),
+        };
+        Ok(git_tool_output(
+            "diff",
+            cwd.clone(),
+            tmux::git_diff(
+                &cwd,
+                input.0.repo_path.as_deref(),
+                input.0.staged.unwrap_or(false),
+                &paths,
+                max_bytes,
+            )
+            .await,
+        ))
+    }
+
+    #[tool(
+        name = "git-log",
+        description = "Read bounded fixed-format Git history for HEAD. Commit count and output are capped; signatures, pagers, network fetches, and optional index writes are disabled.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GitQueryOutput>()
+    )]
+    async fn git_log(&self, input: Parameters<GitLogInput>) -> Result<CallToolResult, McpError> {
+        let max_bytes = match git_max_bytes(input.0.max_bytes) {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let max_count = input.0.max_count.unwrap_or(DEFAULT_GIT_LOG_COUNT);
+        if !(1..=MAX_GIT_LOG_COUNT).contains(&max_count) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxCount must be between 1 and {MAX_GIT_LOG_COUNT}"
+            ))]));
+        }
+        let cwd = match self
+            .checked_git_cwd("git-log", &input.0.pane_id, input.0.socket.as_deref())
+            .await
+        {
+            Ok(cwd) => cwd,
+            Err(error) => return Ok(error),
+        };
+        Ok(git_tool_output(
+            "log",
+            cwd.clone(),
+            tmux::git_log(&cwd, input.0.repo_path.as_deref(), max_count, max_bytes).await,
+        ))
+    }
+
+    #[tool(
+        name = "git-show",
+        description = "Read one bounded Git commit resolved from revision (default HEAD). External diff and textconv helpers, signature checks, pagers, network fetches, and optional index writes are disabled.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GitQueryOutput>()
+    )]
+    async fn git_show(&self, input: Parameters<GitShowInput>) -> Result<CallToolResult, McpError> {
+        let max_bytes = match git_max_bytes(input.0.max_bytes) {
+            Ok(value) => value,
+            Err(error) => return Ok(error),
+        };
+        let revision = input.0.revision.unwrap_or_else(|| "HEAD".to_string());
+        if revision.is_empty()
+            || revision.len() > 256
+            || revision.starts_with('-')
+            || revision.contains(['\0', '\r', '\n'])
+        {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "revision must be 1-256 characters, must not start with '-', and must not contain NUL or newlines",
+            )]));
+        }
+        let cwd = match self
+            .checked_git_cwd("git-show", &input.0.pane_id, input.0.socket.as_deref())
+            .await
+        {
+            Ok(cwd) => cwd,
+            Err(error) => return Ok(error),
+        };
+        Ok(git_tool_output(
+            "show",
+            cwd.clone(),
+            tmux::git_show(&cwd, input.0.repo_path.as_deref(), &revision, max_bytes).await,
+        ))
     }
 
     #[tool(
@@ -3587,7 +3860,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 .build(),
         )
         .with_instructions(
-            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory and read-file for filesystem inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
+            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory, read-file, and the bounded git-status/git-diff/git-log/git-show tools for inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
         )
     }
 
@@ -4454,6 +4727,10 @@ mod tests {
         assert!(server.tool_is_read_only("capture-pane"));
         assert!(server.tool_is_read_only("list-directory"));
         assert!(server.tool_is_read_only("read-file"));
+        assert!(server.tool_is_read_only("git-status"));
+        assert!(server.tool_is_read_only("git-diff"));
+        assert!(server.tool_is_read_only("git-log"));
+        assert!(server.tool_is_read_only("git-show"));
         assert!(!server.tool_is_read_only("execute-command"));
         assert!(!server.tool_is_read_only("send-keys"));
         assert!(!server.tool_is_read_only("unknown-tool"));
@@ -4487,6 +4764,44 @@ mod tests {
             .expect("read-file result");
         assert_eq!(reading.is_error, Some(true));
         assert!(first_text(&reading).contains("maxBytes"));
+
+        let status = server
+            .git_status(Parameters(GitStatusInput {
+                pane_id: "%1".into(),
+                repo_path: None,
+                max_bytes: Some(MAX_GIT_BYTES + 1),
+                socket: None,
+            }))
+            .await
+            .expect("git-status result");
+        assert_eq!(status.is_error, Some(true));
+        assert!(first_text(&status).contains("maxBytes"));
+
+        let log = server
+            .git_log(Parameters(GitLogInput {
+                pane_id: "%1".into(),
+                repo_path: None,
+                max_count: Some(MAX_GIT_LOG_COUNT + 1),
+                max_bytes: None,
+                socket: None,
+            }))
+            .await
+            .expect("git-log result");
+        assert_eq!(log.is_error, Some(true));
+        assert!(first_text(&log).contains("maxCount"));
+
+        let show = server
+            .git_show(Parameters(GitShowInput {
+                pane_id: "%1".into(),
+                repo_path: None,
+                revision: Some("--help".into()),
+                max_bytes: None,
+                socket: None,
+            }))
+            .await
+            .expect("git-show result");
+        assert_eq!(show.is_error, Some(true));
+        assert!(first_text(&show).contains("revision"));
     }
 
     async fn start_control_hub(

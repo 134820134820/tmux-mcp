@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -41,6 +41,33 @@ const PARALLEL_BUFFER_THRESHOLD: usize = 10;
 /// Fuzzy scoring skips individual lines larger than this to bound CPU.
 const FUZZY_MAX_LINE_BYTES: usize = 4_096;
 const READ_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const GIT_ERROR_MAX_BYTES: usize = 65_536;
+const GIT_ROOT_MAX_BYTES: usize = 16_384;
+const GIT_ARGUMENT_MAX_BYTES: usize = 16_384;
+const GIT_ENV: &[(&str, &str)] = &[
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_LITERAL_PATHSPECS", "1"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+    ("LC_ALL", "C"),
+];
+const GIT_ENV_REMOVE: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_PROXY_COMMAND",
+];
 
 static TMUX_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TMUX_MAX_CONCURRENCY));
 
@@ -83,6 +110,14 @@ pub struct SubsearchOptions {
     pub similarity_threshold: Option<f32>,
     /// Resume cursor within the anchor window for paged subsearch.
     pub resume_from_offset: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GitReadOutput {
+    pub repo_root: String,
+    pub output: String,
+    pub bytes_read: usize,
+    pub truncated: bool,
 }
 
 struct BufferScanResult {
@@ -469,6 +504,379 @@ async fn execute_read_only_program(cwd: &str, program: &str, args: &[&str]) -> R
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         })
     }
+}
+
+fn hardened_git_args(repo_path: &str) -> Vec<String> {
+    [
+        "--no-pager",
+        "--no-optional-locks",
+        "--no-replace-objects",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "color.ui=false",
+        "-C",
+        repo_path,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn build_git_command(cwd: &str, args: &[String]) -> Result<Command> {
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some(mut ssh_args) = get_ssh_args()? {
+        ssh_args.insert(0, "-n".to_string());
+        let mut environment = Vec::new();
+        for name in GIT_ENV_REMOVE {
+            environment.push("-u".to_string());
+            environment.push((*name).to_string());
+        }
+        environment.extend(
+            GIT_ENV
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+        environment.push("git".to_string());
+        environment.extend(args.iter().map(|arg| (*arg).to_string()));
+        let environment = environment.iter().map(String::as_str).collect::<Vec<_>>();
+        ssh_args.push(format!(
+            "cd -- {} && {}",
+            quote_remote_arg(cwd),
+            build_remote_command("/usr/bin/env", &environment)
+        ));
+        let mut command = Command::new("ssh");
+        command.args(ssh_args);
+        Ok(command)
+    } else {
+        let mut command = Command::new("git");
+        command
+            .current_dir(cwd)
+            .args(args)
+            .envs(GIT_ENV.iter().copied());
+        for name in GIT_ENV_REMOVE {
+            command.env_remove(name);
+        }
+        Ok(command)
+    }
+}
+
+async fn read_stream_bounded<R>(mut reader: R, max_bytes: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut kept = Vec::with_capacity(max_bytes.min(65_536));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(kept.len());
+        kept.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+    Ok((kept, truncated))
+}
+
+async fn execute_git_bounded(
+    cwd: &str,
+    args: &[String],
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool)> {
+    let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
+        message: format!("tmux semaphore closed: {e}"),
+    })?;
+    let mut command = build_git_command(cwd, args)?;
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| Error::Tmux {
+        message: format!("failed to spawn git: {e}"),
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| Error::Tmux {
+        message: "failed to capture git stdout".to_string(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| Error::Tmux {
+        message: "failed to capture git stderr".to_string(),
+    })?;
+    let stdout_task = tokio::spawn(read_stream_bounded(stdout, max_bytes));
+    let stderr_task = tokio::spawn(read_stream_bounded(stderr, GIT_ERROR_MAX_BYTES));
+
+    let status = match tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, child.wait()).await {
+        Ok(result) => result.map_err(|e| Error::Tmux {
+            message: format!("failed to wait for git: {e}"),
+        })?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(Error::Tmux {
+                message: "git timed out after 10 seconds".to_string(),
+            });
+        }
+    };
+    let (stdout, truncated) = stdout_task
+        .await
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to join git stdout reader: {e}"),
+        })?
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to read git stdout: {e}"),
+        })?;
+    let (stderr, stderr_truncated) = stderr_task
+        .await
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to join git stderr reader: {e}"),
+        })?
+        .map_err(|e| Error::Tmux {
+            message: format!("failed to read git stderr: {e}"),
+        })?;
+
+    if status.success() {
+        Ok((stdout, truncated))
+    } else {
+        let mut message = String::from_utf8_lossy(&stderr).trim().to_string();
+        if message.is_empty() {
+            message = format!("git exited with {status}");
+        } else if stderr_truncated {
+            message.push_str("\n… (stderr truncated)");
+        }
+        Err(Error::Tmux { message })
+    }
+}
+
+fn validate_git_argument(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidArgument {
+            message: format!("{name} must not be empty"),
+        });
+    }
+    if value.contains(['\0', '\r', '\n']) {
+        return Err(Error::InvalidArgument {
+            message: format!("{name} must not contain NUL or newlines"),
+        });
+    }
+    if value.len() > 4096 {
+        return Err(Error::InvalidArgument {
+            message: format!("{name} must not exceed 4096 bytes"),
+        });
+    }
+    Ok(())
+}
+
+fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+    let version = output.trim().strip_prefix("git version ")?;
+    let mut parts = version.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+async fn ensure_safe_git_version(cwd: &str) -> Result<()> {
+    let (output, truncated) = execute_git_bounded(cwd, &["--version".to_string()], 128).await?;
+    let output = String::from_utf8_lossy(&output);
+    let version = (!truncated)
+        .then(|| parse_git_version(&output))
+        .flatten()
+        .ok_or_else(|| Error::Tmux {
+            message: "unable to determine Git version".to_string(),
+        })?;
+    if version < (2, 36) {
+        return Err(Error::Tmux {
+            message: format!(
+                "Git 2.36 or newer is required for safe read-only queries (found {}.{})",
+                version.0, version.1
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn resolve_git_root(cwd: &str, repo_path: Option<&str>) -> Result<String> {
+    let repo_path = repo_path.unwrap_or(".");
+    validate_git_argument("repoPath", repo_path)?;
+    ensure_safe_git_version(cwd).await?;
+    let mut args = hardened_git_args(repo_path);
+    args.extend(
+        ["rev-parse", "--show-toplevel"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    let (output, truncated) = execute_git_bounded(cwd, &args, GIT_ROOT_MAX_BYTES).await?;
+    if truncated {
+        return Err(Error::Tmux {
+            message: "Git repository root exceeds the safe output limit".to_string(),
+        });
+    }
+    let root = String::from_utf8_lossy(&output)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    validate_git_argument("repository root", &root)?;
+    Ok(root)
+}
+
+async fn run_git_query(
+    cwd: &str,
+    repo_path: Option<&str>,
+    command: &[String],
+    max_bytes: usize,
+) -> Result<GitReadOutput> {
+    let repo_root = resolve_git_root(cwd, repo_path).await?;
+    let mut args = hardened_git_args(&repo_root);
+    args.extend(command.iter().cloned());
+    let (output, truncated) = execute_git_bounded(cwd, &args, max_bytes).await?;
+    let bytes_read = output.len();
+    Ok(GitReadOutput {
+        repo_root,
+        output: String::from_utf8_lossy(&output).into_owned(),
+        bytes_read,
+        truncated,
+    })
+}
+
+pub async fn git_status(
+    cwd: &str,
+    repo_path: Option<&str>,
+    max_bytes: usize,
+) -> Result<GitReadOutput> {
+    run_git_query(
+        cwd,
+        repo_path,
+        &[
+            "status",
+            "--short",
+            "--branch",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+        max_bytes,
+    )
+    .await
+}
+
+pub async fn git_diff(
+    cwd: &str,
+    repo_path: Option<&str>,
+    staged: bool,
+    paths: &[String],
+    max_bytes: usize,
+) -> Result<GitReadOutput> {
+    for path in paths {
+        validate_git_argument("path", path)?;
+    }
+    if paths.iter().map(String::len).sum::<usize>() > GIT_ARGUMENT_MAX_BYTES {
+        return Err(Error::InvalidArgument {
+            message: format!("paths must not exceed {GIT_ARGUMENT_MAX_BYTES} bytes in total"),
+        });
+    }
+    let mut command = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--ignore-submodules=all",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if staged {
+        command.push("--cached".to_string());
+    }
+    command.push("--".to_string());
+    command.extend(paths.iter().cloned());
+    run_git_query(cwd, repo_path, &command, max_bytes).await
+}
+
+pub async fn git_log(
+    cwd: &str,
+    repo_path: Option<&str>,
+    max_count: u32,
+    max_bytes: usize,
+) -> Result<GitReadOutput> {
+    run_git_query(
+        cwd,
+        repo_path,
+        &[
+            "log".to_string(),
+            "--no-show-signature".to_string(),
+            "--decorate=short".to_string(),
+            "--date=iso-strict".to_string(),
+            "--format=%h%x09%ad%x09%an%x09%d%x09%s".to_string(),
+            format!("--max-count={max_count}"),
+        ],
+        max_bytes,
+    )
+    .await
+}
+
+pub async fn git_show(
+    cwd: &str,
+    repo_path: Option<&str>,
+    revision: &str,
+    max_bytes: usize,
+) -> Result<GitReadOutput> {
+    validate_git_argument("revision", revision)?;
+    if revision.starts_with('-') || revision.len() > 256 {
+        return Err(Error::InvalidArgument {
+            message: "revision must be at most 256 characters and must not start with '-'"
+                .to_string(),
+        });
+    }
+    let repo_root = resolve_git_root(cwd, repo_path).await?;
+    let mut verify = hardened_git_args(&repo_root);
+    verify.extend(
+        ["rev-parse", "--verify", "--end-of-options"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    verify.push(format!("{revision}^{{commit}}"));
+    let (commit, truncated) = execute_git_bounded(cwd, &verify, 128).await?;
+    if truncated {
+        return Err(Error::Tmux {
+            message: "resolved Git revision exceeds the safe output limit".to_string(),
+        });
+    }
+    let commit = String::from_utf8_lossy(&commit)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if commit.len() < 7 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Tmux {
+            message: "Git returned an invalid commit id".to_string(),
+        });
+    }
+    let mut command = hardened_git_args(&repo_root);
+    command.extend(
+        [
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-show-signature",
+            "--ignore-submodules=all",
+            "--format=fuller",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    command.push(commit);
+    command.push("--".to_string());
+    let (output, truncated) = execute_git_bounded(cwd, &command, max_bytes).await?;
+    let bytes_read = output.len();
+    Ok(GitReadOutput {
+        repo_root,
+        output: String::from_utf8_lossy(&output).into_owned(),
+        bytes_read,
+        truncated,
+    })
 }
 
 fn validate_read_path(path: &str) -> Result<()> {
@@ -2901,6 +3309,120 @@ mod tests {
         assert_eq!(content, "hello");
         assert_eq!(bytes_read, 5);
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_keeps_only_the_prefix() {
+        let (bytes, truncated) = read_stream_bounded(&b"abcdef"[..], 3)
+            .await
+            .expect("bounded read");
+        assert_eq!(bytes, b"abc");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn hardened_git_arguments_fix_the_repository_and_disable_helpers() {
+        let args = hardened_git_args("/repo with spaces");
+        for expected in [
+            "--no-pager",
+            "--no-optional-locks",
+            "--no-replace-objects",
+            "protocol.allow=never",
+            "core.fsmonitor=false",
+            "core.untrackedCache=false",
+            "color.ui=false",
+            "-C",
+            "/repo with spaces",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected));
+        }
+        assert!(!args.iter().any(|arg| arg == "safe.directory=*"));
+    }
+
+    #[test]
+    fn remote_git_command_clears_inherited_repository_environment() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SSH", "user@host");
+        let command =
+            build_git_command("/repo with spaces", &hardened_git_args("/repo with spaces"))
+                .expect("remote Git command");
+        let remote = command
+            .as_std()
+            .get_args()
+            .last()
+            .expect("remote command")
+            .to_string_lossy();
+        assert!(remote.contains("/usr/bin/env -u GIT_DIR"));
+        assert!(remote.contains("-u GIT_CONFIG_PARAMETERS"));
+        assert!(remote.contains("GIT_TERMINAL_PROMPT=0"));
+        assert!(remote.contains("git --no-pager"));
+        assert!(remote.contains("-C '/repo with spaces'"));
+    }
+
+    #[test]
+    fn git_version_parser_requires_a_safe_modern_version() {
+        assert_eq!(parse_git_version("git version 2.51.0\n"), Some((2, 51)));
+        assert_eq!(
+            parse_git_version("git version 2.45.1.windows.1"),
+            Some((2, 45))
+        );
+        assert_eq!(parse_git_version("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn safe_git_queries_work_in_a_real_temporary_repository() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SSH");
+        let dir = tempdir().expect("temp Git repository");
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .expect("spawn Git fixture command");
+            assert!(
+                output.status.success(),
+                "Git fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--quiet"]);
+        fs::write(dir.path().join("tracked.txt"), "first\n").expect("write tracked file");
+        run(&["add", "--", "tracked.txt"]);
+        run(&[
+            "-c",
+            "user.name=tmux-mcp test",
+            "-c",
+            "user.email=tmux-mcp@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ]);
+        fs::write(dir.path().join("tracked.txt"), "first\nsecond\n").expect("modify tracked file");
+        stub.set_var("GIT_DIR", dir.path().join("wrong-git-dir"));
+        stub.set_var("GIT_WORK_TREE", dir.path().join("wrong-work-tree"));
+        stub.set_var("GIT_CONFIG_COUNT", "1");
+        stub.set_var("GIT_CONFIG_KEY_0", "alias.status");
+        stub.set_var("GIT_CONFIG_VALUE_0", "!echo unsafe");
+        let cwd = dir.path().to_string_lossy();
+
+        let status = git_status(&cwd, None, 4096).await.expect("Git status");
+        assert!(status.output.contains("tracked.txt"));
+        assert!(!status.truncated);
+
+        let diff = git_diff(&cwd, None, false, &[], 8).await.expect("Git diff");
+        assert_eq!(diff.output.len(), 8);
+        assert!(diff.truncated);
+
+        let log = git_log(&cwd, None, 1, 4096).await.expect("Git log");
+        assert!(log.output.contains("initial"));
+
+        let show = git_show(&cwd, None, "HEAD", 4096).await.expect("Git show");
+        assert!(show.output.contains("initial"));
+        assert!(show.output.contains("tracked.txt"));
     }
 
     #[rstest]
