@@ -592,6 +592,7 @@
 
       .dialog-header h2 { margin: 0; font-size: 16px; }
       .dialog-header button { margin-left: auto; padding: 6px 10px; }
+      .dialog-header .dialog-close { width: 30px; height: 30px; padding: 0; font-size: 20px; line-height: 1; }
       .dialog-body { padding: 17px; }
       .log-switch { margin-left: 4px; }
       .log-switch button { min-width: 64px; margin-left: 0; padding: 5px 10px; }
@@ -743,7 +744,7 @@
           <button id="log-critical" class="active" type="button" role="tab" aria-selected="true">关键</button>
           <button id="log-full" type="button" role="tab" aria-selected="false">全面</button>
         </div>
-        <button id="close-operation-log" type="button">关闭</button>
+        <button id="close-operation-log" class="dialog-close" type="button" aria-label="关闭" title="关闭">×</button>
       </div>
       <div id="operation-log-list" class="dialog-body"></div>
     </dialog>
@@ -1005,6 +1006,10 @@
 
       function displayInput(record) {
         const args = record.arguments || {};
+        if (record.tool === "list-directory") {
+          return `ls${args.showHidden ? " -a" : ""} ${args.path || "."}`;
+        }
+        if (record.tool === "read-file") return `read ${args.path || ""}`;
         const special = {
           "send-cancel": "Ctrl-C",
           "send-eof": "Ctrl-D",
@@ -1032,6 +1037,20 @@
 
       function genericResult(record) {
         if (record.result === undefined || record.result === null) return "";
+        const structured = record.result?.structuredContent;
+        if (record.tool === "list-directory" && Array.isArray(structured?.entries)) {
+          const output = structured.entries.join("\n") || "（空目录）";
+          return structured.truncated ? `${output}\n…（结果已截断）` : output;
+        }
+        if (record.tool === "read-file" && typeof structured?.content === "string") {
+          const output = structured.content || "（空文件）";
+          return structured.truncated ? `${output}\n…（内容已截断）` : output;
+        }
+        const text = record.result?.content
+          ?.filter((item) => item.type === "text" && typeof item.text === "string")
+          .map((item) => item.text)
+          .join("\n");
+        if (text) return text;
         return typeof record.result === "string"
           ? record.result
           : JSON.stringify(record.result, null, 2);

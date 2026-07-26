@@ -32,6 +32,29 @@ fn operation_log_switches_between_critical_and_full_records() {
 }
 
 #[test]
+fn operation_log_uses_an_accessible_close_icon() {
+    assert!(PAGE.contains(
+        r#"id="close-operation-log" class="dialog-close" type="button" aria-label="关闭" title="关闭">×</button>"#
+    ));
+}
+
+#[test]
+fn safe_read_tools_render_as_clean_pane_messages() {
+    for marker in [
+        r#"record.tool === "list-directory""#,
+        r#"record.tool === "read-file""#,
+        "record.result?.structuredContent",
+        "structured.entries.join",
+        "structured.content",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing safe read message marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn page_polls_snapshots_and_uses_the_control_api() {
     for marker in [
         "/api/state",
