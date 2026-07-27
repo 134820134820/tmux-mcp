@@ -1,8 +1,8 @@
 use serde_json::json;
 use tempfile::tempdir;
 use tmux_mcp_rs::control::{
-    default_state_dir, load_or_create_token, set_gate_mode, validate_web_url, ActionKind,
-    ActionRecord, ActionStatus, GateMode, StatePaths,
+    clear_ai_pause, default_state_dir, load_or_create_token, set_ai_pause, set_gate_mode,
+    validate_web_url, ActionKind, ActionRecord, ActionStatus, GateMode, StatePaths,
 };
 use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus};
 
@@ -71,6 +71,24 @@ fn gate_file_is_absent_by_default_and_toggles_explicitly() {
     assert_eq!(paths.gate_mode(), GateMode::Approval);
     set_gate_mode(&paths, GateMode::Off).expect("disable gate");
     assert!(!paths.gate_enabled());
+}
+
+#[test]
+fn ai_pause_file_keeps_the_reason_pane_until_cleared() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+
+    assert_eq!(paths.ai_pause().expect("read absent pause"), None);
+    set_ai_pause(&paths, "%2").expect("pause AI");
+    assert_eq!(
+        paths
+            .ai_pause()
+            .expect("read pause")
+            .map(|pause| pause.pane_id),
+        Some("%2".into())
+    );
+    clear_ai_pause(&paths).expect("clear pause");
+    assert_eq!(paths.ai_pause().expect("read cleared pause"), None);
 }
 
 #[test]

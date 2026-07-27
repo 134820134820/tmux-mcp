@@ -21,8 +21,9 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{
-    set_gate_mode, ActionKind, ActionRecord, ActionStatus, AuthorizationResponse, GateDecision,
-    GateMode, StatePaths, ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
+    clear_ai_pause, set_gate_mode, ActionKind, ActionRecord, ActionStatus, AiPause,
+    AuthorizationResponse, GateDecision, GateMode, StatePaths, ACTION_SCHEMA_VERSION,
+    AGENT_RECORD_MAX_BYTES,
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
@@ -88,6 +89,7 @@ struct StateQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StateResponse {
+    ai_pause: Option<AiPause>,
     gate_enabled: bool,
     gate_mode: GateMode,
     pending: Vec<ActionRecord>,
@@ -251,6 +253,7 @@ pub fn build_router(
     let api = Router::new()
         .route("/api/state", get(api_state))
         .route("/api/gate", put(api_gate))
+        .route("/api/ai-pause/clear", put(api_clear_ai_pause))
         .route("/api/approvals/:id", put(api_approval))
         .route("/api/agent/authorize", post(agent_authorize))
         .route("/api/agent/record", post(agent_record))
@@ -369,6 +372,11 @@ async fn api_state(
         }
     }
     Json(StateResponse {
+        ai_pause: context.hub.paths().ai_pause().unwrap_or_else(|_| {
+            Some(AiPause {
+                pane_id: "未知".into(),
+            })
+        }),
         gate_enabled: context.hub.paths().gate_enabled(),
         gate_mode: context.hub.paths().gate_mode(),
         pending: context.hub.pending().await,
@@ -380,6 +388,17 @@ async fn api_state(
         pane_info,
         activity,
     })
+}
+
+async fn api_clear_ai_pause(State(context): State<AppContext>) -> Response {
+    match clear_ai_pause(context.hub.paths()) {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unable to clear AI pause: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_gate(State(context): State<AppContext>, Json(input): Json<GateUpdate>) -> Response {

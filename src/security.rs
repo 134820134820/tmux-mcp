@@ -495,6 +495,7 @@ pub struct SecurityConfig {
     pub allow_execute_command: bool,
     /// Gates `rawMode` on `execute-command` (tracked wrappers skipped).
     #[serde(default = "default_true")]
+    #[allow(dead_code)]
     pub allow_raw_mode: bool,
     /// Gates interactive and special-key injection tools (`send-keys`, `paste-text`, …).
     #[serde(default = "default_true")]
@@ -864,6 +865,7 @@ impl SecurityPolicy {
     }
 
     /// Validate that raw mode is permitted by policy.
+    #[allow(dead_code)]
     pub fn check_raw_mode(&self) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
