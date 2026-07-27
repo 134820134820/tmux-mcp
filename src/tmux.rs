@@ -44,6 +44,7 @@ const READ_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const GIT_ERROR_MAX_BYTES: usize = 65_536;
 const GIT_ROOT_MAX_BYTES: usize = 16_384;
 const GIT_ARGUMENT_MAX_BYTES: usize = 16_384;
+const READ_TOOL_MAX_BYTES: usize = 262_144;
 const GIT_ENV: &[(&str, &str)] = &[
     ("GIT_OPTIONAL_LOCKS", "0"),
     ("GIT_NO_LAZY_FETCH", "1"),
@@ -118,6 +119,24 @@ pub struct GitReadOutput {
     pub output: String,
     pub bytes_read: usize,
     pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileReadMode {
+    Prefix,
+    Lines { start: u32, end: u32 },
+    Tail { lines: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FileSearchOptions<'a> {
+    pub path: &'a str,
+    pub pattern: &'a str,
+    pub literal: bool,
+    pub case_sensitive: bool,
+    pub show_hidden: bool,
+    pub max_matches: usize,
+    pub max_bytes: usize,
 }
 
 struct BufferScanResult {
@@ -463,12 +482,14 @@ pub async fn execute_tmux(args: &[&str]) -> Result<String> {
     execute_tmux_with_socket(args, None).await
 }
 
-async fn execute_read_only_program(cwd: &str, program: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
-        message: format!("tmux semaphore closed: {e}"),
-    })?;
-
-    let mut command = if let Some(mut ssh_args) = get_ssh_args()? {
+async fn execute_read_only_program(
+    cwd: &str,
+    program: &str,
+    args: &[&str],
+    max_bytes: usize,
+    accepted_exit_codes: &[i32],
+) -> Result<(Vec<u8>, bool)> {
+    let command = if let Some(mut ssh_args) = get_ssh_args()? {
         ssh_args.insert(0, "-n".to_string());
         ssh_args.push(format!(
             "cd -- {} && {}",
@@ -483,27 +504,7 @@ async fn execute_read_only_program(cwd: &str, program: &str, args: &[&str]) -> R
         command.current_dir(cwd).args(args);
         command
     };
-    command
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, command.output())
-        .await
-        .map_err(|_| Error::Tmux {
-            message: format!("{program} timed out after 10 seconds"),
-        })?
-        .map_err(|e| Error::Tmux {
-            message: format!("failed to spawn {program}: {e}"),
-        })?;
-
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(Error::Tmux {
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        })
-    }
+    execute_command_bounded(command, program, max_bytes, accepted_exit_codes).await
 }
 
 fn hardened_git_args(repo_path: &str) -> Vec<String> {
@@ -584,34 +585,34 @@ where
     Ok((kept, truncated))
 }
 
-async fn execute_git_bounded(
-    cwd: &str,
-    args: &[String],
+async fn execute_command_bounded(
+    mut command: Command,
+    label: &str,
     max_bytes: usize,
+    accepted_exit_codes: &[i32],
 ) -> Result<(Vec<u8>, bool)> {
     let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
         message: format!("tmux semaphore closed: {e}"),
     })?;
-    let mut command = build_git_command(cwd, args)?;
     command
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|e| Error::Tmux {
-        message: format!("failed to spawn git: {e}"),
+        message: format!("failed to spawn {label}: {e}"),
     })?;
     let stdout = child.stdout.take().ok_or_else(|| Error::Tmux {
-        message: "failed to capture git stdout".to_string(),
+        message: format!("failed to capture {label} stdout"),
     })?;
     let stderr = child.stderr.take().ok_or_else(|| Error::Tmux {
-        message: "failed to capture git stderr".to_string(),
+        message: format!("failed to capture {label} stderr"),
     })?;
     let stdout_task = tokio::spawn(read_stream_bounded(stdout, max_bytes));
     let stderr_task = tokio::spawn(read_stream_bounded(stderr, GIT_ERROR_MAX_BYTES));
 
     let status = match tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, child.wait()).await {
         Ok(result) => result.map_err(|e| Error::Tmux {
-            message: format!("failed to wait for git: {e}"),
+            message: format!("failed to wait for {label}: {e}"),
         })?,
         Err(_) => {
             let _ = child.kill().await;
@@ -619,38 +620,49 @@ async fn execute_git_bounded(
             stdout_task.abort();
             stderr_task.abort();
             return Err(Error::Tmux {
-                message: "git timed out after 10 seconds".to_string(),
+                message: format!("{label} timed out after 10 seconds"),
             });
         }
     };
     let (stdout, truncated) = stdout_task
         .await
         .map_err(|e| Error::Tmux {
-            message: format!("failed to join git stdout reader: {e}"),
+            message: format!("failed to join {label} stdout reader: {e}"),
         })?
         .map_err(|e| Error::Tmux {
-            message: format!("failed to read git stdout: {e}"),
+            message: format!("failed to read {label} stdout: {e}"),
         })?;
     let (stderr, stderr_truncated) = stderr_task
         .await
         .map_err(|e| Error::Tmux {
-            message: format!("failed to join git stderr reader: {e}"),
+            message: format!("failed to join {label} stderr reader: {e}"),
         })?
         .map_err(|e| Error::Tmux {
-            message: format!("failed to read git stderr: {e}"),
+            message: format!("failed to read {label} stderr: {e}"),
         })?;
 
-    if status.success() {
+    if status
+        .code()
+        .is_some_and(|code| accepted_exit_codes.contains(&code))
+    {
         Ok((stdout, truncated))
     } else {
         let mut message = String::from_utf8_lossy(&stderr).trim().to_string();
         if message.is_empty() {
-            message = format!("git exited with {status}");
+            message = format!("{label} exited with {status}");
         } else if stderr_truncated {
             message.push_str("\n… (stderr truncated)");
         }
         Err(Error::Tmux { message })
     }
+}
+
+async fn execute_git_bounded(
+    cwd: &str,
+    args: &[String],
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool)> {
+    execute_command_bounded(build_git_command(cwd, args)?, "git", max_bytes, &[0]).await
 }
 
 fn validate_git_argument(name: &str, value: &str) -> Result<()> {
@@ -901,14 +913,23 @@ pub async fn list_directory(
     max_entries: usize,
 ) -> Result<(Vec<String>, bool)> {
     validate_read_path(path)?;
-    let mut entries = if ssh_enabled()? {
+    let (mut entries, output_truncated) = if ssh_enabled()? {
         let flag = if show_hidden { "-1Ab" } else { "-1b" };
-        String::from_utf8_lossy(
-            &execute_read_only_program(cwd, "/bin/ls", &[flag, "--", path]).await?,
+        let (output, truncated) = execute_read_only_program(
+            cwd,
+            "/bin/ls",
+            &[flag, "--", path],
+            READ_TOOL_MAX_BYTES,
+            &[0],
         )
-        .lines()
-        .map(str::to_string)
-        .collect::<Vec<_>>()
+        .await?;
+        (
+            String::from_utf8_lossy(&output)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+            truncated,
+        )
     } else {
         let path = if Path::new(path).is_absolute() {
             Path::new(path).to_path_buf()
@@ -930,40 +951,164 @@ pub async fn list_directory(
                 }
             }
         }
-        entries
+        (entries, false)
     };
-    let truncated = entries.len() > max_entries;
+    let truncated = output_truncated || entries.len() > max_entries;
     entries.truncate(max_entries);
     Ok((entries, truncated))
 }
 
-/// Read a bounded byte prefix from a local or remote file.
-pub async fn read_file(cwd: &str, path: &str, max_bytes: usize) -> Result<(String, usize, bool)> {
+fn read_local_file(path: &Path, max_bytes: usize, mode: FileReadMode) -> Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path).map_err(|e| Error::Tmux {
+        message: format!("unable to open '{}': {e}", path.display()),
+    })?;
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1).min(65_536));
+    match mode {
+        FileReadMode::Prefix => {
+            file.take((max_bytes + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| Error::Tmux {
+                    message: format!("unable to read '{}': {e}", path.display()),
+                })?;
+        }
+        FileReadMode::Lines { start, end } => {
+            let mut current_line = 1_u32;
+            let mut buffer = [0_u8; 8192];
+            while current_line <= end && bytes.len() <= max_bytes {
+                let read = file.read(&mut buffer).map_err(|e| Error::Tmux {
+                    message: format!("unable to read '{}': {e}", path.display()),
+                })?;
+                if read == 0 {
+                    break;
+                }
+                for byte in &buffer[..read] {
+                    if current_line >= start {
+                        bytes.push(*byte);
+                        if bytes.len() > max_bytes {
+                            break;
+                        }
+                    }
+                    if *byte == b'\n' {
+                        current_line += 1;
+                        if current_line > end {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        FileReadMode::Tail { lines } => {
+            let length = file
+                .metadata()
+                .map_err(|e| Error::Tmux {
+                    message: format!("unable to inspect '{}': {e}", path.display()),
+                })?
+                .len();
+            let mut start_offset = 0_u64;
+            if length > 0 {
+                file.seek(SeekFrom::End(-1)).map_err(|e| Error::Tmux {
+                    message: format!("unable to seek '{}': {e}", path.display()),
+                })?;
+                let mut last = [0_u8; 1];
+                file.read_exact(&mut last).map_err(|e| Error::Tmux {
+                    message: format!("unable to read '{}': {e}", path.display()),
+                })?;
+                let target_newlines = lines as usize + usize::from(last[0] == b'\n');
+                let mut found = 0_usize;
+                let mut position = length;
+                let mut buffer = [0_u8; 8192];
+                while position > 0 && found < target_newlines {
+                    let chunk = position.min(buffer.len() as u64) as usize;
+                    let chunk_start = position - chunk as u64;
+                    file.seek(SeekFrom::Start(chunk_start))
+                        .map_err(|e| Error::Tmux {
+                            message: format!("unable to seek '{}': {e}", path.display()),
+                        })?;
+                    file.read_exact(&mut buffer[..chunk])
+                        .map_err(|e| Error::Tmux {
+                            message: format!("unable to read '{}': {e}", path.display()),
+                        })?;
+                    for index in (0..chunk).rev() {
+                        if buffer[index] == b'\n' {
+                            found += 1;
+                            if found == target_newlines {
+                                start_offset = chunk_start + index as u64 + 1;
+                                break;
+                            }
+                        }
+                    }
+                    position = chunk_start;
+                }
+            }
+            file.seek(SeekFrom::Start(start_offset))
+                .map_err(|e| Error::Tmux {
+                    message: format!("unable to seek '{}': {e}", path.display()),
+                })?;
+            file.take((max_bytes + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| Error::Tmux {
+                    message: format!("unable to read '{}': {e}", path.display()),
+                })?;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Read a bounded byte prefix, line range, or tail from a local or remote file.
+pub async fn read_file(
+    cwd: &str,
+    path: &str,
+    max_bytes: usize,
+    mode: FileReadMode,
+) -> Result<(String, usize, bool)> {
     validate_read_path(path)?;
-    let mut bytes = if ssh_enabled()? {
-        let count = (max_bytes + 1).to_string();
-        execute_read_only_program(cwd, "/usr/bin/head", &["-c", &count, "--", path]).await?
+    let (mut bytes, output_truncated) = if ssh_enabled()? {
+        let max_output = max_bytes.saturating_add(1);
+        let (program, args) = match mode {
+            FileReadMode::Prefix => (
+                "/usr/bin/head",
+                vec![
+                    "-c".to_string(),
+                    max_output.to_string(),
+                    "--".to_string(),
+                    path.to_string(),
+                ],
+            ),
+            FileReadMode::Lines { start, end } => (
+                "/usr/bin/sed",
+                vec![
+                    "-n".to_string(),
+                    format!("{start},{end}p"),
+                    "--".to_string(),
+                    path.to_string(),
+                ],
+            ),
+            FileReadMode::Tail { lines } => (
+                "/usr/bin/tail",
+                vec![
+                    "-n".to_string(),
+                    lines.to_string(),
+                    "--".to_string(),
+                    path.to_string(),
+                ],
+            ),
+        };
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        execute_read_only_program(cwd, program, &args, max_output, &[0]).await?
     } else {
         let path = if Path::new(path).is_absolute() {
             Path::new(path).to_path_buf()
         } else {
             Path::new(cwd).join(path)
         };
-        let file = tokio::fs::File::open(&path)
+        let bytes = tokio::task::spawn_blocking(move || read_local_file(&path, max_bytes, mode))
             .await
             .map_err(|e| Error::Tmux {
-                message: format!("unable to open '{}': {e}", path.display()),
-            })?;
-        let mut bytes = Vec::new();
-        file.take((max_bytes + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| Error::Tmux {
-                message: format!("unable to read '{}': {e}", path.display()),
-            })?;
-        bytes
+                message: format!("file reader task failed: {e}"),
+            })??;
+        (bytes, false)
     };
-    let truncated = bytes.len() > max_bytes;
+    let truncated = output_truncated || bytes.len() > max_bytes;
     bytes.truncate(max_bytes);
     let bytes_read = bytes.len();
     Ok((
@@ -971,6 +1116,130 @@ pub async fn read_file(cwd: &str, path: &str, max_bytes: usize) -> Result<(Strin
         bytes_read,
         truncated,
     ))
+}
+
+/// Recursively list files through fixed `find` arguments.
+fn find_files_args(
+    path: &str,
+    name_pattern: Option<&str>,
+    show_hidden: bool,
+    max_depth: u32,
+) -> Vec<String> {
+    let path = if path.starts_with('-') {
+        format!("./{path}")
+    } else {
+        path.to_string()
+    };
+    let mut args = vec![path, "-maxdepth".to_string(), max_depth.to_string()];
+    if !show_hidden {
+        args.extend(
+            ["(", "-path", "*/.*", "-prune", ")", "-o"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    args.extend(["-type", "f"].into_iter().map(str::to_string));
+    if let Some(pattern) = name_pattern {
+        args.extend(["-name".to_string(), pattern.to_string()]);
+    }
+    args.push("-print".to_string());
+    args
+}
+
+pub async fn find_files(
+    cwd: &str,
+    path: &str,
+    name_pattern: Option<&str>,
+    show_hidden: bool,
+    max_depth: u32,
+    max_entries: usize,
+) -> Result<(Vec<String>, bool)> {
+    validate_read_path(path)?;
+    if let Some(pattern) = name_pattern {
+        if pattern.is_empty() || pattern.len() > 256 || pattern.contains(['\0', '\r', '\n']) {
+            return Err(Error::InvalidArgument {
+                message: "namePattern must be 1-256 characters without NUL or newlines".to_string(),
+            });
+        }
+    }
+    let args = find_files_args(path, name_pattern, show_hidden, max_depth);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let (output, output_truncated) =
+        execute_read_only_program(cwd, "/usr/bin/find", &args, READ_TOOL_MAX_BYTES, &[0]).await?;
+    let mut files = String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let truncated = output_truncated || files.len() > max_entries;
+    files.truncate(max_entries);
+    Ok((files, truncated))
+}
+
+/// Recursively search text through fixed `grep` arguments.
+fn search_files_text_args(
+    path: &str,
+    pattern: &str,
+    literal: bool,
+    case_sensitive: bool,
+    show_hidden: bool,
+) -> Vec<String> {
+    let mut args = ["-r", "-I", "-n", "-H"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if literal {
+        args.push("-F".to_string());
+    }
+    if !case_sensitive {
+        args.push("-i".to_string());
+    }
+    if !show_hidden {
+        args.extend(
+            ["--exclude=.*", "--exclude-dir=.*"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    args.extend([
+        "-e".to_string(),
+        pattern.to_string(),
+        "--".to_string(),
+        path.to_string(),
+    ]);
+    args
+}
+
+pub async fn search_files_text(
+    cwd: &str,
+    options: FileSearchOptions<'_>,
+) -> Result<(Vec<String>, usize, bool)> {
+    validate_read_path(options.path)?;
+    if options.pattern.is_empty()
+        || options.pattern.len() > 1024
+        || options.pattern.contains(['\0', '\r', '\n'])
+    {
+        return Err(Error::InvalidArgument {
+            message: "pattern must be 1-1024 characters without NUL or newlines".to_string(),
+        });
+    }
+    let args = search_files_text_args(
+        options.path,
+        options.pattern,
+        options.literal,
+        options.case_sensitive,
+        options.show_hidden,
+    );
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let (output, output_truncated) =
+        execute_read_only_program(cwd, "/bin/grep", &args, options.max_bytes, &[0, 1]).await?;
+    let bytes_read = output.len();
+    let mut matches = String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let truncated = output_truncated || matches.len() > options.max_matches;
+    matches.truncate(options.max_matches);
+    Ok((matches, bytes_read, truncated))
 }
 
 /// Resolve a remote path with `realpath` over SSH (requires `TMUX_MCP_SSH`).
@@ -3303,12 +3572,32 @@ mod tests {
         assert!(!truncated);
         assert!(all.iter().any(|name| name == ".hidden"));
 
-        let (content, bytes_read, truncated) = read_file(&cwd, "alpha.txt", 5)
-            .await
-            .expect("read bounded file");
+        let (content, bytes_read, truncated) =
+            read_file(&cwd, "alpha.txt", 5, FileReadMode::Prefix)
+                .await
+                .expect("read bounded file");
         assert_eq!(content, "hello");
         assert_eq!(bytes_read, 5);
         assert!(truncated);
+
+        fs::write(dir.path().join("lines.txt"), "one\ntwo\nthree\nfour\n").expect("write lines");
+        let (content, _, truncated) = read_file(
+            &cwd,
+            "lines.txt",
+            100,
+            FileReadMode::Lines { start: 2, end: 3 },
+        )
+        .await
+        .expect("read line range");
+        assert_eq!(content, "two\nthree\n");
+        assert!(!truncated);
+
+        let (content, _, truncated) =
+            read_file(&cwd, "lines.txt", 100, FileReadMode::Tail { lines: 2 })
+                .await
+                .expect("read tail");
+        assert_eq!(content, "three\nfour\n");
+        assert!(!truncated);
     }
 
     #[tokio::test]
@@ -3318,6 +3607,26 @@ mod tests {
             .expect("bounded read");
         assert_eq!(bytes, b"abc");
         assert!(truncated);
+    }
+
+    #[test]
+    fn filesystem_search_builders_keep_model_text_in_fixed_argv_slots() {
+        let hostile = "$(touch /tmp/bad); -exec sh";
+        let find = find_files_args(".", Some(hostile), false, 6);
+        assert_eq!(
+            find[find.iter().position(|arg| arg == "-name").unwrap() + 1],
+            hostile
+        );
+        assert!(!find.iter().any(|arg| arg == "-exec"));
+        assert_eq!(find_files_args("-odd", None, true, 1)[0], "./-odd");
+
+        let grep = search_files_text_args(".", hostile, true, true, false);
+        assert!(grep.iter().any(|arg| arg == "-F"));
+        assert_eq!(
+            grep[grep.iter().position(|arg| arg == "-e").unwrap() + 1],
+            hostile
+        );
+        assert_eq!(&grep[grep.len() - 2..], ["--", "."]);
     }
 
     #[test]

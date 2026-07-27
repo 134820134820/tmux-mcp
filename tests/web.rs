@@ -9,7 +9,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use tmux_mcp_rs::commands::CommandTracker;
 use tmux_mcp_rs::control::{
-    set_gate_enabled, ActionRecord, ActionStatus, GateDecision, StatePaths,
+    set_gate_mode, ActionRecord, ActionStatus, GateDecision, GateMode, StatePaths,
 };
 use tmux_mcp_rs::security::{SecurityConfig, SecurityPolicy};
 use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus, ShellType};
@@ -85,7 +85,7 @@ async fn gate_off_approves_immediately_and_persists_record() {
 async fn gate_on_waits_until_the_exact_request_is_decided() {
     let dir = tempdir().expect("temp state dir");
     let paths = StatePaths::new(dir.path());
-    set_gate_enabled(&paths, true).expect("enable gate");
+    set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
     let state = HubState::open(paths).expect("open hub");
     let record = ActionRecord::new("Claude", "send-keys", json!({"paneId": "%2"}));
     let id = record.id.clone();
@@ -112,7 +112,7 @@ async fn gate_on_waits_until_the_exact_request_is_decided() {
 async fn disconnected_gate_request_is_pruned_as_incomplete() {
     let dir = tempdir().expect("temp state dir");
     let paths = StatePaths::new(dir.path());
-    set_gate_enabled(&paths, true).expect("enable gate");
+    set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
     let state = HubState::open(paths).expect("open hub");
     let record = ActionRecord::new("Codex", "send-keys", json!({"paneId": "%9"}));
 
@@ -349,14 +349,33 @@ async fn safe_read_tools_appear_in_their_pane_message_history() {
     let dir = tempdir().expect("temp state dir");
     let state = HubState::open(StatePaths::new(dir.path())).expect("open hub");
 
-    for (tool, pane_id) in [("list-directory", "%1"), ("read-file", "%2")] {
+    for (tool, pane_id) in [
+        ("list-directory", "%1"),
+        ("read-file", "%2"),
+        ("find-files", "%1"),
+        ("search-text", "%2"),
+    ] {
         let mut record = ActionRecord::new("Codex", tool, json!({"paneId": pane_id, "path": "."}));
         record.read_only = true;
         state.upsert(record).await.expect("persist safe read");
     }
 
-    assert_eq!(state.records_for_pane("%1").await[0].tool, "list-directory");
-    assert_eq!(state.records_for_pane("%2").await[0].tool, "read-file");
+    let mut pane_one = state
+        .records_for_pane("%1")
+        .await
+        .into_iter()
+        .map(|record| record.tool)
+        .collect::<Vec<_>>();
+    pane_one.sort_unstable();
+    assert_eq!(pane_one, ["find-files", "list-directory"]);
+    let mut pane_two = state
+        .records_for_pane("%2")
+        .await
+        .into_iter()
+        .map(|record| record.tool)
+        .collect::<Vec<_>>();
+    pane_two.sort_unstable();
+    assert_eq!(pane_two, ["read-file", "search-text"]);
     assert!(state.records_for_pane("%3").await.is_empty());
     assert!(state.operations().await.is_empty());
 }
@@ -819,7 +838,7 @@ async fn browser_gate_toggle_requires_matching_origin_and_json() {
                 .header(header::ORIGIN, "http://127.0.0.1:38473")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-tmux-mcp-token", token)
-                .body(Body::from(r#"{"enabled":true}"#))
+                .body(Body::from(r#"{"mode":"tools"}"#))
                 .unwrap(),
         )
         .await
@@ -827,13 +846,14 @@ async fn browser_gate_toggle_requires_matching_origin_and_json() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(paths.gate_enabled());
+    assert_eq!(paths.gate_mode(), tmux_mcp_rs::control::GateMode::Tools);
 }
 
 #[tokio::test]
 async fn disabling_gate_approves_and_wakes_pending_requests() {
     let dir = tempdir().expect("temp state dir");
     let paths = StatePaths::new(dir.path());
-    set_gate_enabled(&paths, true).expect("enable gate");
+    set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
     let state = HubState::open(paths.clone()).expect("open hub");
     let token = "i".repeat(64);
     let app = build_router(
@@ -872,7 +892,7 @@ async fn disabling_gate_approves_and_wakes_pending_requests() {
                 .header(header::ORIGIN, "http://127.0.0.1:38473")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-tmux-mcp-token", token)
-                .body(Body::from(r#"{"enabled":false}"#))
+                .body(Body::from(r#"{"mode":"off"}"#))
                 .unwrap(),
         )
         .await

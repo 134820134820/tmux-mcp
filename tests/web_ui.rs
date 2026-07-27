@@ -5,7 +5,7 @@ fn page_contains_both_pane_modes_and_gate_controls() {
     for marker in [
         "mode-messages",
         "mode-interactive",
-        "gate-toggle",
+        "data-gate-mode",
         "approval-dialog",
         "pane-tree",
         "message-list",
@@ -43,9 +43,13 @@ fn safe_read_tools_render_as_clean_pane_messages() {
     for marker in [
         r#"record.tool === "list-directory""#,
         r#"record.tool === "read-file""#,
+        r#"record.tool === "find-files""#,
+        r#"record.tool === "search-text""#,
         "record.result?.structuredContent",
         "structured.entries.join",
         "structured.content",
+        "structured.files.join",
+        "structured.matches.join",
     ] {
         assert!(
             PAGE.contains(marker),
@@ -232,20 +236,33 @@ fn running_command_notice_uses_a_compact_accessible_spinner() {
 }
 
 #[test]
-fn gate_approval_is_a_non_blocking_popover_above_the_composer() {
+fn gate_approval_is_attached_above_the_composer() {
     assert!(PAGE.contains(r#"id="approval-dialog""#));
     assert!(PAGE.contains(r#"class="approval-popover""#));
-    assert!(PAGE.contains("bottom: 72px"));
+    let stack = PAGE
+        .split_once(r#"<div class="composer-stack">"#)
+        .expect("composer stack")
+        .1
+        .split_once(r#"<section id="interactive-view""#)
+        .expect("composer stack end")
+        .0;
+    let approval = stack.find(r#"id="approval-dialog""#).expect("approval");
+    let composer = stack
+        .find(r#"id="command-composer""#)
+        .expect("command composer");
+    assert!(approval < composer);
+    assert!(PAGE.contains(".approval-popover {\n        width: 100%;"));
+    assert!(!PAGE.contains("bottom: 72px"));
     assert!(PAGE.contains("elements.approval.hidden = false"));
-    let approval = PAGE
+    let render_approval = PAGE
         .split_once("function renderApproval(pending)")
         .expect("renderApproval function")
         .1
         .split_once("function renderOperations")
         .expect("renderApproval function end")
         .0;
-    assert!(!approval.contains("showModal"));
-    assert!(!approval.contains(".close()"));
+    assert!(!render_approval.contains("showModal"));
+    assert!(!render_approval.contains(".close()"));
 }
 
 #[test]
@@ -275,13 +292,19 @@ fn delayed_approval_hides_immediately_and_cannot_drop_its_refresh() {
 }
 
 #[test]
-fn gate_control_uses_an_accessible_toggle_switch() {
+fn gate_control_uses_an_accessible_three_mode_switch() {
     for marker in [
-        r#"<span class="gate-switch" aria-hidden="true"></span>"#,
-        ".gate-switch::after",
-        ".gate-control input:checked + .gate-switch",
-        ".gate-control input:focus-visible + .gate-switch",
-        "transform: translateX(16px)",
+        r#"id="gate-modes""#,
+        r#"data-gate-mode="off""#,
+        r#"data-gate-mode="tools""#,
+        r#"data-gate-mode="approval""#,
+        r#"role="group" aria-label="Gate 模式""#,
+        ".gate-modes::before",
+        r#".gate-modes[data-mode="tools"]::before"#,
+        r#".gate-modes[data-mode="approval"]::before"#,
+        r#"elements.gateModes.dataset.mode = value;"#,
+        r#"body: { mode: button.dataset.gateMode }"#,
+        r#"button.setAttribute("aria-pressed", String(active))"#,
     ] {
         assert!(
             PAGE.contains(marker),

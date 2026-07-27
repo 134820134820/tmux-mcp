@@ -103,6 +103,14 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
         groups: &["file-read", "read"],
     },
     ToolManifestEntry {
+        name: "find-files",
+        groups: &["list", "file-read", "read"],
+    },
+    ToolManifestEntry {
+        name: "search-text",
+        groups: &["file-read", "read"],
+    },
+    ToolManifestEntry {
         name: "git-status",
         groups: &["git-read", "read"],
     },
@@ -679,8 +687,8 @@ impl SecurityPolicy {
             | "set-synchronize-panes" => self.config.allow_move,
             "capture-pane" | "show-buffer" | "save-buffer" | "load-buffer" | "delete-buffer"
             | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
-            | "subsearch-buffer" | "read-file" | "git-status" | "git-diff" | "git-log"
-            | "git-show" => self.config.allow_capture,
+            | "subsearch-buffer" | "read-file" | "search-text" | "git-status" | "git-diff"
+            | "git-log" | "git-show" => self.config.allow_capture,
             "socket-for-path"
             | "list-sessions"
             | "list-windows"
@@ -689,7 +697,8 @@ impl SecurityPolicy {
             | "get-current-session"
             | "list-clients"
             | "list-buffers"
-            | "list-directory" => self.config.allow_list,
+            | "list-directory"
+            | "find-files" => self.config.allow_list,
             _ => true,
         };
 
@@ -2027,7 +2036,9 @@ mod tests {
         assert!(policy.check_tool("list-sessions").is_ok());
         assert!(policy.check_tool("find-session").is_ok());
         assert!(policy.check_tool("list-directory").is_ok());
+        assert!(policy.check_tool("find-files").is_ok());
         assert!(policy.check_tool("read-file").is_err());
+        assert!(policy.check_tool("search-text").is_err());
         assert!(policy.check_tool("capture-pane").is_err());
         assert!(policy.check_tool("execute-command").is_err());
     }

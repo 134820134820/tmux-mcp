@@ -119,57 +119,59 @@
       .status-dot.offline { background: var(--red); }
 
       .gate-control {
-        position: relative;
         display: flex;
         align-items: center;
-        gap: 9px;
-        padding: 7px 10px;
+        gap: 7px;
+        padding: 4px 5px 4px 9px;
         border: 1px solid var(--line);
         border-radius: 9px;
         background: var(--panel);
-        cursor: pointer;
         user-select: none;
       }
 
-      .gate-control input {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        opacity: 0;
-      }
-
-      .gate-switch {
+      .gate-modes {
         position: relative;
-        width: 38px;
-        height: 22px;
-        border: 1px solid #c7c9cf;
-        border-radius: 999px;
-        background: #d9dce1;
-        box-shadow: inset 0 1px 2px rgb(0 0 0 / 10%);
-        transition: background .16s ease, border-color .16s ease;
+        display: flex;
+        gap: 2px;
+        padding: 2px;
+        border-radius: 7px;
+        background: var(--panel-2);
       }
 
-      .gate-switch::after {
+      .gate-modes::before {
         content: "";
         position: absolute;
         top: 2px;
+        bottom: 2px;
         left: 2px;
-        width: 16px;
-        height: 16px;
-        border-radius: 50%;
-        background: #ffffff;
-        box-shadow: 0 1px 3px rgb(0 0 0 / 28%);
+        width: calc((100% - 8px) / 3);
+        border-radius: 5px;
+        background: var(--panel);
+        box-shadow: 0 1px 3px rgb(0 0 0 / 14%);
         transition: transform .16s ease;
       }
 
-      .gate-control input:checked + .gate-switch {
-        border-color: var(--green);
-        background: var(--green);
+      .gate-modes[data-mode="tools"]::before { transform: translateX(calc(100% + 2px)); }
+      .gate-modes[data-mode="approval"]::before { transform: translateX(calc(200% + 4px)); }
+
+      .gate-modes button {
+        position: relative;
+        z-index: 1;
+        flex: 1 1 0;
+        padding: 4px 7px;
+        border: 0;
+        border-radius: 5px;
+        color: var(--muted);
+        background: transparent;
+        font-size: 11px;
+        transition: color .16s ease;
       }
 
-      .gate-control input:checked + .gate-switch::after { transform: translateX(16px); }
-      .gate-control input:focus-visible { outline: 0; }
-      .gate-control input:focus-visible + .gate-switch {
+      .gate-modes button.active {
+        color: var(--text);
+      }
+
+      .gate-modes button:focus-visible {
         outline: 2px solid var(--blue);
         outline-offset: 2px;
       }
@@ -342,11 +344,16 @@
         white-space: nowrap;
       }
 
+      .composer-stack {
+        width: min(1120px, calc(100% - 56px));
+        margin: 0 auto 16px;
+      }
+
       .command-composer {
         display: flex;
         gap: 9px;
-        width: min(1120px, calc(100% - 56px));
-        margin: 0 auto 16px;
+        width: 100%;
+        margin: 0;
         padding: 0;
         border: 0;
         background: transparent;
@@ -547,19 +554,15 @@
       }
 
       .approval-popover {
-        position: absolute;
-        z-index: 10;
-        left: 50%;
-        bottom: 72px;
-        width: min(720px, calc(100% - 56px));
-        max-height: min(520px, calc(100% - 96px));
+        width: 100%;
+        max-height: min(420px, 45vh);
+        margin-bottom: 8px;
         overflow: auto;
         border: 1px solid var(--line);
         border-radius: 14px;
         color: var(--text);
         background: var(--panel);
-        box-shadow: 0 14px 40px rgb(0 0 0 / 18%);
-        transform: translateX(-50%);
+        box-shadow: 0 8px 24px rgb(0 0 0 / 10%);
       }
 
       .approval-popover[hidden] { display: none; }
@@ -657,11 +660,14 @@
           <span id="connection-dot" class="status-dot"></span>
           <span id="connection-text">连接中</span>
         </div>
-        <label class="gate-control" title="开启后，AI 的修改操作必须先得到批准">
+        <div class="gate-control">
           <span>Gate</span>
-          <input id="gate-toggle" type="checkbox" aria-label="Gate 审批">
-          <span class="gate-switch" aria-hidden="true"></span>
-        </label>
+          <div id="gate-modes" class="gate-modes" role="group" aria-label="Gate 模式" data-mode="off">
+            <button type="button" data-gate-mode="off" title="直接执行">关闭</button>
+            <button type="button" data-gate-mode="tools" title="已有专用工具的命令必须改用工具">工具</button>
+            <button type="button" data-gate-mode="approval" title="所有修改操作都需批准">审批</button>
+          </div>
+        </div>
         <button id="open-operation-log" class="log-button" type="button">操作日志</button>
       </header>
 
@@ -687,17 +693,41 @@
             <span>cwd</span>
             <code id="messages-cwd-path"></code>
           </div>
-          <form id="command-composer" class="command-composer">
-            <label class="sr-only" for="command-input">向当前 pane 发送命令</label>
-            <textarea
-              id="command-input"
-              rows="1"
-              maxlength="65536"
-              placeholder="向当前 pane 发送命令"
-              disabled
-            ></textarea>
-            <button id="command-send" type="submit" aria-label="发送命令" disabled>↑</button>
-          </form>
+          <div class="composer-stack">
+            <section
+              id="approval-dialog"
+              class="approval-popover"
+              role="region"
+              aria-label="Gate 审批请求"
+              aria-live="polite"
+              hidden
+            >
+              <div class="dialog-header">
+                <h2>请求批准</h2>
+                <span id="approval-queue-count" class="subtle"></span>
+              </div>
+              <div class="dialog-body">
+                <dl id="approval-summary" class="approval-summary"></dl>
+                <p class="card-label">精确参数</p>
+                <pre id="approval-arguments" class="approval-arguments"></pre>
+              </div>
+              <div class="dialog-actions">
+                <button id="approval-reject" class="reject" type="button">拒绝</button>
+                <button id="approval-approve" class="approve" type="button">批准</button>
+              </div>
+            </section>
+            <form id="command-composer" class="command-composer">
+              <label class="sr-only" for="command-input">向当前 pane 发送命令</label>
+              <textarea
+                id="command-input"
+                rows="1"
+                maxlength="65536"
+                placeholder="向当前 pane 发送命令"
+                disabled
+              ></textarea>
+              <button id="command-send" type="submit" aria-label="发送命令" disabled>↑</button>
+            </form>
+          </div>
         </section>
 
         <section id="interactive-view" class="view">
@@ -712,28 +742,6 @@
           </div>
         </section>
 
-        <section
-          id="approval-dialog"
-          class="approval-popover"
-          role="region"
-          aria-label="Gate 审批请求"
-          aria-live="polite"
-          hidden
-        >
-          <div class="dialog-header">
-            <h2>请求批准</h2>
-            <span id="approval-queue-count" class="subtle"></span>
-          </div>
-          <div class="dialog-body">
-            <dl id="approval-summary" class="approval-summary"></dl>
-            <p class="card-label">精确参数</p>
-            <pre id="approval-arguments" class="approval-arguments"></pre>
-          </div>
-          <div class="dialog-actions">
-            <button id="approval-reject" class="reject" type="button">拒绝</button>
-            <button id="approval-approve" class="approve" type="button">批准</button>
-          </div>
-        </section>
       </main>
     </div>
 
@@ -766,7 +774,8 @@
         commandInput: byId("command-input"),
         commandSend: byId("command-send"),
         terminal: byId("terminal-snapshot"),
-        gate: byId("gate-toggle"),
+        gateModes: byId("gate-modes"),
+        gateButtons: [...document.querySelectorAll("[data-gate-mode]")],
         connectionDot: byId("connection-dot"),
         connectionText: byId("connection-text"),
         error: byId("error-bar"),
@@ -799,6 +808,7 @@
       let stateRefreshQueued = false;
       let captureBusy = false;
       let commandSubmitting = false;
+      let gateBusy = false;
       let decidingApprovalId = "";
       let approvalCooldown = false;
       const decidedApprovalIds = new Set();
@@ -844,6 +854,15 @@
       function showError(message) {
         elements.error.textContent = message || "";
         elements.error.classList.toggle("visible", Boolean(message));
+      }
+
+      function renderGateMode(value) {
+        elements.gateModes.dataset.mode = value;
+        for (const button of elements.gateButtons) {
+          const active = button.dataset.gateMode === value;
+          button.classList.toggle("active", active);
+          button.setAttribute("aria-pressed", String(active));
+        }
       }
 
       function flattenPanes(topology) {
@@ -1009,7 +1028,21 @@
         if (record.tool === "list-directory") {
           return `ls${args.showHidden ? " -a" : ""} ${args.path || "."}`;
         }
-        if (record.tool === "read-file") return `read ${args.path || ""}`;
+        if (record.tool === "read-file") {
+          if (args.tailLines) return `read --tail ${args.tailLines} ${args.path || ""}`;
+          if (args.startLine && args.endLine) {
+            return `read --lines ${args.startLine}-${args.endLine} ${args.path || ""}`;
+          }
+          return `read ${args.path || ""}`;
+        }
+        if (record.tool === "find-files") {
+          const name = args.namePattern ? ` --name ${args.namePattern}` : "";
+          return `find-files ${args.path || "."}${name}`;
+        }
+        if (record.tool === "search-text") {
+          const mode = args.regex ? "--regex" : "--literal";
+          return `search-text ${mode} ${args.pattern || ""} ${args.path || "."}`;
+        }
         const git = args.repoPath ? `git -C ${args.repoPath}` : "git";
         if (record.tool === "git-status") return `${git} status`;
         if (record.tool === "git-diff") {
@@ -1055,6 +1088,14 @@
         if (record.tool === "read-file" && typeof structured?.content === "string") {
           const output = structured.content || "（空文件）";
           return structured.truncated ? `${output}\n…（内容已截断）` : output;
+        }
+        if (record.tool === "find-files" && Array.isArray(structured?.files)) {
+          const output = structured.files.join("\n") || "（没有匹配文件）";
+          return structured.truncated ? `${output}\n…（结果已截断）` : output;
+        }
+        if (record.tool === "search-text" && Array.isArray(structured?.matches)) {
+          const output = structured.matches.join("\n") || "（没有匹配内容）";
+          return structured.truncated ? `${output}\n…（结果已截断）` : output;
         }
         if (record.tool?.startsWith("git-") && typeof structured?.output === "string") {
           const output = structured.output || "（无输出）";
@@ -1316,7 +1357,7 @@
           const selectionChanged = choosePane(panes);
           updateActivity(state.activity);
           renderTopology(state.topology);
-          elements.gate.checked = Boolean(state.gateEnabled);
+          renderGateMode(state.gateMode || (state.gateEnabled ? "approval" : "off"));
           renderOperations();
           renderApproval(state.pending);
           setConnection(true, "已连接");
@@ -1421,16 +1462,23 @@
         }
       });
 
-      elements.gate.addEventListener("change", async () => {
-        const enabled = elements.gate.checked;
-        try {
-          await api("/api/gate", { method: "PUT", body: { enabled } });
-          await refreshState();
-        } catch (error) {
-          elements.gate.checked = !enabled;
-          showError(error.message);
-        }
-      });
+      for (const button of elements.gateButtons) {
+        button.addEventListener("click", async () => {
+          if (gateBusy) return;
+          gateBusy = true;
+          elements.gateButtons.forEach((item) => { item.disabled = true; });
+          try {
+            await api("/api/gate", { method: "PUT", body: { mode: button.dataset.gateMode } });
+            await refreshState();
+          } catch (error) {
+            renderGateMode(latestState?.gateMode || "off");
+            showError(error.message);
+          } finally {
+            gateBusy = false;
+            elements.gateButtons.forEach((item) => { item.disabled = false; });
+          }
+        });
+      }
 
       async function decideApproval(approved) {
         const id = elements.approval.dataset.requestId;
