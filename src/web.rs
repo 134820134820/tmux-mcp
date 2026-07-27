@@ -21,8 +21,8 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{
-    set_gate_enabled, ActionKind, ActionRecord, ActionStatus, AuthorizationResponse, GateDecision,
-    StatePaths, ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
+    set_gate_mode, ActionKind, ActionRecord, ActionStatus, AuthorizationResponse, GateDecision,
+    GateMode, StatePaths, ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
@@ -89,6 +89,7 @@ struct StateQuery {
 #[serde(rename_all = "camelCase")]
 struct StateResponse {
     gate_enabled: bool,
+    gate_mode: GateMode,
     pending: Vec<ActionRecord>,
     messages: Vec<ActionRecord>,
     operations: Vec<ActionRecord>,
@@ -121,8 +122,8 @@ struct WindowNode {
 }
 
 #[derive(Debug, Deserialize)]
-struct GateToggle {
-    enabled: bool,
+struct GateUpdate {
+    mode: GateMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -369,6 +370,7 @@ async fn api_state(
     }
     Json(StateResponse {
         gate_enabled: context.hub.paths().gate_enabled(),
+        gate_mode: context.hub.paths().gate_mode(),
         pending: context.hub.pending().await,
         messages,
         operations: context.hub.operations().await,
@@ -380,8 +382,8 @@ async fn api_state(
     })
 }
 
-async fn api_gate(State(context): State<AppContext>, Json(input): Json<GateToggle>) -> Response {
-    match context.hub.set_gate_enabled(input.enabled).await {
+async fn api_gate(State(context): State<AppContext>, Json(input): Json<GateUpdate>) -> Response {
+    match context.hub.set_gate_mode(input.mode).await {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -753,7 +755,7 @@ mod tests {
     async fn authorize_rechecks_gate_after_waiting_for_pending_lock() {
         let dir = tempfile::tempdir().expect("temp state dir");
         let paths = StatePaths::new(dir.path());
-        set_gate_enabled(&paths, true).expect("enable gate");
+        set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
         let hub = HubState::open(paths.clone()).expect("open hub");
         let pending = hub.inner.pending.lock().await;
         let authorizing = {
@@ -781,7 +783,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        set_gate_enabled(&paths, false).expect("disable gate");
+        set_gate_mode(&paths, GateMode::Off).expect("disable gate");
         drop(pending);
 
         assert_eq!(
@@ -806,7 +808,7 @@ mod tests {
         let pending = hub.inner.pending.lock().await;
         let enabling = {
             let hub = hub.clone();
-            tokio::spawn(async move { hub.set_gate_enabled(true).await })
+            tokio::spawn(async move { hub.set_gate_mode(GateMode::Approval).await })
         };
         tokio::task::yield_now().await;
 
@@ -1153,14 +1155,14 @@ impl HubState {
         receiver.await.unwrap_or(GateDecision::Rejected)
     }
 
-    async fn set_gate_enabled(&self, enabled: bool) -> io::Result<()> {
-        if enabled {
+    async fn set_gate_mode(&self, mode: GateMode) -> io::Result<()> {
+        if mode != GateMode::Off {
             let _pending = self.inner.pending.lock().await;
-            return set_gate_enabled(&self.inner.paths, true);
+            return set_gate_mode(&self.inner.paths, mode);
         }
         let approvals = {
             let mut pending = self.inner.pending.lock().await;
-            set_gate_enabled(&self.inner.paths, false)?;
+            set_gate_mode(&self.inner.paths, GateMode::Off)?;
             pending
                 .drain()
                 .map(|(_, approval)| approval)
@@ -1407,6 +1409,8 @@ impl RecordStore {
                         record.tool.as_str(),
                         "list-directory"
                             | "read-file"
+                            | "find-files"
+                            | "search-text"
                             | "git-status"
                             | "git-diff"
                             | "git-log"

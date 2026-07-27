@@ -109,7 +109,7 @@ impl Annotated {
 }
 
 use crate::commands::{CommandEventKind, CommandTracker};
-use crate::control::{ActionRecord, ControlClient, GateDecision};
+use crate::control::{ActionRecord, ControlClient, GateDecision, GateMode};
 use crate::security::{SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
@@ -121,6 +121,11 @@ const DEFAULT_DIRECTORY_ENTRIES: u32 = 200;
 const MAX_DIRECTORY_ENTRIES: u32 = 500;
 const DEFAULT_FILE_BYTES: u32 = 65_536;
 const MAX_FILE_BYTES: u32 = 262_144;
+const MAX_FILE_LINES: u32 = 10_000;
+const DEFAULT_FIND_DEPTH: u32 = 6;
+const MAX_FIND_DEPTH: u32 = 32;
+const DEFAULT_SEARCH_MATCHES: u32 = 100;
+const MAX_SEARCH_MATCHES: u32 = 500;
 const DEFAULT_GIT_BYTES: u32 = 65_536;
 const MAX_GIT_BYTES: u32 = 262_144;
 const DEFAULT_GIT_LOG_COUNT: u32 = 20;
@@ -323,6 +328,27 @@ pub struct ReadFileOutput {
     pub truncated: bool,
 }
 
+/// `find-files` structured payload.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FindFilesOutput {
+    pub cwd: String,
+    pub path: String,
+    pub files: Vec<String>,
+    pub truncated: bool,
+}
+
+/// `search-text` structured payload.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTextOutput {
+    pub cwd: String,
+    pub path: String,
+    pub matches: Vec<String>,
+    pub bytes_read: usize,
+    pub truncated: bool,
+}
+
 /// Shared structured payload for bounded Git queries.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -441,6 +467,67 @@ pub struct ReadFileInput {
     /// Absolute path or path relative to the pane's current working directory.
     pub path: String,
     /// Maximum bytes to return (default 65536, maximum 262144).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u32>,
+    /// First 1-based line to return; must be paired with endLine.
+    #[serde(rename = "startLine")]
+    pub start_line: Option<u32>,
+    /// Last 1-based line to return; must be paired with startLine.
+    #[serde(rename = "endLine")]
+    pub end_line: Option<u32>,
+    /// Return the last N lines; mutually exclusive with startLine/endLine.
+    #[serde(rename = "tailLines")]
+    pub tail_lines: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `find-files`: bounded recursive file-name search.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindFilesInput {
+    /// Pane whose current working directory resolves relative paths.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Absolute path or path relative to the pane cwd (default `.`).
+    pub path: Option<String>,
+    /// Optional shell-style file-name pattern such as `*.rs` (not a command).
+    #[serde(rename = "namePattern")]
+    pub name_pattern: Option<String>,
+    /// Include hidden files and directories (default false).
+    #[serde(rename = "showHidden")]
+    pub show_hidden: Option<bool>,
+    /// Maximum recursion depth (default 6, maximum 32).
+    #[serde(rename = "maxDepth")]
+    pub max_depth: Option<u32>,
+    /// Maximum files to return (default 200, maximum 500).
+    #[serde(rename = "maxEntries")]
+    pub max_entries: Option<u32>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `search-text`: bounded recursive text search.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchTextInput {
+    /// Pane whose current working directory resolves relative paths.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Text or regular expression to search for.
+    pub pattern: String,
+    /// Absolute path or path relative to the pane cwd (default `.`).
+    pub path: Option<String>,
+    /// Treat pattern as a regular expression instead of literal text (default false).
+    pub regex: Option<bool>,
+    /// Match case exactly (default true).
+    #[serde(rename = "caseSensitive")]
+    pub case_sensitive: Option<bool>,
+    /// Include hidden files and directories (default false).
+    #[serde(rename = "showHidden")]
+    pub show_hidden: Option<bool>,
+    /// Maximum matching lines to return (default 100, maximum 500).
+    #[serde(rename = "maxMatches")]
+    pub max_matches: Option<u32>,
+    /// Maximum output bytes (default 65536, maximum 262144).
     #[serde(rename = "maxBytes")]
     pub max_bytes: Option<u32>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
@@ -1125,6 +1212,37 @@ impl TmuxMcpServer {
             .unwrap_or(false)
     }
 
+    fn preferred_tool_for_command(command: &str) -> Option<&'static str> {
+        if command
+            .chars()
+            .any(|character| "|&;<>\r\n$`()#".contains(character))
+        {
+            return None;
+        }
+        let words = shell_words::split(command).ok()?;
+        match words.first().map(String::as_str)? {
+            "ls" => Some("list-directory"),
+            "cat" | "head" | "tail" => Some("read-file"),
+            "find" => Some("find-files"),
+            "grep" | "rg" => Some("search-text"),
+            "git" => {
+                let subcommand = if words.get(1).map(String::as_str) == Some("-C") {
+                    words.get(3)
+                } else {
+                    words.get(1)
+                };
+                match subcommand.map(String::as_str) {
+                    Some("status") => Some("git-status"),
+                    Some("diff") => Some("git-diff"),
+                    Some("log") => Some("git-log"),
+                    Some("show") => Some("git-show"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn resource_template(
         uri_template: &str,
         name: &str,
@@ -1709,7 +1827,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "read-file",
-        description = "Read a bounded text prefix from a remote file without running arbitrary shell text. Paths may be absolute or relative to the target pane cwd. Read-only but may expose sensitive data such as keys or credentials.",
+        description = "Read a bounded text prefix, 1-based line range, or tail from a remote file without accepting shell text. startLine/endLine must be paired; tailLines is mutually exclusive. Read-only but may expose sensitive data such as keys or credentials.",
         annotations(read_only_hint = true, idempotent_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<ReadFileOutput>()
     )]
@@ -1719,6 +1837,135 @@ impl TmuxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         if let Err(e) = self.policy.check_tool("read-file") {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let max_bytes = input.0.max_bytes.unwrap_or(DEFAULT_FILE_BYTES);
+        if !(1..=MAX_FILE_BYTES).contains(&max_bytes) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxBytes must be between 1 and {MAX_FILE_BYTES}"
+            ))]));
+        }
+        let mode = match (
+            input.0.start_line,
+            input.0.end_line,
+            input.0.tail_lines,
+        ) {
+            (None, None, None) => tmux::FileReadMode::Prefix,
+            (Some(start), Some(end), None)
+                if start > 0 && end >= start && end - start < MAX_FILE_LINES =>
+            {
+                tmux::FileReadMode::Lines { start, end }
+            }
+            (None, None, Some(lines)) if (1..=MAX_FILE_LINES).contains(&lines) => {
+                tmux::FileReadMode::Tail { lines }
+            }
+            _ => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "use either startLine/endLine together (1-based, at most {MAX_FILE_LINES} lines) or tailLines (1-{MAX_FILE_LINES})"
+                ))]))
+            }
+        };
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let pane = match self
+            .checked_pane_info(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            Ok(pane) => pane,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        match tmux::read_file(&pane.current_path, &input.0.path, max_bytes as usize, mode).await {
+            Ok((content, bytes_read, truncated)) => Ok(structured_output(&ReadFileOutput {
+                cwd: pane.current_path,
+                path: input.0.path,
+                content,
+                bytes_read,
+                truncated,
+            })),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error reading file: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "find-files",
+        description = "Recursively find files below a remote path using a fixed optional file-name pattern. Depth, result count, output, and runtime are bounded; hidden paths are skipped by default and arbitrary find expressions are not accepted.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<FindFilesOutput>()
+    )]
+    async fn find_files(
+        &self,
+        input: Parameters<FindFilesInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("find-files") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let max_depth = input.0.max_depth.unwrap_or(DEFAULT_FIND_DEPTH);
+        if !(1..=MAX_FIND_DEPTH).contains(&max_depth) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxDepth must be between 1 and {MAX_FIND_DEPTH}"
+            ))]));
+        }
+        let max_entries = input.0.max_entries.unwrap_or(DEFAULT_DIRECTORY_ENTRIES);
+        if !(1..=MAX_DIRECTORY_ENTRIES).contains(&max_entries) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxEntries must be between 1 and {MAX_DIRECTORY_ENTRIES}"
+            ))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let pane = match self
+            .checked_pane_info(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            Ok(pane) => pane,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
+        };
+        let path = input.0.path.unwrap_or_else(|| ".".to_string());
+        match tmux::find_files(
+            &pane.current_path,
+            &path,
+            input.0.name_pattern.as_deref(),
+            input.0.show_hidden.unwrap_or(false),
+            max_depth,
+            max_entries as usize,
+        )
+        .await
+        {
+            Ok((files, truncated)) => Ok(structured_output(&FindFilesOutput {
+                cwd: pane.current_path,
+                path,
+                files,
+                truncated,
+            })),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error finding files: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "search-text",
+        description = "Recursively search remote text files with fixed grep arguments. Literal matching is the default; optional regular expressions, output, match count, and runtime are bounded. Hidden paths are skipped by default.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<SearchTextOutput>()
+    )]
+    async fn search_text(
+        &self,
+        input: Parameters<SearchTextInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("search-text") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let max_matches = input.0.max_matches.unwrap_or(DEFAULT_SEARCH_MATCHES);
+        if !(1..=MAX_SEARCH_MATCHES).contains(&max_matches) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "maxMatches must be between 1 and {MAX_SEARCH_MATCHES}"
+            ))]));
         }
         let max_bytes = input.0.max_bytes.unwrap_or(DEFAULT_FILE_BYTES);
         if !(1..=MAX_FILE_BYTES).contains(&max_bytes) {
@@ -1737,16 +1984,30 @@ impl TmuxMcpServer {
             Ok(pane) => pane,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
         };
-        match tmux::read_file(&pane.current_path, &input.0.path, max_bytes as usize).await {
-            Ok((content, bytes_read, truncated)) => Ok(structured_output(&ReadFileOutput {
+        let path = input.0.path.unwrap_or_else(|| ".".to_string());
+        match tmux::search_files_text(
+            &pane.current_path,
+            tmux::FileSearchOptions {
+                path: &path,
+                pattern: &input.0.pattern,
+                literal: !input.0.regex.unwrap_or(false),
+                case_sensitive: input.0.case_sensitive.unwrap_or(true),
+                show_hidden: input.0.show_hidden.unwrap_or(false),
+                max_matches: max_matches as usize,
+                max_bytes: max_bytes as usize,
+            },
+        )
+        .await
+        {
+            Ok((matches, bytes_read, truncated)) => Ok(structured_output(&SearchTextOutput {
                 cwd: pane.current_path,
-                path: input.0.path,
-                content,
+                path,
+                matches,
                 bytes_read,
                 truncated,
             })),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error reading file: {e}"
+                "Error searching text: {e}"
             ))])),
         }
     }
@@ -3779,8 +4040,28 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
             let mut record = control.action(request.name.to_string(), arguments);
             record.read_only = read_only;
+            let preferred_tool = if !read_only
+                && control.gate_mode() == GateMode::Tools
+                && request.name == "execute-command"
+            {
+                record
+                    .arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(Self::preferred_tool_for_command)
+            } else {
+                None
+            };
             if read_only {
                 action = Some(record);
+            } else if let Some(tool) = preferred_tool {
+                let error = format!(
+                    "execute-command rejected by Tool-first Gate: use the existing MCP tool '{tool}' instead"
+                );
+                record.result = Some(serde_json::json!({"error": error}));
+                record.mark_rejected();
+                let _ = control.record(&record).await;
+                return Ok(CallToolResult::error(vec![Content::text(error)]));
             } else {
                 match control.authorize(&record).await {
                     Ok(GateDecision::Approved) => {
@@ -3860,7 +4141,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 .build(),
         )
         .with_instructions(
-            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory, read-file, and the bounded git-status/git-diff/git-log/git-show tools for inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
+            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory, find-files, read-file, search-text, and the bounded git-status/git-diff/git-log/git-show tools for inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
         )
     }
 
@@ -4613,7 +4894,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
 mod tests {
     use super::*;
     use crate::control::{
-        load_or_create_token, set_gate_enabled, ControlClient, GateDecision, StatePaths,
+        load_or_create_token, set_gate_mode, ControlClient, GateDecision, GateMode, StatePaths,
     };
     use crate::test_support::TmuxStub;
     use crate::web::{build_router, HubState};
@@ -4727,6 +5008,8 @@ mod tests {
         assert!(server.tool_is_read_only("capture-pane"));
         assert!(server.tool_is_read_only("list-directory"));
         assert!(server.tool_is_read_only("read-file"));
+        assert!(server.tool_is_read_only("find-files"));
+        assert!(server.tool_is_read_only("search-text"));
         assert!(server.tool_is_read_only("git-status"));
         assert!(server.tool_is_read_only("git-diff"));
         assert!(server.tool_is_read_only("git-log"));
@@ -4734,6 +5017,33 @@ mod tests {
         assert!(!server.tool_is_read_only("execute-command"));
         assert!(!server.tool_is_read_only("send-keys"));
         assert!(!server.tool_is_read_only("unknown-tool"));
+    }
+
+    #[test]
+    fn tool_first_gate_only_redirects_simple_commands_to_existing_tools() {
+        for (command, tool) in [
+            ("ls -la", "list-directory"),
+            ("tail -n 20 app.log", "read-file"),
+            ("find . -name Cargo.toml", "find-files"),
+            ("rg needle src", "search-text"),
+            ("git -C repo status --short", "git-status"),
+            ("git diff --stat", "git-diff"),
+        ] {
+            assert_eq!(
+                TmuxMcpServer::preferred_tool_for_command(command),
+                Some(tool)
+            );
+        }
+        for command in [
+            "ls | head",
+            "ls && rm -rf target",
+            "bash -c 'ls'",
+            "sudo ls",
+            "git checkout main",
+            "echo $(ls)",
+        ] {
+            assert_eq!(TmuxMcpServer::preferred_tool_for_command(command), None);
+        }
     }
 
     #[tokio::test]
@@ -4758,12 +5068,62 @@ mod tests {
                 pane_id: "%1".into(),
                 path: "/tmp/file".into(),
                 max_bytes: Some(MAX_FILE_BYTES + 1),
+                start_line: None,
+                end_line: None,
+                tail_lines: None,
                 socket: None,
             }))
             .await
             .expect("read-file result");
         assert_eq!(reading.is_error, Some(true));
         assert!(first_text(&reading).contains("maxBytes"));
+
+        let line_range = server
+            .read_file(Parameters(ReadFileInput {
+                pane_id: "%1".into(),
+                path: "/tmp/file".into(),
+                max_bytes: None,
+                start_line: Some(10),
+                end_line: Some(2),
+                tail_lines: None,
+                socket: None,
+            }))
+            .await
+            .expect("read-file line range result");
+        assert_eq!(line_range.is_error, Some(true));
+        assert!(first_text(&line_range).contains("startLine/endLine"));
+
+        let finding = server
+            .find_files(Parameters(FindFilesInput {
+                pane_id: "%1".into(),
+                path: None,
+                name_pattern: None,
+                show_hidden: None,
+                max_depth: Some(MAX_FIND_DEPTH + 1),
+                max_entries: None,
+                socket: None,
+            }))
+            .await
+            .expect("find-files result");
+        assert_eq!(finding.is_error, Some(true));
+        assert!(first_text(&finding).contains("maxDepth"));
+
+        let searching = server
+            .search_text(Parameters(SearchTextInput {
+                pane_id: "%1".into(),
+                pattern: "needle".into(),
+                path: None,
+                regex: None,
+                case_sensitive: None,
+                show_hidden: None,
+                max_matches: Some(MAX_SEARCH_MATCHES + 1),
+                max_bytes: None,
+                socket: None,
+            }))
+            .await
+            .expect("search-text result");
+        assert_eq!(searching.is_error, Some(true));
+        assert!(first_text(&searching).contains("maxMatches"));
 
         let status = server
             .git_status(Parameters(GitStatusInput {
@@ -4833,7 +5193,7 @@ mod tests {
     async fn read_only_tool_bypasses_enabled_gate() {
         let dir = tempdir().expect("state dir");
         let paths = StatePaths::new(dir.path());
-        set_gate_enabled(&paths, true).expect("enable gate");
+        set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
         let (url, hub, task) = start_control_hub(paths.clone()).await;
         let control = ControlClient::new(&url, "Codex", paths).expect("control");
         let server = TmuxMcpServer::new_with_control(
@@ -4870,10 +5230,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_rejection_returns_before_mutating_route() {
+    async fn tool_first_gate_still_requires_approval_for_send_keys() {
         let dir = tempdir().expect("state dir");
         let paths = StatePaths::new(dir.path());
-        set_gate_enabled(&paths, true).expect("enable gate");
+        set_gate_mode(&paths, GateMode::Tools).expect("enable tool-first gate");
         let (url, hub, task) = start_control_hub(paths.clone()).await;
         let control = ControlClient::new(&url, "Claude", paths).expect("control");
         let server = TmuxMcpServer::new_with_control(
@@ -4916,6 +5276,43 @@ mod tests {
             hub.records_for_pane("%8").await[0].status,
             crate::control::ActionStatus::Rejected
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_first_gate_rejects_shell_equivalents_without_touching_tmux() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        set_gate_mode(&paths, GateMode::Tools).expect("enable tool-first gate");
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let control = ControlClient::new(&url, "Codex", paths).expect("control");
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(control),
+        );
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let arguments = serde_json::json!({"paneId": "%8", "command": "ls -la"})
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        let result = server
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("execute-command")
+                    .with_arguments(arguments),
+                context,
+            )
+            .await
+            .expect("tool result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("list-directory"));
+        assert!(hub.pending().await.is_empty());
+        let records = hub.records_for_pane("%8").await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, crate::control::ActionStatus::Rejected);
         task.abort();
     }
 

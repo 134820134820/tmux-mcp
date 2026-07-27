@@ -5,7 +5,8 @@ use serde_json::json;
 use tempfile::tempdir;
 use tmux_mcp_rs::commands::CommandTracker;
 use tmux_mcp_rs::control::{
-    load_or_create_token, set_gate_enabled, ActionStatus, ControlClient, GateDecision, StatePaths,
+    load_or_create_token, set_gate_mode, ActionStatus, ControlClient, GateDecision, GateMode,
+    StatePaths,
 };
 use tmux_mcp_rs::security::SecurityPolicy;
 use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus, ShellType};
@@ -56,7 +57,7 @@ async fn client_authorizes_through_the_real_loopback_api() {
 async fn client_waits_for_gate_decision() {
     let dir = tempdir().expect("temp state dir");
     let paths = StatePaths::new(dir.path());
-    set_gate_enabled(&paths, true).expect("enable gate");
+    set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
     let (url, state, task) = start_hub(paths.clone()).await;
     let client = ControlClient::new(&url, "Claude", paths).expect("control client");
     let record = client.action("send-enter", json!({"paneId": "%2"}));
@@ -99,7 +100,7 @@ async fn unavailable_hub_is_fail_open_only_while_gate_is_off() {
         client.authorize(&record).await.expect("fail open"),
         GateDecision::Approved
     );
-    set_gate_enabled(&paths, true).expect("enable gate");
+    set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
     assert!(client.authorize(&record).await.is_err());
 }
 

@@ -1,8 +1,8 @@
 use serde_json::json;
 use tempfile::tempdir;
 use tmux_mcp_rs::control::{
-    default_state_dir, load_or_create_token, set_gate_enabled, validate_web_url, ActionKind,
-    ActionRecord, ActionStatus, StatePaths,
+    default_state_dir, load_or_create_token, set_gate_mode, validate_web_url, ActionKind,
+    ActionRecord, ActionStatus, GateMode, StatePaths,
 };
 use tmux_mcp_rs::types::{CommandSnapshot, CommandStatus};
 
@@ -63,9 +63,13 @@ fn gate_file_is_absent_by_default_and_toggles_explicitly() {
     let paths = StatePaths::new(dir.path());
 
     assert!(!paths.gate_enabled());
-    set_gate_enabled(&paths, true).expect("enable gate");
+    assert_eq!(paths.gate_mode(), GateMode::Off);
+    set_gate_mode(&paths, GateMode::Tools).expect("enable tool-first gate");
+    assert_eq!(paths.gate_mode(), GateMode::Tools);
+    set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
     assert!(paths.gate_enabled());
-    set_gate_enabled(&paths, false).expect("disable gate");
+    assert_eq!(paths.gate_mode(), GateMode::Approval);
+    set_gate_mode(&paths, GateMode::Off).expect("disable gate");
     assert!(!paths.gate_enabled());
 }
 

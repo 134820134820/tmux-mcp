@@ -56,6 +56,14 @@ pub enum GateDecision {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateMode {
+    Off,
+    Tools,
+    Approval,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationResponse {
@@ -273,6 +281,10 @@ impl ControlClient {
         }
     }
 
+    pub fn gate_mode(&self) -> GateMode {
+        self.paths.gate_mode()
+    }
+
     pub async fn record(&self, record: &ActionRecord) -> Result<(), String> {
         let token =
             load_or_create_token(&self.paths).map_err(|error| format!("control token: {error}"))?;
@@ -421,20 +433,31 @@ impl StatePaths {
     }
 
     pub fn gate_enabled(&self) -> bool {
-        self.gate.is_file()
+        self.gate_mode() != GateMode::Off
+    }
+
+    pub fn gate_mode(&self) -> GateMode {
+        match fs::read_to_string(&self.gate) {
+            Ok(value) if value.trim() == "tools" => GateMode::Tools,
+            Ok(_) => GateMode::Approval,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => GateMode::Off,
+            Err(_) => GateMode::Approval,
+        }
     }
 }
 
-pub fn set_gate_enabled(paths: &StatePaths, enabled: bool) -> io::Result<()> {
+pub fn set_gate_mode(paths: &StatePaths, mode: GateMode) -> io::Result<()> {
     fs::create_dir_all(&paths.directory)?;
-    if enabled {
-        if !paths.gate.exists() {
-            fs::write(&paths.gate, b"enabled\n")?;
+    match mode {
+        GateMode::Off => {
+            if let Err(error) = fs::remove_file(&paths.gate) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
         }
-    } else if let Err(error) = fs::remove_file(&paths.gate) {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
+        GateMode::Tools => fs::write(&paths.gate, b"tools\n")?,
+        GateMode::Approval => fs::write(&paths.gate, b"approval\n")?,
     }
     Ok(())
 }
