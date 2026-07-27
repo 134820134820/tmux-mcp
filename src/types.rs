@@ -261,7 +261,7 @@ pub enum ShellType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CommandStatus {
-    /// Accepted but waiting for the pane's tracked-command queue head.
+    /// Legacy wire value retained for compatibility; new commands are never queued.
     Queued,
     /// Keys sent / side-channel watcher active (or tracking disabled after send).
     Running,

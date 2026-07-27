@@ -63,4 +63,20 @@ size, identifiers, and input length. The UI renders untrusted values with
 - `--client-name <name>`, default `mcp-<pid>`
 
 No option changes existing behavior unless `--web` or `--web-url` is supplied.
+## 单 MCP 实例并发保护（2026-07-28，临时边界）
 
+- 同一个 MCP 进程内，同一 socket/pane 同时只允许一个 tracked command；后续
+  `execute-command` 直接拒绝，不排队。不同 pane 仍可并行。
+- AI 向运行中的 tracked command 发送 `send-keys`、`send-hex`、`paste-text`
+  或特殊键时必须提供匹配的 `forCommandId`；`send-cancel`（Ctrl-C）例外，但
+  不会因此提前释放命令占用。
+- `rawMode` 与 `noEnter` 不出现在 MCP 工具 schema 中；AI 的
+  `execute-command` 固定使用 tracked 模式并发送 Enter。网页交互仍走独立按键接口。
+- `TrackingError` 表示 pane 状态不确定并继续占用该 pane。下一次 AI 工具调用先
+  自动执行 `capture-pane`：成功时返回画面、取消本次调用并解除不确定；失败时设置
+  “AI 操作已暂停”，之后拒绝 AI 工具调用，直到人在网页清除暂停。
+- 网页接入时暂停标记保存在本机状态目录的 `ai-paused.json`；未接入网页时只保存在
+  当前 MCP 进程内，重启进程即可清除。
+- **临时边界：** 当前不协调多个 Codex/Claude/MCP 进程，不把普通命令占用写入远端
+  tmux 元数据，也不锁定 pane 的删除、移动或合并操作。多个 MCP 同时操作同一 pane
+  仍可能冲突；只有出现实际需求时再增加跨进程协调。

@@ -1,11 +1,11 @@
 //! Side-channel command execution tracking for agent-driven shell work in panes.
 //!
-//! `CommandTracker` queues tracked commands per pane, wraps them with optional
+//! `CommandTracker` runs at most one tracked command per pane, wraps it with optional
 //! START/DONE debug markers plus a private tmux exit-code side channel
 //! (`set-buffer` + `wait-for`), and commits terminal status only from that
 //! channel—not from forgeable pane scrollback.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -147,7 +147,7 @@ impl Default for TrackingConfig {
 }
 
 #[derive(Clone)]
-struct QueuedLaunch {
+struct TrackedLaunch {
     command_id: String,
     pane_id: String,
     command: String,
@@ -156,19 +156,18 @@ struct QueuedLaunch {
     secret: String,
 }
 
-/// In-process registry of queued, running, and recently completed pane commands.
+/// In-process registry of running and recently completed pane commands.
 ///
-/// One tracker instance is shared by the MCP server. Tracked launches serialize
-/// per `socket|pane_id` so a pane never runs two side-channel wrappers at once.
+/// One tracker instance is shared by the MCP server. A second tracked launch for
+/// the same `socket|pane_id` is rejected while the first command is unresolved.
 /// Completion is side-channel authoritative; pane scrollback is presentation only.
 pub struct CommandTracker {
     /// All live records keyed by command id (including terminal until eviction).
     active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
     /// Private side-channel secrets (never exposed on CommandExecution).
     secrets: Arc<RwLock<HashMap<String, String>>>,
-    /// `socket|pane_id` → queued tracked launches waiting for the running slot.
-    pane_queues: Arc<RwLock<HashMap<String, VecDeque<QueuedLaunch>>>>,
-    /// `socket|pane_id` → currently running tracked command id.
+    /// `socket|pane_id` → current tracked command id. Tracking errors retain this
+    /// entry until the caller captures and acknowledges the uncertain pane.
     pane_running: Arc<RwLock<HashMap<String, String>>>,
     /// Process-default shell dialect; pane `current_command` may override at wrap time.
     shell_type: ShellType,
@@ -198,7 +197,6 @@ impl CommandTracker {
         Self {
             active_commands: Arc::new(RwLock::new(HashMap::new())),
             secrets: Arc::new(RwLock::new(HashMap::new())),
-            pane_queues: Arc::new(RwLock::new(HashMap::new())),
             pane_running: Arc::new(RwLock::new(HashMap::new())),
             shell_type,
             tracking,
@@ -273,19 +271,14 @@ impl CommandTracker {
             pane_id: pane_id.to_string(),
             socket: resolved_socket.clone(),
             command: command.to_string(),
-            status: if tracking_disabled {
-                CommandStatus::Running
-            } else {
-                CommandStatus::Queued
-            },
+            status: CommandStatus::Running,
             exit_code: None,
             output: if tracking_disabled {
                 Some("Tracking disabled for raw_mode or no_enter commands".to_string())
             } else {
                 None
             },
-            // No marker-bounded pane capture exists yet. Raw/no-enter output is a
-            // diagnostic, while tracked commands begin queued with no output at all.
+            // No marker-bounded pane capture exists yet.
             output_truncated: true,
             reason: None,
             started_at: Instant::now(),
@@ -294,19 +287,13 @@ impl CommandTracker {
             tracking_disabled,
         };
 
-        {
-            let mut commands = self.active_commands.write().await;
-            commands.insert(command_id.clone(), execution.clone());
-        }
-        if let Some(ref secret) = secret {
-            let mut secrets = self.secrets.write().await;
-            secrets.insert(command_id.clone(), secret.clone());
-        }
-
-        self.emit(CommandEventKind::Created, &execution);
-        self.cleanup_completed().await;
-
         if tracking_disabled {
+            self.active_commands
+                .write()
+                .await
+                .insert(command_id.clone(), execution.clone());
+            self.emit(CommandEventKind::Created, &execution);
+            self.cleanup_completed().await;
             self.dispatch_keys(
                 pane_id,
                 command,
@@ -319,51 +306,64 @@ impl CommandTracker {
             return Ok(command_id);
         }
 
-        let secret = secret.expect("tracked mode always has a secret");
         let key = Self::pane_key(pane_id, resolved_socket.as_deref());
-        let launch = QueuedLaunch {
+        {
+            let mut running = self.pane_running.write().await;
+            if let Some(active_id) = running.get(&key) {
+                return Err(Error::InvalidArgument {
+                    message: format!(
+                        "pane {pane_id} is busy with tracked command {active_id}; wait for it to finish"
+                    ),
+                });
+            }
+            running.insert(key, command_id.clone());
+        }
+
+        let secret = secret.expect("tracked mode always has a secret");
+        let launch = TrackedLaunch {
             command_id: command_id.clone(),
             pane_id: pane_id.to_string(),
             command: command.to_string(),
             delay_ms,
             socket: resolved_socket.clone(),
-            secret,
+            secret: secret.clone(),
         };
 
-        let start_now = {
-            let mut running = self.pane_running.write().await;
-            match running.entry(key.clone()) {
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    let mut queues = self.pane_queues.write().await;
-                    queues.entry(key).or_default().push_back(launch.clone());
-                    false
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(command_id.clone());
-                    true
-                }
-            }
-        };
+        self.active_commands
+            .write()
+            .await
+            .insert(command_id.clone(), execution.clone());
+        self.secrets
+            .write()
+            .await
+            .insert(command_id.clone(), secret);
+        self.emit(CommandEventKind::Created, &execution);
+        self.cleanup_completed().await;
 
-        if start_now {
-            self.start_tracked_launch(launch).await?;
+        if let Err(error) = self.start_tracked_launch(launch).await {
+            release_pane(
+                &self.pane_running,
+                pane_id,
+                resolved_socket.as_deref(),
+                &command_id,
+            )
+            .await;
+            return Err(error);
         }
 
         Ok(command_id)
     }
 
-    async fn start_tracked_launch(&self, launch: QueuedLaunch) -> Result<()> {
+    async fn start_tracked_launch(&self, launch: TrackedLaunch) -> Result<()> {
         run_tracked_launch(
             Arc::clone(&self.active_commands),
             Arc::clone(&self.secrets),
-            Arc::clone(&self.pane_queues),
             Arc::clone(&self.pane_running),
             self.events.clone(),
             Arc::clone(&self.notify),
             self.tracking.clone(),
             self.shell_type,
             launch,
-            false,
         )
         .await
     }
@@ -500,12 +500,72 @@ impl CommandTracker {
         commands.get(id).cloned()
     }
 
+    /// Return the tracked command id occupying one pane.
+    pub async fn pane_command_id(&self, pane_id: &str, socket: Option<&str>) -> Option<String> {
+        let key = Self::pane_key(pane_id, socket);
+        self.pane_running.read().await.get(&key).cloned()
+    }
+
+    /// Return one pane whose tracked command ended without a reliable completion signal.
+    pub async fn uncertain_command(&self) -> Option<CommandExecution> {
+        let mut command_ids = self
+            .pane_running
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        command_ids.sort();
+        let commands = self.active_commands.read().await;
+        command_ids.into_iter().find_map(|id| {
+            commands
+                .get(&id)
+                .filter(|exec| exec.status == CommandStatus::TrackingError)
+                .cloned()
+        })
+    }
+
+    /// Release an uncertain pane after a successful human/model-visible capture.
+    pub async fn acknowledge_uncertain(&self, command_id: &str) {
+        let Some(exec) = self.get_command(command_id).await else {
+            return;
+        };
+        if exec.status == CommandStatus::TrackingError {
+            release_pane(
+                &self.pane_running,
+                &exec.pane_id,
+                exec.socket.as_deref(),
+                command_id,
+            )
+            .await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn insert_test_execution(&self, execution: CommandExecution) {
         self.active_commands
             .write()
             .await
             .insert(execution.id.clone(), execution);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_test_occupant(&self, execution: CommandExecution) {
+        let key = Self::pane_key(&execution.pane_id, execution.socket.as_deref());
+        self.pane_running
+            .write()
+            .await
+            .insert(key, execution.id.clone());
+        self.insert_test_execution(execution).await;
+    }
+
+    #[cfg(test)]
+    pub async fn insert_test_claim(&self, pane_id: &str, socket: Option<&str>, command_id: &str) {
+        let key = Self::pane_key(pane_id, socket);
+        self.pane_running
+            .write()
+            .await
+            .insert(key, command_id.to_string());
     }
 
     /// List ids currently held in the tracker map.
@@ -522,8 +582,8 @@ impl CommandTracker {
 
     /// Drop every tracked entry bound to a pane on one tmux socket.
     ///
-    /// Queue/running maps are keyed by `socket|pane_id` because pane ids are
-    /// only unique within a tmux server—do not purge other sockets' queues.
+    /// Occupancy is keyed by `socket|pane_id` because pane ids are only unique
+    /// within a tmux server.
     pub async fn purge_pane(&self, pane_id: &str, socket: Option<&str>) -> usize {
         let mut commands = self.active_commands.write().await;
         let mut secrets = self.secrets.write().await;
@@ -547,8 +607,6 @@ impl CommandTracker {
         }
         {
             let key = Self::pane_key(pane_id, socket);
-            let mut queues = self.pane_queues.write().await;
-            queues.remove(&key);
             let mut running = self.pane_running.write().await;
             running.remove(&key);
         }
@@ -565,13 +623,22 @@ impl CommandTracker {
         let pending_abandon_window = Duration::from_secs(self.tracking.tracking_deadline_seconds)
             .saturating_add(retention_window)
             .max(Duration::from_secs(1));
+        let occupied = self
+            .pane_running
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>();
 
         let mut evicted: Vec<CommandExecution> = Vec::new();
         {
             let mut commands = self.active_commands.write().await;
             let mut secrets = self.secrets.write().await;
             commands.retain(|id, exec| {
-                let keep = if !exec.status.is_terminal() {
+                let keep = if occupied.contains(id) {
+                    true
+                } else if !exec.status.is_terminal() {
                     let age = now
                         .checked_duration_since(exec.started_at)
                         .unwrap_or(Duration::ZERO);
@@ -599,6 +666,9 @@ impl CommandTracker {
                     .iter()
                     .filter_map(|(id, exec)| {
                         if !exec.status.is_terminal() {
+                            return None;
+                        }
+                        if occupied.contains(id) {
                             return None;
                         }
                         exec.completed_at
@@ -636,16 +706,14 @@ impl CommandTracker {
 async fn run_tracked_launch(
     active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
     secrets: Arc<RwLock<HashMap<String, String>>>,
-    pane_queues: Arc<RwLock<HashMap<String, VecDeque<QueuedLaunch>>>>,
     pane_running: Arc<RwLock<HashMap<String, String>>>,
     events: broadcast::Sender<CommandEvent>,
     notify: Arc<Notify>,
     tracking: TrackingConfig,
     shell_type: ShellType,
-    launch: QueuedLaunch,
-    launch_was_queued: bool,
+    launch: TrackedLaunch,
 ) -> Result<()> {
-    let QueuedLaunch {
+    let TrackedLaunch {
         command_id,
         pane_id,
         command,
@@ -689,50 +757,21 @@ async fn run_tracked_launch(
     if let Err(e) = dispatch_keys_free(&pane_id, &wrapped, delay_ms, socket.as_deref()).await {
         {
             let mut commands = active_commands.write().await;
-            if launch_was_queued {
-                if let Some(exec) = commands.get_mut(&command_id) {
-                    if !exec.status.is_terminal() {
-                        exec.status = CommandStatus::TrackingError;
-                        exec.reason = Some(format!("failed to send command to pane: {e}"));
-                        exec.completed_at = Some(Instant::now());
-                        let _ = events.send(CommandEvent {
-                            command_id: exec.id.clone(),
-                            resource_uri: command_resource_uri(&exec.id),
-                            kind: CommandEventKind::Terminal,
-                            status: exec.status,
-                        });
-                    }
-                }
-            } else {
-                commands.remove(&command_id);
-            }
+            commands.remove(&command_id);
             secrets.write().await.remove(&command_id);
         }
         notify.notify_waiters();
-        spawn_advance_queue(
-            active_commands,
-            secrets,
-            pane_queues,
-            pane_running,
-            events,
-            notify,
-            tracking,
-            shell_type,
-            pane_id,
-            socket,
-        );
+        release_pane(&pane_running, &pane_id, socket.as_deref(), &command_id).await;
         return Err(e);
     }
 
     spawn_side_channel_watcher(
         active_commands,
         secrets,
-        pane_queues,
         pane_running,
         events,
         notify,
         tracking,
-        shell_type,
         command_id,
         pane_id,
         socket,
@@ -746,12 +785,10 @@ async fn run_tracked_launch(
 fn spawn_side_channel_watcher(
     active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
     secrets: Arc<RwLock<HashMap<String, String>>>,
-    pane_queues: Arc<RwLock<HashMap<String, VecDeque<QueuedLaunch>>>>,
     pane_running: Arc<RwLock<HashMap<String, String>>>,
     events: broadcast::Sender<CommandEvent>,
     notify: Arc<Notify>,
     tracking: TrackingConfig,
-    shell_type: ShellType,
     command_id: String,
     pane_id: String,
     socket: Option<String>,
@@ -823,18 +860,9 @@ fn spawn_side_channel_watcher(
             notify.notify_waiters();
         }
 
-        spawn_advance_queue(
-            Arc::clone(&active_commands),
-            Arc::clone(&secrets),
-            pane_queues,
-            pane_running,
-            events.clone(),
-            Arc::clone(&notify),
-            tracking.clone(),
-            shell_type,
-            pane_id.clone(),
-            socket.clone(),
-        );
+        if status != CommandStatus::TrackingError {
+            release_pane(&pane_running, &pane_id, socket.as_deref(), &command_id).await;
+        }
 
         secrets.write().await.remove(&command_id);
         let cleanup_socket = socket.clone();
@@ -883,51 +911,17 @@ fn spawn_side_channel_watcher(
     });
 }
 
-/// Pop the next queued launch for a pane and spawn `run_tracked_launch` (non-async to break cycles).
-#[allow(clippy::too_many_arguments)]
-fn spawn_advance_queue(
-    active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
-    secrets: Arc<RwLock<HashMap<String, String>>>,
-    pane_queues: Arc<RwLock<HashMap<String, VecDeque<QueuedLaunch>>>>,
-    pane_running: Arc<RwLock<HashMap<String, String>>>,
-    events: broadcast::Sender<CommandEvent>,
-    notify: Arc<Notify>,
-    tracking: TrackingConfig,
-    shell_type: ShellType,
-    pane_id: String,
-    socket: Option<String>,
+async fn release_pane(
+    pane_running: &RwLock<HashMap<String, String>>,
+    pane_id: &str,
+    socket: Option<&str>,
+    command_id: &str,
 ) {
-    tokio::spawn(async move {
-        let key = CommandTracker::pane_key(&pane_id, socket.as_deref());
-        let next = {
-            let mut running = pane_running.write().await;
-            running.remove(&key);
-            let mut queues = pane_queues.write().await;
-            let next = queues.get_mut(&key).and_then(|q| q.pop_front());
-            if let Some(ref n) = next {
-                running.insert(key.clone(), n.command_id.clone());
-            }
-            if queues.get(&key).is_some_and(|q| q.is_empty()) {
-                queues.remove(&key);
-            }
-            next
-        };
-        if let Some(launch) = next {
-            let _ = run_tracked_launch(
-                active_commands,
-                secrets,
-                pane_queues,
-                pane_running,
-                events,
-                notify,
-                tracking,
-                shell_type,
-                launch,
-                true,
-            )
-            .await;
-        }
-    });
+    let key = CommandTracker::pane_key(pane_id, socket);
+    let mut running = pane_running.write().await;
+    if running.get(&key).is_some_and(|active| active == command_id) {
+        running.remove(&key);
+    }
 }
 
 async fn dispatch_keys_free(
@@ -1672,132 +1666,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_command_queues_second_on_same_pane() {
-        let mut stub = TmuxStub::new();
-        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "1");
+    async fn execute_command_rejects_second_on_same_pane() {
         let tracker = CommandTracker::new(ShellType::Bash);
-
-        let id1 = tracker
-            .execute_command("%1", "echo one", false, false, None, None)
-            .await
-            .expect("first");
-        let id2 = tracker
+        let id = "running-command".to_string();
+        tracker.insert_test_occupant(running_execution(&id)).await;
+        let error = tracker
             .execute_command("%1", "echo two", false, false, None, None)
             .await
-            .expect("second");
+            .expect_err("second command must be rejected");
 
-        let c2 = tracker.get_command(&id2).await.expect("c2");
-        assert_eq!(
-            c2.status,
-            CommandStatus::Queued,
-            "second tracked command should queue"
-        );
-        assert_eq!(c2.output, None);
-        assert_snapshot_output_incomplete(&c2);
-
-        let c1 = wait_until_terminal(&tracker, &id1).await;
-        assert!(c1.status.is_terminal());
-        let c2 = wait_until_terminal(&tracker, &id2).await;
-        assert!(c2.status.is_terminal());
+        assert!(error.to_string().contains("busy"));
+        assert!(error.to_string().contains(&id));
+        assert_eq!(tracker.get_active_ids().await, vec![id]);
     }
 
     #[tokio::test]
-    async fn terminal_state_and_queue_advance_while_presentation_capture_is_blocked() {
-        let mut stub = TmuxStub::new();
-        let capture_log = NamedTempFile::new().expect("capture log");
-        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "0.1");
-        stub.set_var("TMUX_STUB_CAPTURE_SLEEP_SECS", "2");
-        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
-
-        let tracking = TrackingConfig {
-            tracking_deadline_seconds: 1,
-            ..TrackingConfig::default()
-        };
-        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
-        let id1 = tracker
-            .execute_command("%1", "echo one", false, false, None, None)
-            .await
-            .expect("first");
-        let id2 = tracker
-            .execute_command("%1", "echo two", false, false, None, None)
-            .await
-            .expect("second");
-        assert_eq!(
-            tracker.get_command(&id2).await.expect("queued").status,
-            CommandStatus::Queued
+    async fn tracking_error_keeps_pane_busy_until_acknowledged() {
+        let tracker = CommandTracker::with_tracking(
+            ShellType::Bash,
+            TrackingConfig {
+                completed_retention_minutes: 0,
+                ..TrackingConfig::default()
+            },
         );
-
-        let mut capture_started = false;
-        for _ in 0..100 {
-            if std::fs::metadata(capture_log.path()).is_ok_and(|metadata| metadata.len() > 0) {
-                capture_started = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(capture_started, "presentation capture did not start");
-
-        let first = tokio::time::timeout(
-            Duration::from_millis(1_200),
-            wait_until_terminal(&tracker, &id1),
-        )
-        .await
-        .expect("first status blocked on capture");
-        assert_eq!(first.status, CommandStatus::Completed);
-        assert_snapshot_output_incomplete(&first);
-
-        let second = tokio::time::timeout(
-            Duration::from_millis(1_200),
-            wait_until_terminal(&tracker, &id2),
-        )
-        .await
-        .expect("pane queue blocked on first capture");
-        assert_eq!(second.status, CommandStatus::Completed);
-        assert_snapshot_output_incomplete(&second);
-
-        // Let both deliberately slow stub captures finish before restoring the environment.
-        tokio::time::sleep(Duration::from_millis(2_300)).await;
-    }
-
-    #[tokio::test]
-    async fn queued_send_failure_remains_pollable_as_tracking_error() {
-        let mut stub = TmuxStub::new();
-        stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "1");
-        let tracker = CommandTracker::new(ShellType::Bash);
-
-        let id1 = tracker
-            .execute_command("%1", "echo one", false, false, None, None)
-            .await
-            .expect("first");
-        let id2 = tracker
-            .execute_command("%1", "echo two", false, false, None, None)
-            .await
-            .expect("second");
+        let id = "uncertain-command".to_string();
+        let mut failed = running_execution(&id);
+        failed.status = CommandStatus::TrackingError;
+        failed.completed_at = Some(Instant::now());
+        tracker.insert_test_occupant(failed).await;
+        tracker.cleanup_completed().await;
         assert_eq!(
             tracker
-                .get_command(&id2)
+                .uncertain_command()
                 .await
-                .expect("queued command")
-                .status,
-            CommandStatus::Queued
+                .expect("uncertain command")
+                .id,
+            id
         );
 
-        stub.set_var("TMUX_STUB_ERROR_CMD", "send-keys");
-        let _ = wait_until_terminal(&tracker, &id1).await;
-        let failed = wait_until_terminal(&tracker, &id2).await;
+        let error = tracker
+            .execute_command("%1", "echo two", false, false, None, None)
+            .await
+            .expect_err("uncertain pane must remain busy");
+        assert!(error.to_string().contains("busy"));
 
-        assert_eq!(failed.status, CommandStatus::TrackingError);
-        assert!(failed.completed_at.is_some());
-        assert_eq!(failed.output, None);
-        assert_snapshot_output_incomplete(&failed);
-        assert!(
-            failed
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("failed to send command to pane")),
-            "unexpected failure reason: {:?}",
-            failed.reason
-        );
+        tracker.acknowledge_uncertain(&id).await;
+        assert!(tracker.uncertain_command().await.is_none());
+        assert!(tracker.pane_command_id("%1", None).await.is_none());
     }
 
     #[tokio::test]
@@ -1930,39 +1845,15 @@ mod tests {
             .execute_command("%1", "echo a", false, false, None, Some(socket_a.into()))
             .await
             .expect("execute on socket a");
-        let queued_a = tracker
-            .execute_command(
-                "%1",
-                "echo queued-a",
-                false,
-                false,
-                None,
-                Some(socket_a.into()),
-            )
-            .await
-            .expect("queue on socket a");
         let id_b = tracker
             .execute_command("%1", "echo b", false, false, None, Some(socket_b.into()))
             .await
             .expect("execute on socket b");
-        let queued_b = tracker
-            .execute_command(
-                "%1",
-                "echo queued-b",
-                false,
-                false,
-                None,
-                Some(socket_b.into()),
-            )
-            .await
-            .expect("queue on socket b");
 
-        assert_eq!(tracker.purge_pane("%1", Some(socket_a)).await, 2);
+        assert_eq!(tracker.purge_pane("%1", Some(socket_a)).await, 1);
         assert!(tracker.get_command(&id_a).await.is_none());
-        assert!(tracker.get_command(&queued_a).await.is_none());
         assert!(tracker.get_command(&id_b).await.is_some());
-        assert!(tracker.get_command(&queued_b).await.is_some());
-        assert_eq!(tracker.purge_pane("%1", Some(socket_b)).await, 2);
+        assert_eq!(tracker.purge_pane("%1", Some(socket_b)).await, 1);
     }
 
     #[tokio::test]

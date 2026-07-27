@@ -70,6 +70,12 @@ pub struct AuthorizationResponse {
     pub decision: GateDecision,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiPause {
+    pub pane_id: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionTarget {
@@ -232,6 +238,7 @@ pub struct StatePaths {
     pub directory: PathBuf,
     pub events: PathBuf,
     pub gate: PathBuf,
+    pub ai_pause: PathBuf,
     pub token: PathBuf,
 }
 
@@ -283,6 +290,17 @@ impl ControlClient {
 
     pub fn gate_mode(&self) -> GateMode {
         self.paths.gate_mode()
+    }
+
+    pub fn ai_pause(&self) -> Result<Option<AiPause>, String> {
+        self.paths
+            .ai_pause()
+            .map_err(|error| format!("AI pause state: {error}"))
+    }
+
+    pub fn pause_ai(&self, pane_id: &str) -> Result<(), String> {
+        set_ai_pause(&self.paths, pane_id)
+            .map_err(|error| format!("unable to persist AI pause: {error}"))
     }
 
     pub async fn record(&self, record: &ActionRecord) -> Result<(), String> {
@@ -427,6 +445,7 @@ impl StatePaths {
         Self {
             events: directory.join("events.jsonl"),
             gate: directory.join("gate.enabled"),
+            ai_pause: directory.join("ai-paused.json"),
             token: directory.join("control.token"),
             directory,
         }
@@ -444,6 +463,34 @@ impl StatePaths {
             Err(_) => GateMode::Approval,
         }
     }
+
+    pub fn ai_pause(&self) -> io::Result<Option<AiPause>> {
+        match fs::read_to_string(&self.ai_pause) {
+            Ok(value) => serde_json::from_str(&value)
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub fn set_ai_pause(paths: &StatePaths, pane_id: &str) -> io::Result<()> {
+    fs::create_dir_all(&paths.directory)?;
+    let value = serde_json::to_vec(&AiPause {
+        pane_id: pane_id.to_string(),
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(&paths.ai_pause, value)
+}
+
+pub fn clear_ai_pause(paths: &StatePaths) -> io::Result<()> {
+    if let Err(error) = fs::remove_file(&paths.ai_pause) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 pub fn set_gate_mode(paths: &StatePaths, mode: GateMode) -> io::Result<()> {

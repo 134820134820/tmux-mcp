@@ -109,7 +109,7 @@ impl Annotated {
 }
 
 use crate::commands::{CommandEventKind, CommandTracker};
-use crate::control::{ActionRecord, ControlClient, GateDecision, GateMode};
+use crate::control::{ActionRecord, AiPause, ControlClient, GateDecision, GateMode};
 use crate::security::{SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
@@ -144,6 +144,8 @@ pub struct TmuxMcpServer {
     search: SearchConfig,
     router: ToolRouter<Self>,
     control: Option<ControlClient>,
+    /// In-memory fallback used when this MCP process has no web control client.
+    ai_pause: Arc<RwLock<Option<AiPause>>>,
     /// Connected MCP peer used for resource list/updated notifications.
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
     /// Resource URIs currently subscribed by the client.
@@ -271,7 +273,7 @@ pub struct ExecuteCommandOutput {
     pub command_id: String,
     /// `tmux://command/{id}/result` URI for resources/subscribe.
     pub resource_uri: String,
-    /// Initial lifecycle status wire string (`queued` or `running`).
+    /// Initial lifecycle status wire string (`running`).
     pub status: String,
     /// Human-readable accept note (not the command's shell output).
     pub message: String,
@@ -642,9 +644,9 @@ pub struct SplitPaneInput {
     pub socket: Option<String>,
 }
 
-/// `execute-command`: tracked shell work or raw key injection into a pane.
+/// `execute-command`: tracked shell work in a pane.
 ///
-/// Tracked mode (default) queues per pane, wraps with a private exit-code side
+/// Wraps with a private exit-code side
 /// channel, and rejects unquoted `#`, `&`, and embedded newlines. Prefer
 /// resources/subscribe on the returned URI over tight poll loops.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -654,11 +656,17 @@ pub struct ExecuteCommandInput {
     pub pane_id: String,
     /// Shell text to inject. Tracked mode forbids unquoted `#`, `&`, and newlines.
     pub command: String,
-    /// Skip side-channel tracking wrappers (raw send; no authoritative exit code).
+    /// Internal compatibility field; MCP clients always use tracked mode.
+    #[schemars(skip)]
+    #[serde(default, skip_deserializing)]
     #[serde(rename = "rawMode")]
+    #[allow(dead_code)]
     pub raw_mode: Option<bool>,
-    /// Omit the trailing Enter; also disables tracking.
+    /// Internal compatibility field; MCP clients always send Enter.
+    #[schemars(skip)]
+    #[serde(default, skip_deserializing)]
     #[serde(rename = "noEnter")]
+    #[allow(dead_code)]
     pub no_enter: Option<bool>,
     /// Per-character send delay in milliseconds (slow typing).
     #[serde(rename = "delayMs")]
@@ -1005,6 +1013,9 @@ pub struct SendKeysInput {
     /// Delay between key transmissions in milliseconds.
     #[serde(rename = "delayMs")]
     pub delay_ms: Option<u64>,
+    /// Required when this pane has a running tracked command.
+    #[serde(rename = "forCommandId")]
+    pub for_command_id: Option<String>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -1018,6 +1029,9 @@ pub struct SendHexInput {
     pub pane_id: String,
     /// Whitespace-separated hex byte tokens (`00`-`ff`), e.g. CSI-u sequences.
     pub hex: String,
+    /// Required when this pane has a running tracked command.
+    #[serde(rename = "forCommandId")]
+    pub for_command_id: Option<String>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -1031,6 +1045,23 @@ pub struct PasteTextInput {
     pub pane_id: String,
     /// UTF-8 text staged through a temporary paste buffer then pasted.
     pub content: String,
+    /// Required when this pane has a running tracked command.
+    #[serde(rename = "forCommandId")]
+    pub for_command_id: Option<String>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// Special-key input optionally bound to the pane's current tracked command.
+#[cfg(feature = "special-keys")]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SpecialKeyInput {
+    /// Pane target id (`%N`).
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Required when this pane has a running tracked command; `send-cancel` is exempt.
+    #[serde(rename = "forCommandId")]
+    pub for_command_id: Option<String>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -1179,6 +1210,7 @@ impl TmuxMcpServer {
             search,
             router,
             control,
+            ai_pause: Arc::new(RwLock::new(None)),
             peer,
             subscriptions,
         }
@@ -1210,6 +1242,103 @@ impl TmuxMcpServer {
             .and_then(|tool| tool.annotations.as_ref())
             .and_then(|annotations| annotations.read_only_hint)
             .unwrap_or(false)
+    }
+
+    async fn current_ai_pause(&self) -> Result<Option<AiPause>, String> {
+        if let Some(pause) = self.ai_pause.read().await.clone() {
+            return Ok(Some(pause));
+        }
+        match &self.control {
+            Some(control) => control.ai_pause(),
+            None => Ok(None),
+        }
+    }
+
+    async fn pause_ai(&self, pane_id: &str) {
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|control| control.pause_ai(pane_id).is_ok())
+        {
+            return;
+        }
+        *self.ai_pause.write().await = Some(AiPause {
+            pane_id: pane_id.to_string(),
+        });
+    }
+
+    async fn safety_preflight(&self) -> Option<CallToolResult> {
+        match self.current_ai_pause().await {
+            Ok(Some(pause)) => {
+                return Some(CallToolResult::error(vec![Content::text(format!(
+                    "AI 操作已暂停\n原因：无法确认 pane {} 的状态",
+                    pause.pane_id
+                ))]));
+            }
+            Err(error) => {
+                return Some(CallToolResult::error(vec![Content::text(format!(
+                    "AI 操作已暂停\n原因：无法读取暂停状态：{error}"
+                ))]));
+            }
+            Ok(None) => {}
+        }
+
+        let uncertain = self.tracker.uncertain_command().await?;
+        match tmux::capture_pane(
+            &uncertain.pane_id,
+            Some(200),
+            false,
+            None,
+            None,
+            true,
+            uncertain.socket.as_deref(),
+        )
+        .await
+        {
+            Ok(content) => {
+                self.tracker.acknowledge_uncertain(&uncertain.id).await;
+                Some(CallToolResult::error(vec![Content::text(format!(
+                    "The previous command {} in pane {} has an uncertain tracking state. \
+                     The requested operation was not executed.\n\ncapture-pane:\n{}\n\n\
+                     Review this pane before sending another request, especially a modifying command.",
+                    uncertain.id, uncertain.pane_id, content
+                ))]))
+            }
+            Err(_) => {
+                self.pause_ai(&uncertain.pane_id).await;
+                Some(CallToolResult::error(vec![Content::text(format!(
+                    "AI 操作已暂停\n原因：无法确认 pane {} 的状态",
+                    uncertain.pane_id
+                ))]))
+            }
+        }
+    }
+
+    async fn validate_command_input(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+        for_command_id: Option<&str>,
+        allow_cancel: bool,
+    ) -> Result<(), CallToolResult> {
+        let Some(command_id) = self.tracker.pane_command_id(pane_id, socket).await else {
+            if let Some(command_id) = for_command_id {
+                return Err(CallToolResult::error(vec![Content::text(format!(
+                    "pane {pane_id} has no active tracked command; {command_id} is stale"
+                ))]));
+            }
+            return Ok(());
+        };
+        if allow_cancel {
+            return Ok(());
+        }
+        if for_command_id.is_some_and(|id| id == command_id) {
+            return Ok(());
+        }
+        Err(CallToolResult::error(vec![Content::text(format!(
+            "pane {pane_id} is occupied by tracked command {}; set forCommandId to that exact id before sending input",
+            command_id
+        ))]))
     }
 
     fn preferred_tool_for_command(command: &str) -> Option<&'static str> {
@@ -2807,7 +2936,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "execute-command",
-        description = "Run a shell command in a pane with side-channel exit-code tracking. Returns JSON: {commandId, resourceUri, status, message}. Prefer resources/subscribe on resourceUri then resources/read on notifications/resources/updated; fallback: get-command-result with waitMs. Tracked commands queue per pane. For interactive programs (vim/htop), use send-keys instead.",
+        description = "Run one tracked shell command in a pane with side-channel exit-code tracking. Returns JSON: {commandId, resourceUri, status, message}. Prefer resources/subscribe on resourceUri then resources/read on notifications/resources/updated; fallback: get-command-result with waitMs. A second command for the same busy pane is rejected. For interactive programs (vim/htop), use send-keys instead.",
         annotations(open_world_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<ExecuteCommandOutput>()
     )]
@@ -2831,12 +2960,6 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        let raw_mode = input.0.raw_mode.unwrap_or(false);
-        if raw_mode {
-            if let Err(e) = self.policy.check_raw_mode() {
-                return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
-            }
-        }
         if let Err(e) = self.policy.check_command(&input.0.command) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
@@ -2845,8 +2968,8 @@ impl TmuxMcpServer {
             .execute_command(
                 &input.0.pane_id,
                 &input.0.command,
-                raw_mode,
-                input.0.no_enter.unwrap_or(false),
+                false,
+                false,
                 input.0.delay_ms,
                 socket.clone(),
             )
@@ -3607,6 +3730,17 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(result) = self
+            .validate_command_input(
+                &input.0.pane_id,
+                socket.as_deref(),
+                input.0.for_command_id.as_deref(),
+                false,
+            )
+            .await
+        {
+            return Ok(result);
+        }
         let literal = input.0.literal.unwrap_or(false);
         if let Err(e) = self.policy.check_command(&input.0.keys) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
@@ -3686,6 +3820,17 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(result) = self
+            .validate_command_input(
+                &input.0.pane_id,
+                socket.as_deref(),
+                input.0.for_command_id.as_deref(),
+                false,
+            )
+            .await
+        {
+            return Ok(result);
+        }
         let tokens = match tmux::parse_hex_tokens(&input.0.hex) {
             Ok(t) => t,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))])),
@@ -3744,6 +3889,17 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(result) = self
+            .validate_command_input(
+                &input.0.pane_id,
+                socket.as_deref(),
+                input.0.for_command_id.as_deref(),
+                false,
+            )
+            .await
+        {
+            return Ok(result);
+        }
         if let Err(e) = self.policy.check_command(&input.0.content) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
@@ -3769,15 +3925,10 @@ impl TmuxMcpServer {
     )]
     async fn send_cancel(
         &self,
-        input: Parameters<PaneIdInput>,
+        input: Parameters<SpecialKeyInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "C-c",
-            "send-cancel",
-            input.0.socket.as_deref(),
-        )
-        .await
+        self.send_special_key(&input.0, "C-c", "send-cancel", true)
+            .await
     }
 
     #[tool(
@@ -3785,14 +3936,12 @@ impl TmuxMcpServer {
         description = "Send Ctrl+D (EOF) to a pane. Use to end input streams or exit a shell when a prompt is waiting for EOF.",
         annotations(open_world_hint = true)
     )]
-    async fn send_eof(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "C-d",
-            "send-eof",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_eof(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "C-d", "send-eof", false)
+            .await
     }
 
     #[tool(
@@ -3802,15 +3951,10 @@ impl TmuxMcpServer {
     )]
     async fn send_escape(
         &self,
-        input: Parameters<PaneIdInput>,
+        input: Parameters<SpecialKeyInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Escape",
-            "send-escape",
-            input.0.socket.as_deref(),
-        )
-        .await
+        self.send_special_key(&input.0, "Escape", "send-escape", false)
+            .await
     }
 
     #[tool(
@@ -3818,14 +3962,12 @@ impl TmuxMcpServer {
         description = "Send Enter key to a pane. Use to confirm prompts after send-keys in interactive flows; for commands prefer execute-command.",
         annotations(open_world_hint = true)
     )]
-    async fn send_enter(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Enter",
-            "send-enter",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_enter(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Enter", "send-enter", false)
+            .await
     }
 
     #[tool(
@@ -3833,14 +3975,12 @@ impl TmuxMcpServer {
         description = "Send Tab key to a pane. Use for shell completion or field navigation when automating prompts or TUIs.",
         annotations(open_world_hint = true)
     )]
-    async fn send_tab(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Tab",
-            "send-tab",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_tab(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Tab", "send-tab", false)
+            .await
     }
 
     #[tool(
@@ -3850,15 +3990,10 @@ impl TmuxMcpServer {
     )]
     async fn send_backspace(
         &self,
-        input: Parameters<PaneIdInput>,
+        input: Parameters<SpecialKeyInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "BSpace",
-            "send-backspace",
-            input.0.socket.as_deref(),
-        )
-        .await
+        self.send_special_key(&input.0, "BSpace", "send-backspace", false)
+            .await
     }
 
     #[tool(
@@ -3866,8 +4001,11 @@ impl TmuxMcpServer {
         description = "Send Up arrow to a pane. Use for shell history recall or menu navigation in interactive programs.",
         annotations(open_world_hint = true)
     )]
-    async fn send_up(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(&input.0.pane_id, "Up", "send-up", input.0.socket.as_deref())
+    async fn send_up(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Up", "send-up", false)
             .await
     }
 
@@ -3876,14 +4014,12 @@ impl TmuxMcpServer {
         description = "Send Down arrow to a pane. Use for shell history navigation or menu movement in interactive programs.",
         annotations(open_world_hint = true)
     )]
-    async fn send_down(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Down",
-            "send-down",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_down(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Down", "send-down", false)
+            .await
     }
 
     #[tool(
@@ -3891,14 +4027,12 @@ impl TmuxMcpServer {
         description = "Send Left arrow to a pane. Use for cursor movement while editing input in shells or TUIs.",
         annotations(open_world_hint = true)
     )]
-    async fn send_left(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Left",
-            "send-left",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_left(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Left", "send-left", false)
+            .await
     }
 
     #[tool(
@@ -3906,14 +4040,12 @@ impl TmuxMcpServer {
         description = "Send Right arrow to a pane. Use for cursor movement while editing input in shells or TUIs.",
         annotations(open_world_hint = true)
     )]
-    async fn send_right(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Right",
-            "send-right",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_right(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Right", "send-right", false)
+            .await
     }
 
     #[tool(
@@ -3923,15 +4055,10 @@ impl TmuxMcpServer {
     )]
     async fn send_page_up(
         &self,
-        input: Parameters<PaneIdInput>,
+        input: Parameters<SpecialKeyInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "PPage",
-            "send-page-up",
-            input.0.socket.as_deref(),
-        )
-        .await
+        self.send_special_key(&input.0, "PPage", "send-page-up", false)
+            .await
     }
 
     #[tool(
@@ -3941,15 +4068,10 @@ impl TmuxMcpServer {
     )]
     async fn send_page_down(
         &self,
-        input: Parameters<PaneIdInput>,
+        input: Parameters<SpecialKeyInput>,
     ) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "NPage",
-            "send-page-down",
-            input.0.socket.as_deref(),
-        )
-        .await
+        self.send_special_key(&input.0, "NPage", "send-page-down", false)
+            .await
     }
 
     #[tool(
@@ -3957,14 +4079,12 @@ impl TmuxMcpServer {
         description = "Send Home key to a pane. Use to jump to start of line or top of a view while driving interactive apps.",
         annotations(open_world_hint = true)
     )]
-    async fn send_home(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "Home",
-            "send-home",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_home(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "Home", "send-home", false)
+            .await
     }
 
     #[tool(
@@ -3972,14 +4092,12 @@ impl TmuxMcpServer {
         description = "Send End key to a pane. Use to jump to end of line or bottom of a view while driving interactive apps.",
         annotations(open_world_hint = true)
     )]
-    async fn send_end(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
-        self.send_special_key(
-            &input.0.pane_id,
-            "End",
-            "send-end",
-            input.0.socket.as_deref(),
-        )
-        .await
+    async fn send_end(
+        &self,
+        input: Parameters<SpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        self.send_special_key(&input.0, "End", "send-end", false)
+            .await
     }
 }
 
@@ -3987,30 +4105,42 @@ impl TmuxMcpServer {
 impl TmuxMcpServer {
     async fn send_special_key(
         &self,
-        pane_id: &str,
+        input: &SpecialKeyInput,
         key: &str,
         tool_name: &str,
-        socket: Option<&str>,
+        allow_cancel: bool,
     ) -> Result<CallToolResult, McpError> {
         if let Err(e) = self.policy.check_tool(tool_name) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        let socket = tmux::resolve_socket(socket);
+        let socket = tmux::resolve_socket(input.socket.as_deref());
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        if let Err(e) = self.policy.check_pane(pane_id) {
+        if let Err(e) = self.policy.check_pane(&input.pane_id) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self
-            .enforce_session_for_pane(pane_id, socket.as_deref())
+            .enforce_session_for_pane(&input.pane_id, socket.as_deref())
             .await
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        match tmux::send_keys(pane_id, key, false, socket.as_deref()).await {
+        if let Err(result) = self
+            .validate_command_input(
+                &input.pane_id,
+                socket.as_deref(),
+                input.for_command_id.as_deref(),
+                allow_cancel,
+            )
+            .await
+        {
+            return Ok(result);
+        }
+        match tmux::send_keys(&input.pane_id, key, false, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "{key} sent to pane {pane_id}"
+                "{key} sent to pane {}",
+                input.pane_id
             ))])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error sending {key}: {e}"
@@ -4030,6 +4160,9 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        if let Some(result) = self.safety_preflight().await {
+            return Ok(result);
+        }
         let mut action: Option<ActionRecord> = None;
         if let Some(control) = &self.control {
             let read_only = self.tool_is_read_only(&request.name);
@@ -4141,7 +4274,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 .build(),
         )
         .with_instructions(
-            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory, find-files, read-file, search-text, and the bounded git-status/git-diff/git-log/git-show tools for inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. Tracked commands queue one-at-a-time per pane; interactive send-keys during a tracked run is unsafe. Completion is side-channel based—do not trust DONE lines in pane text.",
+            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory, find-files, read-file, search-text, and the bounded git-status/git-diff/git-log/git-show tools for inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. A busy pane rejects another tracked command. Interactive AI input to a running command must include its commandId; send-cancel is exempt. Completion is side-channel based—do not trust DONE lines in pane text.",
         )
     }
 
@@ -4894,7 +5027,8 @@ impl rmcp::ServerHandler for TmuxMcpServer {
 mod tests {
     use super::*;
     use crate::control::{
-        load_or_create_token, set_gate_mode, ControlClient, GateDecision, GateMode, StatePaths,
+        load_or_create_token, set_ai_pause, set_gate_mode, ControlClient, GateDecision, GateMode,
+        StatePaths,
     };
     use crate::test_support::TmuxStub;
     use crate::web::{build_router, HubState};
@@ -5227,6 +5361,33 @@ mod tests {
         assert_eq!(records[0].tool, "socket-for-path");
         assert!(records[0].read_only);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn persisted_ai_pause_rejects_even_read_only_tools_before_gate() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        set_ai_pause(&paths, "%2").expect("pause AI");
+        let control =
+            ControlClient::new("http://127.0.0.1:9", "Codex", paths).expect("control client");
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(control),
+        );
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let result = server
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("socket-for-path"),
+                context,
+            )
+            .await
+            .expect("tool result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("AI 操作已暂停"));
+        assert!(first_text(&result).contains("pane %2"));
     }
 
     #[tokio::test]
@@ -5808,25 +5969,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_command_raw_mode_denied() {
+    async fn execute_command_schema_hides_tracking_bypass_fields() {
         let server = server_with_policy("[security]\nallow_raw_mode = false\n");
-        let input = Parameters(ExecuteCommandInput {
-            pane_id: "%1".into(),
-            command: "echo hi".into(),
-            raw_mode: Some(true),
-            no_enter: None,
-            delay_ms: None,
-            socket: None,
-            wait_ms: None,
-        });
+        let schema = &server
+            .router
+            .get("execute-command")
+            .expect("execute-command route")
+            .input_schema;
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("input properties");
+        assert!(!properties.contains_key("rawMode"));
+        assert!(!properties.contains_key("noEnter"));
+    }
 
-        let result = server
-            .execute_command(input)
+    #[tokio::test]
+    async fn tracked_pane_input_requires_matching_command_id_except_cancel() {
+        let server = server_default();
+        let now = Instant::now();
+        server
+            .tracker
+            .insert_test_occupant(CommandExecution {
+                id: "command-1".into(),
+                pane_id: "%1".into(),
+                socket: None,
+                command: "interactive".into(),
+                status: CommandStatus::Running,
+                exit_code: None,
+                output: None,
+                output_truncated: true,
+                reason: None,
+                started_at: now,
+                completed_at: None,
+                raw_mode: false,
+                tracking_disabled: false,
+            })
+            .await;
+
+        assert!(server
+            .validate_command_input("%1", None, None, false)
             .await
-            .expect("execute command");
+            .is_err());
+        assert!(server
+            .validate_command_input("%1", None, Some("wrong"), false)
+            .await
+            .is_err());
+        assert!(server
+            .validate_command_input("%1", None, Some("command-1"), false)
+            .await
+            .is_ok());
+        assert!(server
+            .validate_command_input("%1", None, None, true)
+            .await
+            .is_ok());
 
-        assert_eq!(result.is_error, Some(true));
-        assert!(first_text(&result).contains("raw mode"));
+        server
+            .tracker
+            .insert_test_claim("%2", None, "command-starting")
+            .await;
+        assert!(server
+            .validate_command_input("%2", None, None, false)
+            .await
+            .is_err());
+        assert!(server
+            .validate_command_input("%2", None, Some("command-starting"), false)
+            .await
+            .is_ok());
     }
 
     #[cfg(feature = "interactive")]
@@ -5840,6 +6049,7 @@ mod tests {
             enter: None,
             repeat: None,
             delay_ms: None,
+            for_command_id: None,
             socket: None,
         });
 
@@ -5856,6 +6066,7 @@ mod tests {
         let input = Parameters(SendHexInput {
             pane_id: "%1".into(),
             hex: "1b 5b 31 33 3b 32 75".into(),
+            for_command_id: None,
             socket: None,
         });
 
@@ -5872,6 +6083,7 @@ mod tests {
         let input = Parameters(SendHexInput {
             pane_id: "%1".into(),
             hex: "1b zz".into(),
+            for_command_id: None,
             socket: None,
         });
 
@@ -5889,6 +6101,7 @@ mod tests {
             pane_id: "%1".into(),
             // rx\b m -rf / would become rm -rf / after backspace
             hex: "72 78 08 6d 20 2d 72 66 20 2f 0d".into(),
+            for_command_id: None,
             socket: None,
         });
 
@@ -5902,8 +6115,9 @@ mod tests {
     #[tokio::test]
     async fn send_cancel_denied_by_policy() {
         let server = server_with_policy("[security]\nallow_send_keys = false\n");
-        let input = Parameters(PaneIdInput {
+        let input = Parameters(SpecialKeyInput {
             pane_id: "%1".into(),
+            for_command_id: None,
             socket: None,
         });
 
@@ -6666,6 +6880,7 @@ mod tests {
                 enter: None,
                 repeat: None,
                 delay_ms: None,
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -6673,8 +6888,9 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
 
         let result = server
-            .send_cancel(Parameters(PaneIdInput {
+            .send_cancel(Parameters(SpecialKeyInput {
                 pane_id: "%1".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7147,6 +7363,7 @@ mod tests {
                 enter: None,
                 repeat: None,
                 delay_ms: None,
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7169,6 +7386,7 @@ mod tests {
                 enter: Some(true),
                 repeat: None,
                 delay_ms: None,
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7194,6 +7412,7 @@ mod tests {
                 enter: Some(true),
                 repeat: None,
                 delay_ms: None,
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7218,6 +7437,7 @@ mod tests {
                 enter: None,
                 repeat: None,
                 delay_ms: Some(1),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7232,6 +7452,7 @@ mod tests {
                 enter: None,
                 repeat: None,
                 delay_ms: Some(1),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7246,6 +7467,7 @@ mod tests {
                 enter: None,
                 repeat: None,
                 delay_ms: None,
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7262,8 +7484,9 @@ mod tests {
         let server = server_default();
 
         let result = server
-            .send_cancel(Parameters(PaneIdInput {
+            .send_cancel(Parameters(SpecialKeyInput {
                 pane_id: "%1".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -7948,6 +8171,7 @@ mod tests {
             enter: None,
             repeat: Some(2),
             delay_ms: Some(0),
+            for_command_id: None,
             socket: None,
         });
         let result = server.send_keys(literal).await.expect("send keys");
@@ -7960,6 +8184,7 @@ mod tests {
             enter: None,
             repeat: Some(1),
             delay_ms: Some(0),
+            for_command_id: None,
             socket: None,
         });
         let result = server.send_keys(delayed).await.expect("send keys");
@@ -7972,6 +8197,7 @@ mod tests {
             enter: None,
             repeat: None,
             delay_ms: None,
+            for_command_id: None,
             socket: None,
         });
         let result = server.send_keys(immediate).await.expect("send keys");
@@ -7994,6 +8220,7 @@ mod tests {
                 enter: Some(true),
                 repeat: None,
                 delay_ms: None,
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -8019,6 +8246,7 @@ mod tests {
             .paste_text(Parameters(PasteTextInput {
                 pane_id: "%1".into(),
                 content: "hello".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -8036,6 +8264,7 @@ mod tests {
             .paste_text(Parameters(PasteTextInput {
                 pane_id: "%1".into(),
                 content: "blocked".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -8053,6 +8282,7 @@ mod tests {
             .paste_text(Parameters(PasteTextInput {
                 pane_id: "%1".into(),
                 content: "echo ok\nrm -rf /".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -8069,6 +8299,7 @@ mod tests {
             .paste_text(Parameters(PasteTextInput {
                 pane_id: "%1".into(),
                 content: "line1\nline2\n".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -8089,6 +8320,7 @@ mod tests {
             .paste_text(Parameters(PasteTextInput {
                 pane_id: "%1".into(),
                 content: "line1\nline2\n".into(),
+                for_command_id: None,
                 socket: None,
             }))
             .await
@@ -8118,8 +8350,9 @@ mod tests {
         let server = server_default();
         let pane_id = "%1".to_string();
         let pane = || {
-            Parameters(PaneIdInput {
+            Parameters(SpecialKeyInput {
                 pane_id: pane_id.clone(),
+                for_command_id: None,
                 socket: None,
             })
         };
@@ -8246,7 +8479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_command_raw_mode_pending() {
+    async fn execute_command_internal_raw_field_still_uses_tracking() {
         let _stub = TmuxStub::new();
         let server = server_default();
         let input = Parameters(ExecuteCommandInput {
@@ -8270,14 +8503,14 @@ mod tests {
             .get_command_result(Parameters(GetCommandResultInput {
                 command_id: command_id.to_string(),
                 socket: None,
-                wait_ms: None,
+                wait_ms: Some(5_000),
             }))
             .await
             .expect("get command result");
 
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
-        assert_eq!(payload["status"], "running");
-        assert!(payload.get("output").is_some());
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["exitCode"], 0);
     }
 
     #[tokio::test]

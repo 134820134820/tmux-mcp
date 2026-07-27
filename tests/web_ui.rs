@@ -411,3 +411,17 @@ fn page_uses_the_light_theme_contract() {
     assert!(PAGE.contains("background: #ececf1"));
     assert!(!PAGE.contains("--bg: #0b0d10"));
 }
+
+#[test]
+fn ai_pause_is_an_inline_composer_banner_with_a_clear_action() {
+    for marker in [
+        r#"id="ai-pause-banner""#,
+        "AI 操作已暂停",
+        "无法确认 pane",
+        "恢复 AI 操作",
+        r#"api("/api/ai-pause/clear""#,
+        "renderAiPause(state.aiPause)",
+    ] {
+        assert!(PAGE.contains(marker), "missing AI pause marker: {marker}");
+    }
+}

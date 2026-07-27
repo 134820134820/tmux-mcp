@@ -642,6 +642,29 @@
       }
 
       .error-bar.visible { display: block; }
+
+      .ai-pause-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 12px 14px;
+        border: 1px solid #f0b8b8;
+        border-radius: 14px;
+        color: #991b1b;
+        background: #fff7f7;
+        white-space: pre-line;
+      }
+
+      .ai-pause-banner button {
+        flex: none;
+        border: 0;
+        border-radius: 999px;
+        padding: 8px 14px;
+        color: white;
+        background: #b91c1c;
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -694,6 +717,10 @@
             <code id="messages-cwd-path"></code>
           </div>
           <div class="composer-stack">
+            <section id="ai-pause-banner" class="ai-pause-banner" role="alert" hidden>
+              <span id="ai-pause-text"></span>
+              <button id="ai-pause-clear" type="button">恢复 AI 操作</button>
+            </section>
             <section
               id="approval-dialog"
               class="approval-popover"
@@ -774,6 +801,9 @@
         commandInput: byId("command-input"),
         commandSend: byId("command-send"),
         terminal: byId("terminal-snapshot"),
+        aiPauseBanner: byId("ai-pause-banner"),
+        aiPauseText: byId("ai-pause-text"),
+        aiPauseClear: byId("ai-pause-clear"),
         gateModes: byId("gate-modes"),
         gateButtons: [...document.querySelectorAll("[data-gate-mode]")],
         connectionDot: byId("connection-dot"),
@@ -863,6 +893,13 @@
           button.classList.toggle("active", active);
           button.setAttribute("aria-pressed", String(active));
         }
+      }
+
+      function renderAiPause(pause) {
+        elements.aiPauseBanner.hidden = !pause;
+        elements.aiPauseText.textContent = pause
+          ? `AI 操作已暂停\n原因：无法确认 pane ${pause.paneId} 的状态`
+          : "";
       }
 
       function flattenPanes(topology) {
@@ -1357,6 +1394,7 @@
           const selectionChanged = choosePane(panes);
           updateActivity(state.activity);
           renderTopology(state.topology);
+          renderAiPause(state.aiPause);
           renderGateMode(state.gateMode || (state.gateEnabled ? "approval" : "off"));
           renderOperations();
           renderApproval(state.pending);
@@ -1479,6 +1517,18 @@
           }
         });
       }
+
+      elements.aiPauseClear.addEventListener("click", async () => {
+        elements.aiPauseClear.disabled = true;
+        try {
+          await api("/api/ai-pause/clear", { method: "PUT", body: {} });
+          await refreshState();
+        } catch (error) {
+          showError(error.message);
+        } finally {
+          elements.aiPauseClear.disabled = false;
+        }
+      });
 
       async function decideApproval(approved) {
         const id = elements.approval.dataset.requestId;
