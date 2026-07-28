@@ -421,6 +421,7 @@ fn ai_pause_is_an_inline_composer_banner_with_a_clear_action() {
         "恢复 AI 操作",
         r#"api("/api/ai-pause/clear""#,
         "renderAiPause(state.aiPause)",
+        ".ai-pause-banner[hidden] { display: none; }",
     ] {
         assert!(PAGE.contains(marker), "missing AI pause marker: {marker}");
     }
