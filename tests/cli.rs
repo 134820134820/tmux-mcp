@@ -50,6 +50,8 @@ fn cli_help_lists_web_control_options() {
     assert!(stdout.contains("--web-bind"));
     assert!(stdout.contains("--web-url"));
     assert!(stdout.contains("--client-name"));
+    assert!(stdout.contains("--claude-channel"));
+    assert!(stdout.contains("--full-tools"));
 }
 
 #[test]

@@ -10,6 +10,8 @@ pub mod commands;
 pub mod control;
 /// Domain errors and the crate-wide `Result` alias.
 pub mod errors;
+/// Conversation-scoped GPU idle watcher.
+pub mod gpu_monitor;
 /// Security policy: tool surface, allowlists, command filters, buffer path sandbox.
 pub mod security;
 /// Local/SSH tmux process adapter, parsers, and buffer search.

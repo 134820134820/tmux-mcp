@@ -35,11 +35,26 @@ fn action_record_classifies_tools_and_extracts_exact_targets() {
 
 #[test]
 fn input_and_operation_tools_have_distinct_kinds() {
-    let input = ActionRecord::new("Claude", "send-enter", json!({"paneId": "%9"}));
+    let input = ActionRecord::new(
+        "Claude",
+        "press-special-key",
+        json!({"paneId": "%9", "key": "enter"}),
+    );
     let operation = ActionRecord::new("Claude", "split-pane", json!({"paneId": "%9"}));
 
     assert_eq!(input.kind, ActionKind::Input);
     assert_eq!(operation.kind, ActionKind::Operation);
+}
+
+#[test]
+fn consolidated_target_id_is_classified_by_tmux_prefix() {
+    let session = ActionRecord::new("Claude", "kill-target", json!({"targetId": "$1"}));
+    let window = ActionRecord::new("Claude", "rename-target", json!({"targetId": "@2"}));
+    let pane = ActionRecord::new("Claude", "rename-target", json!({"targetId": "%3"}));
+
+    assert_eq!(session.target.session_id.as_deref(), Some("$1"));
+    assert_eq!(window.target.window_id.as_deref(), Some("@2"));
+    assert_eq!(pane.target.pane_ids, ["%3"]);
 }
 
 #[test]
