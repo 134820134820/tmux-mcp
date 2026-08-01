@@ -7,6 +7,7 @@
 mod commands;
 mod control;
 mod errors;
+mod gpu_monitor;
 mod security;
 mod server;
 #[cfg(test)]
@@ -69,6 +70,14 @@ struct Cli {
     /// Source name shown in the web control center (defaults to `mcp-<pid>`).
     #[arg(long)]
     client_name: Option<String>,
+
+    /// Enable conversation-scoped Claude Channel notifications and GPU watch tools.
+    #[arg(long)]
+    claude_channel: bool,
+
+    /// Expose advanced administrative tools; the default MCP surface is agent-core.
+    #[arg(long)]
+    full_tools: bool,
 }
 
 /// Map CLI/`config.toml` shell names to the tracker dialect (case-insensitive).
@@ -288,7 +297,15 @@ async fn main() {
         }
         None => None,
     };
-    let server = TmuxMcpServer::new_with_control(tracker, security_policy, search_config, control);
+    let server = TmuxMcpServer::new_with_control_channel_and_exposure(
+        tracker,
+        security_policy,
+        search_config,
+        control,
+        cli.claude_channel,
+        cli.full_tools,
+    );
+    let gpu_monitor = server.gpu_monitor();
 
     tracing::info!("Starting tmux-mcp-rs server with stdio transport");
 
@@ -299,20 +316,19 @@ async fn main() {
             let cancel_token = service.cancellation_token();
             let mut wait = Box::pin(service.waiting());
 
-            tokio::select! {
+            let server_error = tokio::select! {
                 result = &mut wait => {
-                    if let Err(e) = result {
-                        eprintln!("Server error: {e}");
-                        std::process::exit(1);
-                    }
+                    result.err()
                 }
                 _ = shutdown_signal() => {
                     cancel_token.cancel();
-                    if let Err(e) = wait.await {
-                        eprintln!("Server error: {e}");
-                        std::process::exit(1);
-                    }
+                    wait.await.err()
                 }
+            };
+            gpu_monitor.shutdown().await;
+            if let Some(error) = server_error {
+                eprintln!("Server error: {error}");
+                std::process::exit(1);
             }
         }
         Err(e) => {

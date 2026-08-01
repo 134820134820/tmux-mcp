@@ -263,7 +263,7 @@ pub fn ssh_enabled() -> Result<bool> {
     Ok(get_ssh_args()?.is_some())
 }
 
-fn quote_remote_arg(arg: &str) -> String {
+pub(crate) fn quote_remote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
     }
@@ -286,6 +286,19 @@ fn quote_remote_arg(arg: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+/// Build one foreground SSH process for a fixed remote command.
+pub(crate) fn build_ssh_remote_process(remote_command: String) -> Result<Command> {
+    let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
+        message: "GPU monitoring requires --ssh or TMUX_MCP_SSH".to_string(),
+    })?;
+    ssh_args.insert(0, "-T".to_string());
+    ssh_args.insert(0, "-n".to_string());
+    ssh_args.push(remote_command);
+    let mut command = Command::new("ssh");
+    command.args(ssh_args);
+    Ok(command)
 }
 
 fn build_remote_tmux_command(socket_args: &[String], args: &[&str]) -> String {

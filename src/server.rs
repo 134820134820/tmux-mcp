@@ -11,8 +11,9 @@ use std::time::Duration;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock as Content, Resource, ResourceContents, ResourceTemplate,
-    ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock as Content, CustomNotification, Resource, ResourceContents,
+    ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+    ServerNotification,
 };
 use rmcp::schemars::JsonSchema;
 use rmcp::serde::{Deserialize, Serialize};
@@ -110,7 +111,10 @@ impl Annotated {
 
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{ActionRecord, AiPause, ControlClient, GateDecision, GateMode};
-use crate::security::{SearchConfig, SecurityPolicy};
+use crate::gpu_monitor::{
+    GpuMonitorManager, GpuWatchQuery, GpuWatchSnapshot, GpuWatchStatus, StartGpuWatchInput,
+};
+use crate::security::{tool_in_group, SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
     command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandSnapshot,
@@ -144,6 +148,8 @@ pub struct TmuxMcpServer {
     search: SearchConfig,
     router: ToolRouter<Self>,
     control: Option<ControlClient>,
+    gpu_monitor: GpuMonitorManager,
+    claude_channel: bool,
     /// In-memory fallback used when this MCP process has no web control client.
     ai_pause: Arc<RwLock<Option<AiPause>>>,
     /// Connected MCP peer used for resource list/updated notifications.
@@ -171,8 +177,7 @@ impl ResourceCapability {
     const fn required_tools(self) -> &'static [&'static str] {
         match self {
             Self::Pane => &["capture-pane"],
-            Self::Window => &["list-windows"],
-            Self::SessionTree => &["list-sessions", "list-windows", "list-panes"],
+            Self::Window | Self::SessionTree => &["get-tmux-state"],
             Self::Clients => &["list-clients"],
             Self::CommandResult => &["get-command-result"],
         }
@@ -294,6 +299,16 @@ pub struct ListWindowsOutput {
 /// `list-panes` structured payload.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListPanesOutput {
+    pub panes: Vec<Pane>,
+}
+
+/// Complete tmux target map returned by `get-tmux-state`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TmuxStateOutput {
+    pub current_session_id: Option<String>,
+    pub sessions: Vec<Session>,
+    pub windows: Vec<Window>,
     pub panes: Vec<Pane>,
 }
 
@@ -691,6 +706,67 @@ pub struct GetCommandResultInput {
     pub socket: Option<String>,
 }
 
+fn gpu_channel_content(snapshot: &GpuWatchSnapshot) -> String {
+    match snapshot.status {
+        GpuWatchStatus::Triggered => format!(
+            "GPU idle: {} for {} seconds. monitorId={}. Call get-gpu-watch, report only, and do not modify workloads without user instruction.",
+            snapshot.idle_gpus.join(","),
+            snapshot.idle_seconds,
+            snapshot.monitor_id
+        ),
+        GpuWatchStatus::Expired => format!(
+            "GPU watcher expired after 24 hours. monitorId={}. Call get-gpu-watch and report status.",
+            snapshot.monitor_id
+        ),
+        GpuWatchStatus::StopUnconfirmed => format!(
+            "GPU watcher stop is unconfirmed. monitorId={}. Call get-gpu-watch and report status.",
+            snapshot.monitor_id
+        ),
+        _ => format!(
+            "GPU watcher failed. monitorId={}. Call get-gpu-watch and report status.",
+            snapshot.monitor_id
+        ),
+    }
+}
+
+/// `get-gpu-watch`: current or recent conversation-scoped watcher state.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetGpuWatchInput {
+    /// Exact monitor ID. Omit to return the active watcher and recent history.
+    #[serde(rename = "monitorId")]
+    pub monitor_id: Option<String>,
+}
+
+/// `stop-gpu-watch`: stop one exact conversation-scoped watcher.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StopGpuWatchInput {
+    /// Monitor ID returned by `watch-gpu-idle`.
+    #[serde(rename = "monitorId")]
+    pub monitor_id: String,
+}
+
+/// Session/window/pane target selected by its native tmux id prefix.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TargetIdInput {
+    /// Exact tmux target id: session `$N`, window `@N`, or pane `%N`.
+    #[serde(rename = "targetId")]
+    pub target_id: String,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// Rename a session, window, or pane selected by its native tmux id prefix.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenameTargetInput {
+    /// Exact tmux target id: session `$N`, window `@N`, or pane `%N`.
+    #[serde(rename = "targetId")]
+    pub target_id: String,
+    /// New session/window name or pane title.
+    pub label: String,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
 /// `rename-window` args.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RenameWindowInput {
@@ -1066,6 +1142,41 @@ pub struct SpecialKeyInput {
     pub socket: Option<String>,
 }
 
+#[cfg(feature = "special-keys")]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecialKey {
+    Cancel,
+    Eof,
+    Escape,
+    Enter,
+    Tab,
+    Backspace,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// Press one predefined non-text key in a pane.
+#[cfg(feature = "special-keys")]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PressSpecialKeyInput {
+    /// Pane target id (`%N`).
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    pub key: SpecialKey,
+    /// Required when this pane has a running tracked command; `cancel` is exempt.
+    #[serde(rename = "forCommandId")]
+    pub for_command_id: Option<String>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
 // ============================================================================
 // Tool Router Implementation
 // ============================================================================
@@ -1114,17 +1225,80 @@ impl TmuxMcpServer {
         search: SearchConfig,
         control: Option<ControlClient>,
     ) -> Self {
+        Self::new_with_control_and_channel(tracker, policy, search, control, false)
+    }
+
+    pub fn new_with_control_and_channel(
+        tracker: CommandTracker,
+        policy: SecurityPolicy,
+        search: SearchConfig,
+        control: Option<ControlClient>,
+        claude_channel: bool,
+    ) -> Self {
+        Self::new_with_control_channel_and_exposure(
+            tracker,
+            policy,
+            search,
+            control,
+            claude_channel,
+            true,
+        )
+    }
+
+    pub fn new_with_control_channel_and_exposure(
+        tracker: CommandTracker,
+        policy: SecurityPolicy,
+        search: SearchConfig,
+        control: Option<ControlClient>,
+        claude_channel: bool,
+        full_tools: bool,
+    ) -> Self {
         #[allow(unused_mut)]
         let mut router = Self::tool_router();
         #[cfg(feature = "interactive")]
         router.merge(Self::interactive_tool_router());
         #[cfg(feature = "special-keys")]
         router.merge(Self::special_keys_tool_router());
-        Self::apply_tool_policy(&mut router, &policy);
-        let command_resources_enabled = ResourceCapability::CommandResult.check(&policy).is_ok();
+        if !claude_channel {
+            router.remove_route("watch-gpu-idle");
+            router.remove_route("get-gpu-watch");
+            router.remove_route("stop-gpu-watch");
+        }
+        for legacy in [
+            "list-sessions",
+            "find-session",
+            "list-windows",
+            "list-panes",
+            "get-current-session",
+            "kill-session",
+            "kill-window",
+            "kill-pane",
+            "rename-session",
+            "rename-window",
+            "rename-pane",
+            "send-cancel",
+            "send-eof",
+            "send-escape",
+            "send-enter",
+            "send-tab",
+            "send-backspace",
+            "send-up",
+            "send-down",
+            "send-left",
+            "send-right",
+            "send-page-up",
+            "send-page-down",
+            "send-home",
+            "send-end",
+        ] {
+            router.remove_route(legacy);
+        }
+        Self::apply_tool_policy(&mut router, &policy, full_tools);
+        let command_resources_enabled = router.get("get-command-result").is_some();
         let tracker = Arc::new(tracker);
         let peer: Arc<RwLock<Option<Peer<RoleServer>>>> = Arc::new(RwLock::new(None));
         let subscriptions: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let gpu_monitor = GpuMonitorManager::new();
 
         {
             let mut events = tracker.subscribe_events();
@@ -1204,16 +1378,70 @@ impl TmuxMcpServer {
             });
         }
 
+        if claude_channel {
+            let mut events = gpu_monitor.subscribe();
+            let peer = Arc::clone(&peer);
+            let gpu_monitor_for_events = gpu_monitor.clone();
+            tokio::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event)
+                            if matches!(
+                                event.snapshot.status,
+                                GpuWatchStatus::Triggered
+                                    | GpuWatchStatus::Failed
+                                    | GpuWatchStatus::Expired
+                                    | GpuWatchStatus::StopUnconfirmed
+                            ) =>
+                        {
+                            let content = gpu_channel_content(&event.snapshot);
+                            let params = serde_json::json!({
+                                "content": content,
+                                "meta": {
+                                    "monitor_id": event.snapshot.monitor_id,
+                                    "status": format!("{:?}", event.snapshot.status).to_lowercase()
+                                }
+                            });
+                            let sent = if let Some(peer) = peer.read().await.as_ref() {
+                                peer.send_notification(ServerNotification::CustomNotification(
+                                    CustomNotification::new(
+                                        "notifications/claude/channel",
+                                        Some(params),
+                                    ),
+                                ))
+                                .await
+                                .is_ok()
+                            } else {
+                                false
+                            };
+                            gpu_monitor_for_events
+                                .mark_notification(&event.snapshot.monitor_id, sent)
+                                .await;
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+
         Self {
             tracker,
             policy: Arc::new(policy),
             search,
             router,
             control,
+            gpu_monitor,
+            claude_channel,
             ai_pause: Arc::new(RwLock::new(None)),
             peer,
             subscriptions,
         }
+    }
+
+    pub fn gpu_monitor(&self) -> GpuMonitorManager {
+        self.gpu_monitor.clone()
     }
 
     async fn capture_peer(&self, context: &RequestContext<RoleServer>) {
@@ -1223,14 +1451,16 @@ impl TmuxMcpServer {
 
     /// Drop routes that fail capability flags or the tool filter so clients never
     /// discover denied tools in `tools/list`.
-    fn apply_tool_policy(router: &mut ToolRouter<Self>, policy: &SecurityPolicy) {
+    fn apply_tool_policy(router: &mut ToolRouter<Self>, policy: &SecurityPolicy, full_tools: bool) {
         for tool_name in router
             .list_all()
             .into_iter()
             .map(|tool| tool.name.into_owned())
             .collect::<Vec<_>>()
         {
-            if policy.check_tool(&tool_name).is_err() {
+            if policy.check_tool(&tool_name).is_err()
+                || (!full_tools && !tool_in_group(&tool_name, "agent-core"))
+            {
                 router.remove_route(&tool_name);
             }
         }
@@ -1395,7 +1625,15 @@ impl TmuxMcpServer {
         &self,
         capability: ResourceCapability,
     ) -> Result<(), crate::errors::Error> {
-        capability.check(&self.policy)
+        capability.check(&self.policy)?;
+        for tool_name in capability.required_tools() {
+            if self.router.get(tool_name).is_none() {
+                return Err(crate::errors::Error::PolicyDenied {
+                    message: format!("tool '{tool_name}' is not exposed by this MCP process"),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn policy_filtered_resource_templates(&self) -> Vec<ResourceTemplate> {
@@ -1657,6 +1895,88 @@ impl TmuxMcpServer {
         let hash = hash_path_for_socket(&normalized);
         let socket_path = format!("/tmp/{hash}.sock");
         Ok(CallToolResult::success(vec![Content::text(socket_path)]))
+    }
+
+    #[tool(
+        name = "get-tmux-state",
+        description = "Return the visible tmux sessions, windows, and panes in one target map.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<TmuxStateOutput>()
+    )]
+    async fn get_tmux_state(
+        &self,
+        input: Parameters<SocketInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("get-tmux-state") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(error) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let sessions = match tmux::list_sessions(socket.as_deref()).await {
+            Ok(sessions) => sessions
+                .into_iter()
+                .filter(|session| {
+                    self.policy
+                        .check_session_identity(&session.id, Some(&session.name))
+                        .is_ok()
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error listing tmux state: {error}"
+                ))]))
+            }
+        };
+        let mut windows = Vec::new();
+        let mut panes = Vec::new();
+        for session in &sessions {
+            let session_windows = match tmux::list_windows(&session.id, socket.as_deref()).await {
+                Ok(windows) => windows,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error listing windows for {}: {error}",
+                        session.id
+                    ))]))
+                }
+            };
+            for window in &session_windows {
+                match tmux::list_panes(&window.id, socket.as_deref()).await {
+                    Ok(window_panes) => panes.extend(
+                        window_panes
+                            .into_iter()
+                            .filter(|pane| self.policy.check_pane(&pane.id).is_ok()),
+                    ),
+                    Err(error) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Error listing panes for {}: {error}",
+                            window.id
+                        ))]))
+                    }
+                }
+            }
+            windows.extend(session_windows);
+        }
+        let current_session_id = tmux::get_current_session(socket.as_deref())
+            .await
+            .ok()
+            .filter(|session| {
+                self.policy
+                    .check_session_identity(&session.id, Some(&session.name))
+                    .is_ok()
+            })
+            .map(|session| session.id);
+        Ok(structured_output(&TmuxStateOutput {
+            current_session_id,
+            sessions,
+            windows,
+            panes,
+        }))
     }
 
     #[tool(
@@ -2825,6 +3145,96 @@ impl TmuxMcpServer {
     }
 
     #[tool(
+        name = "kill-target",
+        description = "Kill one tmux session, window, or pane selected by its exact $N, @N, or %N id.",
+        annotations(destructive_hint = true)
+    )]
+    async fn kill_target(
+        &self,
+        input: Parameters<TargetIdInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("kill-target") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(error) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let result = match input.0.target_id.as_bytes().first() {
+            Some(b'$') => {
+                if let Err(error) = self
+                    .enforce_session_target(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                tmux::kill_session(&input.0.target_id, socket.as_deref()).await
+            }
+            Some(b'@') => {
+                if let Err(error) = self
+                    .enforce_session_for_window(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                if let Err(error) = self
+                    .enforce_allowed_panes_for_window(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                tmux::kill_window(&input.0.target_id, socket.as_deref()).await
+            }
+            Some(b'%') => {
+                if let Err(error) = self.policy.check_pane(&input.0.target_id) {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                if let Err(error) = self
+                    .enforce_session_for_pane(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                let result = tmux::kill_pane(&input.0.target_id, socket.as_deref()).await;
+                if result.is_ok() {
+                    self.tracker
+                        .purge_pane(&input.0.target_id, socket.as_deref())
+                        .await;
+                }
+                result
+            }
+            _ => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "targetId must start with '$', '@', or '%'".to_string(),
+                )]))
+            }
+        };
+        match result {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Target {} killed",
+                input.0.target_id
+            ))])),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error killing target: {error}"
+            ))])),
+        }
+    }
+
+    #[tool(
         name = "kill-session",
         description = "Terminate a tmux session and all its windows/panes. Use for cleanup in isolated agent sessions; avoid in shared sessions.",
         annotations(destructive_hint = true)
@@ -3109,6 +3519,69 @@ impl TmuxMcpServer {
         }
     }
 
+    #[tool(
+        name = "watch-gpu-idle",
+        description = "Watch remote NVIDIA GPUs until one has no compute process for the requested continuous interval.",
+        annotations(open_world_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GpuWatchSnapshot>()
+    )]
+    async fn watch_gpu_idle(
+        &self,
+        input: Parameters<StartGpuWatchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("watch-gpu-idle") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        match self.gpu_monitor.start(input.0).await {
+            Ok(snapshot) => Ok(structured_output(&snapshot)),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(error)])),
+        }
+    }
+
+    #[tool(
+        name = "get-gpu-watch",
+        description = "Get the active or recent GPU watcher state for this MCP process.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GpuWatchQuery>()
+    )]
+    async fn get_gpu_watch(
+        &self,
+        input: Parameters<GetGpuWatchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("get-gpu-watch") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        match self.gpu_monitor.query(input.0.monitor_id.as_deref()).await {
+            Ok(snapshot) => Ok(structured_output(&snapshot)),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(error)])),
+        }
+    }
+
+    #[tool(
+        name = "stop-gpu-watch",
+        description = "Stop the exact GPU watcher owned by this MCP process.",
+        annotations(destructive_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<GpuWatchSnapshot>()
+    )]
+    async fn stop_gpu_watch(
+        &self,
+        input: Parameters<StopGpuWatchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("stop-gpu-watch") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        match self.gpu_monitor.stop(&input.0.monitor_id).await {
+            Ok(snapshot) => Ok(structured_output(&snapshot)),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(error)])),
+        }
+    }
+
     // Feature candidate tools
     #[tool(
         name = "get-current-session",
@@ -3138,6 +3611,82 @@ impl TmuxMcpServer {
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error getting current session: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "rename-target",
+        description = "Rename one tmux session, window, or pane selected by its exact $N, @N, or %N id.",
+        annotations(idempotent_hint = true)
+    )]
+    async fn rename_target(
+        &self,
+        input: Parameters<RenameTargetInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("rename-target") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(error) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let result = match input.0.target_id.as_bytes().first() {
+            Some(b'$') => {
+                if let Err(error) = self
+                    .enforce_session_target(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                tmux::rename_session(&input.0.target_id, &input.0.label, socket.as_deref()).await
+            }
+            Some(b'@') => {
+                if let Err(error) = self
+                    .enforce_session_for_window(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                tmux::rename_window(&input.0.target_id, &input.0.label, socket.as_deref()).await
+            }
+            Some(b'%') => {
+                if let Err(error) = self.policy.check_pane(&input.0.target_id) {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                if let Err(error) = self
+                    .enforce_session_for_pane(&input.0.target_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        error.to_string(),
+                    )]));
+                }
+                tmux::rename_pane(&input.0.target_id, &input.0.label, socket.as_deref()).await
+            }
+            _ => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "targetId must start with '$', '@', or '%'".to_string(),
+                )]))
+            }
+        };
+        match result {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Target {} renamed to {}",
+                input.0.target_id, input.0.label
+            ))])),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error renaming target: {error}"
             ))])),
         }
     }
@@ -3919,6 +4468,40 @@ impl TmuxMcpServer {
 #[tool_router(router = special_keys_tool_router)]
 impl TmuxMcpServer {
     #[tool(
+        name = "press-special-key",
+        description = "Press one predefined non-text key in a pane. Use send-keys for text input.",
+        annotations(open_world_hint = true)
+    )]
+    async fn press_special_key(
+        &self,
+        input: Parameters<PressSpecialKeyInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let (key, allow_cancel) = match input.0.key {
+            SpecialKey::Cancel => ("C-c", true),
+            SpecialKey::Eof => ("C-d", false),
+            SpecialKey::Escape => ("Escape", false),
+            SpecialKey::Enter => ("Enter", false),
+            SpecialKey::Tab => ("Tab", false),
+            SpecialKey::Backspace => ("BSpace", false),
+            SpecialKey::Up => ("Up", false),
+            SpecialKey::Down => ("Down", false),
+            SpecialKey::Left => ("Left", false),
+            SpecialKey::Right => ("Right", false),
+            SpecialKey::PageUp => ("PPage", false),
+            SpecialKey::PageDown => ("NPage", false),
+            SpecialKey::Home => ("Home", false),
+            SpecialKey::End => ("End", false),
+        };
+        let legacy_input = SpecialKeyInput {
+            pane_id: input.0.pane_id,
+            for_command_id: input.0.for_command_id,
+            socket: input.0.socket,
+        };
+        self.send_special_key(&legacy_input, key, "press-special-key", allow_cancel)
+            .await
+    }
+
+    #[tool(
         name = "send-cancel",
         description = "Send Ctrl+C to interrupt the current process in a pane. Use to stop a stuck command or to abort a prompt during interactive workflows.",
         annotations(open_world_hint = true)
@@ -4166,6 +4749,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         let mut action: Option<ActionRecord> = None;
         if let Some(control) = &self.control {
             let read_only = self.tool_is_read_only(&request.name);
+            let safety_stop = request.name == "stop-gpu-watch";
             let arguments = request
                 .arguments
                 .clone()
@@ -4182,10 +4766,11 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .and_then(Self::preferred_tool_for_command)
+                    .filter(|tool| self.router.get(tool).is_some())
             } else {
                 None
             };
-            if read_only {
+            if read_only || safety_stop {
                 action = Some(record);
             } else if let Some(tool) = preferred_tool {
                 let error = format!(
@@ -4265,16 +4850,20 @@ impl rmcp::ServerHandler for TmuxMcpServer {
     }
 
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .enable_resources_subscribe()
-                .enable_resources_list_changed()
-                .build(),
-        )
-        .with_instructions(
-            "Tmux MCP server for sessions, windows, panes, and tracked commands. Prefer list-directory, find-files, read-file, search-text, and the bounded git-status/git-diff/git-log/git-show tools for inspection; raw shell commands remain gated. Prefer per-agent isolated sockets (TMUX_MCP_SOCKET/--socket). execute-command returns commandId + resourceUri (tmux://command/{id}/result). Preferred completion path: resources/subscribe on resourceUri, wait for notifications/resources/updated, then resources/read. Fallback: get-command-result with waitMs. A busy pane rejects another tracked command. Interactive AI input to a running command must include its commandId; send-cancel is exempt. Completion is side-channel based—do not trust DONE lines in pane text.",
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_resources_list_changed()
+            .build();
+        if self.claude_channel {
+            capabilities.experimental = Some(BTreeMap::from([(
+                "claude/channel".to_string(),
+                Default::default(),
+            )]));
+        }
+        ServerInfo::new(capabilities).with_instructions(
+            "Tmux MCP server for sessions, panes, tracked commands, and optional conversation-scoped GPU alerts. GPU alerts are status only; do not modify workloads without user instruction.",
         )
     }
 
@@ -4314,23 +4903,15 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             });
         }
 
-        let can_discover_sessions = self.policy.check_tool("list-sessions").is_ok();
-        let can_discover_windows =
-            can_discover_sessions && self.policy.check_tool("list-windows").is_ok();
-        let can_discover_panes =
-            can_discover_windows && self.policy.check_tool("list-panes").is_ok();
-        let can_publish_panes = can_discover_panes
+        let can_discover_topology = self
+            .check_resource_capability(ResourceCapability::SessionTree)
+            .is_ok();
+        let can_publish_panes = can_discover_topology
             && self
                 .check_resource_capability(ResourceCapability::Pane)
                 .is_ok();
-        let can_publish_windows = can_discover_windows
-            && self
-                .check_resource_capability(ResourceCapability::Window)
-                .is_ok();
-        let can_publish_session_trees = can_discover_panes
-            && self
-                .check_resource_capability(ResourceCapability::SessionTree)
-                .is_ok();
+        let can_publish_windows = can_discover_topology;
+        let can_publish_session_trees = can_discover_topology;
 
         if can_publish_panes || can_publish_windows || can_publish_session_trees {
             let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
@@ -4354,7 +4935,7 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                     })?;
                 for window in windows {
-                    let inspect_panes = can_discover_panes || self.policy.has_pane_allowlist();
+                    let inspect_panes = can_discover_topology || self.policy.has_pane_allowlist();
                     let (window_has_allowed_panes, all_window_panes_allowed) = if inspect_panes {
                         let panes = tmux::list_panes(&window.id, socket.as_deref())
                             .await
@@ -5048,7 +5629,7 @@ mod tests {
     use std::time::Instant;
     use tempfile::tempdir;
     use tempfile::NamedTempFile;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncBufReadExt, BufReader};
 
     fn stage_default_buffer_file(name: &str, contents: &str) {
         let dir = crate::security::default_buffer_dir();
@@ -5078,6 +5659,141 @@ mod tests {
             CommandTracker::new(ShellType::Bash),
             SecurityPolicy::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn gpu_watch_tools_and_channel_capability_are_explicitly_opt_in() {
+        let disabled = server_default();
+        let disabled_tools = disabled
+            .router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect::<HashSet<_>>();
+        assert!(!disabled_tools.contains("watch-gpu-idle"));
+        assert!(<TmuxMcpServer as rmcp::ServerHandler>::get_info(&disabled)
+            .capabilities
+            .experimental
+            .is_none());
+
+        let enabled = TmuxMcpServer::new_with_control_and_channel(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            None,
+            true,
+        );
+        let enabled_tools = enabled
+            .router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect::<HashSet<_>>();
+        assert!(enabled_tools.contains("watch-gpu-idle"));
+        assert!(enabled_tools.contains("get-gpu-watch"));
+        assert!(enabled_tools.contains("stop-gpu-watch"));
+        assert!(<TmuxMcpServer as rmcp::ServerHandler>::get_info(&enabled)
+            .capabilities
+            .experimental
+            .as_ref()
+            .is_some_and(|caps| caps.contains_key("claude/channel")));
+    }
+
+    #[cfg(all(feature = "interactive", feature = "special-keys"))]
+    #[tokio::test]
+    async fn binary_core_surface_is_small_and_full_surface_keeps_advanced_tools() {
+        let core = TmuxMcpServer::new_with_control_channel_and_exposure(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            None,
+            true,
+            false,
+        );
+        let core_names = tool_names(&core);
+        assert_eq!(core_names.len(), 21);
+        for name in [
+            "get-tmux-state",
+            "press-special-key",
+            "execute-command",
+            "read-file",
+            "git-status",
+            "watch-gpu-idle",
+        ] {
+            assert!(core_names.contains(name));
+        }
+        for name in [
+            "list-buffers",
+            "kill-target",
+            "rename-target",
+            "select-layout",
+            "send-hex",
+        ] {
+            assert!(!core_names.contains(name));
+        }
+
+        let full = TmuxMcpServer::new_with_control_and_channel(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            None,
+            true,
+        );
+        let full_names = tool_names(&full);
+        assert_eq!(full_names.len(), 47);
+        for name in ["kill-target", "rename-target", "select-layout", "send-hex"] {
+            assert!(full_names.contains(name));
+        }
+        for legacy in ["list-sessions", "kill-session", "rename-pane", "send-enter"] {
+            assert!(!full_names.contains(legacy));
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_gpu_event_is_sent_to_the_same_mcp_peer() {
+        let server = TmuxMcpServer::new_with_control_and_channel(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            None,
+            true,
+        );
+        let (context, client_transport, _running) = context_for_server(&server);
+        server.capture_peer(&context).await;
+        server.gpu_monitor.emit_for_test(GpuWatchSnapshot {
+            monitor_id: "gpu-watch-callback".to_string(),
+            status: GpuWatchStatus::Triggered,
+            requested_gpu: Some("0".to_string()),
+            target_gpus: vec!["GPU-a".to_string()],
+            idle_gpus: vec!["GPU-a".to_string()],
+            idle_seconds: 300,
+            poll_seconds: 15,
+            created_at_ms: 1,
+            started_at_ms: Some(2),
+            last_sample_at_ms: Some(3),
+            completed_at_ms: Some(4),
+            local_ssh_pid: Some(10),
+            remote_pid: Some(20),
+            notification_status: crate::gpu_monitor::NotificationStatus::NotSent,
+            reason: Some("no_compute_process".to_string()),
+            diagnostic: None,
+        });
+
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            BufReader::new(client_transport).read_line(&mut line),
+        )
+        .await
+        .expect("channel notification timeout")
+        .expect("channel notification read");
+        let message: Value = serde_json::from_str(&line).expect("channel JSON");
+        assert_eq!(
+            message.get("method").and_then(Value::as_str),
+            Some("notifications/claude/channel")
+        );
+        assert!(line.contains("gpu-watch-callback"));
+        assert!(line.contains("do not modify workloads"));
     }
 
     fn first_text(result: &CallToolResult) -> String {
@@ -5138,7 +5854,7 @@ mod tests {
     async fn gate_classification_uses_the_registered_read_only_hint() {
         let server = server_default();
 
-        assert!(server.tool_is_read_only("list-sessions"));
+        assert!(server.tool_is_read_only("get-tmux-state"));
         assert!(server.tool_is_read_only("capture-pane"));
         assert!(server.tool_is_read_only("list-directory"));
         assert!(server.tool_is_read_only("read-file"));
@@ -5364,6 +6080,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gpu_watch_stop_bypasses_enabled_gate() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        set_gate_mode(&paths, GateMode::Approval).expect("enable gate");
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let control = ControlClient::new(&url, "Claude", paths).expect("control");
+        let server = TmuxMcpServer::new_with_control_and_channel(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(control),
+            true,
+        );
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let arguments = serde_json::json!({"monitorId": "missing"})
+            .as_object()
+            .cloned()
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            server.call_tool(
+                rmcp::model::CallToolRequestParams::new("stop-gpu-watch").with_arguments(arguments),
+                context,
+            ),
+        )
+        .await
+        .expect("safety stop must not wait")
+        .expect("tool result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("not found"));
+        assert!(hub.pending().await.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn persisted_ai_pause_rejects_even_read_only_tools_before_gate() {
         let dir = tempdir().expect("state dir");
         let paths = StatePaths::new(dir.path());
@@ -5474,6 +6227,52 @@ mod tests {
         let records = hub.records_for_pane("%8").await;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, crate::control::ActionStatus::Rejected);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_first_gate_never_redirects_to_a_hidden_tool() {
+        let dir = tempdir().expect("state dir");
+        let paths = StatePaths::new(dir.path());
+        set_gate_mode(&paths, GateMode::Tools).expect("enable tool-first gate");
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let control = ControlClient::new(&url, "Codex", paths).expect("control");
+        let policy =
+            policy_from_toml("[security.tools]\nmode = \"deny\"\nitems = [\"list-directory\"]\n");
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            policy,
+            SearchConfig::default(),
+            Some(control),
+        );
+        let (context, _client_transport, _running) = context_for_server(&server);
+        let arguments = serde_json::json!({"paneId": "%8", "command": "ls"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let call = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .call_tool(
+                        rmcp::model::CallToolRequestParams::new("execute-command")
+                            .with_arguments(arguments),
+                        context,
+                    )
+                    .await
+            }
+        });
+
+        let pending = loop {
+            if let Some(record) = hub.pending().await.first() {
+                break record.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(hub.decide(&pending.id, GateDecision::Rejected).await);
+        let result = call.await.expect("call task").expect("tool result");
+        assert!(first_text(&result).contains("rejected by Gate"));
+        assert!(!first_text(&result).contains("list-directory"));
         task.abort();
     }
 
@@ -6236,21 +7035,14 @@ mod tests {
 
     #[tokio::test]
     async fn resource_template_capability_matrix_handles_composite_tool_filters() {
-        let deny_windows =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-windows\"]\n");
-        let templates = resource_template_uris(&deny_windows);
+        let deny_topology =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
+        let templates = resource_template_uris(&deny_topology);
         assert!(!templates.contains("tmux://window/{windowId}/info"));
         assert!(!templates.contains("tmux://session/{sessionId}/tree"));
         assert!(templates.contains("tmux://pane/{paneId}"));
         assert!(templates.contains("tmux://clients"));
         assert!(templates.contains("tmux://command/{commandId}/result"));
-
-        let deny_panes =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-panes\"]\n");
-        let templates = resource_template_uris(&deny_panes);
-        assert!(templates.contains("tmux://window/{windowId}/info"));
-        assert!(!templates.contains("tmux://session/{sessionId}/tree"));
-        assert!(templates.contains("tmux://pane/{paneId}"));
 
         let deny_capture =
             server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
@@ -6267,7 +7059,7 @@ mod tests {
         assert!(!templates.contains("tmux://command/{commandId}/result"));
 
         let topology_only = server_with_policy(
-            "[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\", \"list-windows\", \"list-panes\"]\n",
+            "[security.tools]\nmode = \"allow\"\nitems = [\"get-tmux-state\"]\n",
         );
         let templates = resource_template_uris(&topology_only);
         assert_eq!(
@@ -6310,22 +7102,14 @@ mod tests {
     async fn resource_reads_enforce_composite_capability_matrix() {
         let _stub = TmuxStub::new();
 
-        let deny_windows =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-windows\"]\n");
-        let text = read_resource_text(&deny_windows, "tmux://window/@1/info").await;
+        let deny_topology =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
+        let text = read_resource_text(&deny_topology, "tmux://window/@1/info").await;
         assert!(text.contains("Access denied"));
-        assert!(text.contains("list-windows"));
-        let text = read_resource_text(&deny_windows, "tmux://session/%1/tree").await;
+        assert!(text.contains("get-tmux-state"));
+        let text = read_resource_text(&deny_topology, "tmux://session/%1/tree").await;
         assert!(text.contains("Access denied"));
-        assert!(text.contains("list-windows"));
-
-        let deny_panes =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-panes\"]\n");
-        let text = read_resource_text(&deny_panes, "tmux://session/%1/tree").await;
-        assert!(text.contains("Access denied"));
-        assert!(text.contains("list-panes"));
-        let text = read_resource_text(&deny_panes, "tmux://window/@1/info").await;
-        assert!(!text.contains("Access denied"));
+        assert!(text.contains("get-tmux-state"));
 
         let deny_capture =
             server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
@@ -6342,7 +7126,7 @@ mod tests {
         assert!(text.contains("list-clients"));
 
         let topology_only = server_with_policy(
-            "[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\", \"list-windows\", \"list-panes\"]\n",
+            "[security.tools]\nmode = \"allow\"\nitems = [\"get-tmux-state\"]\n",
         );
         let text = read_resource_text(&topology_only, "tmux://session/%1/tree").await;
         assert!(!text.contains("Access denied"));
@@ -6446,23 +7230,24 @@ mod tests {
     #[tokio::test]
     async fn tool_filter_prunes_denied_tools_from_router() {
         let server = server_with_policy(
-            "[security.tools]\nmode = \"deny\"\nitems = [\"kill-session\", \"@special-keys\"]\n",
+            "[security.tools]\nmode = \"deny\"\nitems = [\"kill-target\", \"@special-keys\"]\n",
         );
         let names = tool_names(&server);
 
-        assert!(!names.contains("kill-session"));
+        assert!(!names.contains("kill-target"));
         #[cfg(feature = "special-keys")]
-        assert!(!names.contains("send-enter"));
+        assert!(!names.contains("press-special-key"));
         assert!(names.contains("execute-command"));
     }
 
     #[tokio::test]
     async fn tool_filter_allowlist_prunes_router_to_allowed_tools() {
-        let server =
-            server_with_policy("[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\"]\n");
+        let server = server_with_policy(
+            "[security.tools]\nmode = \"allow\"\nitems = [\"get-tmux-state\"]\n",
+        );
         let names = tool_names(&server);
 
-        assert!(names.contains("list-sessions"));
+        assert!(names.contains("get-tmux-state"));
         assert!(!names.contains("execute-command"));
         assert_eq!(names.len(), 1);
     }
@@ -7540,10 +8325,10 @@ mod tests {
     async fn list_resources_enforces_composite_capability_matrix() {
         let _stub = TmuxStub::new();
 
-        let deny_windows =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-windows\"]\n");
-        let (context, _client_transport, _running) = context_for_server(&deny_windows);
-        let resources = deny_windows
+        let deny_topology =
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
+        let (context, _client_transport, _running) = context_for_server(&deny_topology);
+        let resources = deny_topology
             .list_resources(None, context)
             .await
             .expect("list resources");
@@ -7555,18 +8340,6 @@ mod tests {
                 "tmux://server/info".to_string(),
             ])
         );
-
-        let deny_panes =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-panes\"]\n");
-        let (context, _client_transport, _running) = context_for_server(&deny_panes);
-        let resources = deny_panes
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris = resource_uris(&resources.resources);
-        assert!(uris.iter().any(|uri| uri.starts_with("tmux://window/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://session/")));
 
         let deny_capture =
             server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
@@ -7581,7 +8354,7 @@ mod tests {
         assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
 
         let topology_only = server_with_policy(
-            "[security.tools]\nmode = \"allow\"\nitems = [\"list-sessions\", \"list-windows\", \"list-panes\"]\n",
+            "[security.tools]\nmode = \"allow\"\nitems = [\"get-tmux-state\"]\n",
         );
         let (context, _client_transport, _running) = context_for_server(&topology_only);
         let resources = topology_only
@@ -7600,7 +8373,7 @@ mod tests {
     async fn list_resources_keeps_clients_and_commands_independent_from_topology() {
         let _stub = TmuxStub::new();
         let server =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"list-sessions\"]\n");
+            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
                 pane_id: "%1".into(),

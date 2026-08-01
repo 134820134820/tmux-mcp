@@ -29,7 +29,9 @@ impl ActionKind {
     fn for_tool(tool: &str) -> Self {
         match tool {
             "execute-command" => Self::Command,
-            "send-keys" | "send-hex" | "paste-text" | "web-input" => Self::Input,
+            "send-keys" | "send-hex" | "paste-text" | "press-special-key" | "web-input" => {
+                Self::Input
+            }
             name if name.starts_with("send-") => Self::Input,
             _ => Self::Operation,
         }
@@ -106,10 +108,20 @@ impl ActionTarget {
                 }
             }
         }
+        let mut session_id = string("sessionId");
+        let mut window_id = string("windowId");
+        if let Some(target_id) = string("targetId") {
+            match target_id.as_bytes().first() {
+                Some(b'$') => session_id = Some(target_id),
+                Some(b'@') => window_id = Some(target_id),
+                Some(b'%') if !pane_ids.contains(&target_id) => pane_ids.push(target_id),
+                _ => {}
+            }
+        }
         Self {
             socket: string("socket"),
-            session_id: string("sessionId"),
-            window_id: string("windowId"),
+            session_id,
+            window_id,
             pane_ids,
         }
     }

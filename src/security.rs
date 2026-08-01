@@ -92,39 +92,39 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     },
     ToolManifestEntry {
         name: "capture-pane",
-        groups: &["capture", "read"],
+        groups: &["capture", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "list-directory",
-        groups: &["list", "file-read", "read"],
+        groups: &["list", "file-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "read-file",
-        groups: &["file-read", "read"],
+        groups: &["file-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "find-files",
-        groups: &["list", "file-read", "read"],
+        groups: &["list", "file-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "search-text",
-        groups: &["file-read", "read"],
+        groups: &["file-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "git-status",
-        groups: &["git-read", "read"],
+        groups: &["git-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "git-diff",
-        groups: &["git-read", "read"],
+        groups: &["git-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "git-log",
-        groups: &["git-read", "read"],
+        groups: &["git-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "git-show",
-        groups: &["git-read", "read"],
+        groups: &["git-read", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "show-buffer",
@@ -164,15 +164,15 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     },
     ToolManifestEntry {
         name: "create-session",
-        groups: &["create"],
+        groups: &["create", "agent-core"],
     },
     ToolManifestEntry {
         name: "create-window",
-        groups: &["create"],
+        groups: &["create", "agent-core"],
     },
     ToolManifestEntry {
         name: "split-pane",
-        groups: &["split"],
+        groups: &["split", "agent-core"],
     },
     ToolManifestEntry {
         name: "kill-session",
@@ -192,11 +192,35 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     },
     ToolManifestEntry {
         name: "execute-command",
-        groups: &["execute"],
+        groups: &["execute", "agent-core"],
     },
     ToolManifestEntry {
         name: "get-command-result",
-        groups: &["execute", "read"],
+        groups: &["execute", "read", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "watch-gpu-idle",
+        groups: &["gpu-monitor", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "get-gpu-watch",
+        groups: &["gpu-monitor", "read", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "stop-gpu-watch",
+        groups: &["gpu-monitor", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "get-tmux-state",
+        groups: &["list", "read", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "kill-target",
+        groups: &["kill"],
+    },
+    ToolManifestEntry {
+        name: "rename-target",
+        groups: &["rename"],
     },
     ToolManifestEntry {
         name: "get-current-session",
@@ -256,7 +280,7 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     },
     ToolManifestEntry {
         name: "send-keys",
-        groups: &["interactive", "raw-input"],
+        groups: &["interactive", "raw-input", "agent-core"],
     },
     ToolManifestEntry {
         name: "send-hex",
@@ -264,7 +288,11 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     },
     ToolManifestEntry {
         name: "paste-text",
-        groups: &["interactive", "raw-input"],
+        groups: &["interactive", "raw-input", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "press-special-key",
+        groups: &["special-keys", "raw-input", "agent-core"],
     },
     ToolManifestEntry {
         name: "send-cancel",
@@ -330,6 +358,13 @@ fn is_known_tool(name: &str) -> bool {
 
 fn is_known_group(name: &str) -> bool {
     name == "all" || TOOL_MANIFEST.iter().any(|tool| tool.groups.contains(&name))
+}
+
+pub fn tool_in_group(tool_name: &str, group: &str) -> bool {
+    TOOL_MANIFEST
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .is_some_and(|tool| tool.groups.contains(&group))
 }
 
 fn expand_tool_filter_item(item: &str, tools: &mut BTreeSet<String>) -> Result<()> {
@@ -500,7 +535,7 @@ pub struct SecurityConfig {
     /// Gates interactive and special-key injection tools (`send-keys`, `paste-text`, …).
     #[serde(default = "default_true")]
     pub allow_send_keys: bool,
-    /// Gates `kill-session` / `kill-window` / `kill-pane` / `detach-client`.
+    /// Gates `kill-target` / `detach-client`.
     #[serde(default = "default_true")]
     pub allow_kill: bool,
     /// Gates `create-session` and `create-window`.
@@ -509,7 +544,7 @@ pub struct SecurityConfig {
     /// Gates `split-pane`.
     #[serde(default = "default_true")]
     pub allow_split: bool,
-    /// Gates `rename-session` / `rename-window` / `rename-pane`.
+    /// Gates `rename-target`.
     #[serde(default = "default_true")]
     pub allow_rename: bool,
     /// Gates focus/layout tools (`select-*`, `resize-pane`, `join-pane`, …).
@@ -666,16 +701,18 @@ impl SecurityPolicy {
 
         let allowed = match tool_name {
             "execute-command" | "get-command-result" => self.config.allow_execute_command,
-            "send-keys" | "send-hex" | "paste-text" | "send-cancel" | "send-eof"
-            | "send-escape" | "send-enter" | "send-tab" | "send-backspace" | "send-up"
-            | "send-down" | "send-left" | "send-right" | "send-page-up" | "send-page-down"
-            | "send-home" | "send-end" => self.config.allow_send_keys,
-            "kill-session" | "kill-window" | "kill-pane" | "detach-client" => {
+            "send-keys" | "send-hex" | "paste-text" | "press-special-key" | "send-cancel"
+            | "send-eof" | "send-escape" | "send-enter" | "send-tab" | "send-backspace"
+            | "send-up" | "send-down" | "send-left" | "send-right" | "send-page-up"
+            | "send-page-down" | "send-home" | "send-end" => self.config.allow_send_keys,
+            "kill-target" | "kill-session" | "kill-window" | "kill-pane" | "detach-client" => {
                 self.config.allow_kill
             }
             "create-session" | "create-window" => self.config.allow_create,
             "split-pane" => self.config.allow_split,
-            "rename-session" | "rename-window" | "rename-pane" => self.config.allow_rename,
+            "rename-target" | "rename-session" | "rename-window" | "rename-pane" => {
+                self.config.allow_rename
+            }
             "move-window"
             | "select-window"
             | "select-pane"
@@ -690,7 +727,8 @@ impl SecurityPolicy {
             | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
             | "subsearch-buffer" | "read-file" | "search-text" | "git-status" | "git-diff"
             | "git-log" | "git-show" => self.config.allow_capture,
-            "socket-for-path"
+            "get-tmux-state"
+            | "socket-for-path"
             | "list-sessions"
             | "list-windows"
             | "list-panes"
@@ -2057,8 +2095,33 @@ mod tests {
         let policy = SecurityPolicy::from_config(config).expect("compile policy");
 
         assert!(policy.check_tool("send-keys").is_err());
+        assert!(policy.check_tool("press-special-key").is_err());
         assert!(policy.check_tool("send-enter").is_err());
         assert!(policy.check_tool("execute-command").is_ok());
+    }
+
+    #[test]
+    fn agent_core_group_contains_required_dependencies_only() {
+        for tool in [
+            "get-tmux-state",
+            "capture-pane",
+            "execute-command",
+            "get-command-result",
+            "press-special-key",
+            "watch-gpu-idle",
+            "stop-gpu-watch",
+        ] {
+            assert!(tool_in_group(tool, "agent-core"), "missing {tool}");
+        }
+        for tool in [
+            "list-buffers",
+            "kill-target",
+            "rename-target",
+            "select-layout",
+            "send-hex",
+        ] {
+            assert!(!tool_in_group(tool, "agent-core"), "unexpected {tool}");
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@
 
 打开 `http://127.0.0.1:38473/`。
 
+stdio MCP 默认只暴露核心工具。需要 buffer、布局、重命名、删除等高级工具时，在现有 MCP 参数末尾增加 `--full-tools` 并重启客户端。完整清单和选择性开放方法见 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md)。
+
 ## Codex
 
 在 `%USERPROFILE%\.codex\config.toml` 中添加：
@@ -40,8 +42,16 @@ Claude 只记录 exe 路径，不会复制 exe。以下命令自动把当前仓�
 
 ```powershell
 $exe = (Resolve-Path .\tmux-mcp.exe).Path
-claude mcp add --scope user --transport stdio tmux -- $exe --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code"
+claude mcp add --scope user --transport stdio tmux -- $exe --ssh milab-ten --web-url http://127.0.0.1:38473 --client-name "Claude Code" --claude-channel
 ```
+
+启用 GPU 空闲回调时，用开发版 Channel 参数启动 Claude：
+
+```powershell
+claude --dangerously-load-development-channels server:tmux
+```
+
+随后可让 Claude 调用 `watch-gpu-idle`；用 `get-gpu-watch` 查询，用 `stop-gpu-watch` 停止。未加 `--claude-channel` 时，这三个工具不会出现，原有 MCP 功能不变。
 
 `--scope`：
 

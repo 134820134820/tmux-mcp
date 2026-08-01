@@ -15,3 +15,6 @@ bin/*/
 .orchid
 specs
 docs/
+!docs/
+docs/*
+!docs/TOOL_SURFACE.md

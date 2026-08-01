@@ -1109,6 +1109,15 @@
           "send-end": "End"
         };
         if (special[record.tool]) return special[record.tool];
+        if (record.tool === "press-special-key") {
+          const labels = {
+            cancel: "Ctrl-C", eof: "Ctrl-D", escape: "Escape", enter: "Enter",
+            tab: "Tab", backspace: "Backspace", up: "↑", down: "↓", left: "←",
+            right: "→", "page-up": "Page Up", "page-down": "Page Down",
+            home: "Home", end: "End"
+          };
+          return labels[args.key] || args.key || "Special key";
+        }
         if (typeof args.text === "string") return args.text || "（输入已清空）";
         if (typeof args.keys === "string") return args.keys;
         if (typeof args.content === "string") return args.content;

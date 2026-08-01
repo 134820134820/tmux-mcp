@@ -17,6 +17,13 @@ fn page_contains_both_pane_modes_and_gate_controls() {
 }
 
 #[test]
+fn consolidated_special_keys_keep_human_readable_input_labels() {
+    assert!(PAGE.contains(r#"record.tool === "press-special-key""#));
+    assert!(PAGE.contains(r#""page-up": "Page Up""#));
+    assert!(PAGE.contains(r#"cancel: "Ctrl-C""#));
+}
+
+#[test]
 fn operation_log_switches_between_critical_and_full_records() {
     for marker in [
         r#"id="log-critical""#,
@@ -251,7 +258,9 @@ fn gate_approval_is_attached_above_the_composer() {
         .find(r#"id="command-composer""#)
         .expect("command composer");
     assert!(approval < composer);
-    assert!(PAGE.contains(".approval-popover {\n        width: 100%;"));
+    assert!(PAGE
+        .replace("\r\n", "\n")
+        .contains(".approval-popover {\n        width: 100%;"));
     assert!(!PAGE.contains("bottom: 72px"));
     assert!(PAGE.contains("elements.approval.hidden = false"));
     let render_approval = PAGE
