@@ -216,17 +216,13 @@ pub fn build_router(
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(event)
-                    if event.kind == CommandEventKind::Terminal
-                        || (event.kind == CommandEventKind::Updated
-                            && event.status.is_terminal()) =>
-                {
+                Ok(event) if event.kind == CommandEventKind::Terminal => {
                     if let Some(execution) = event_tracker.get_command(&event.command_id).await {
                         let recorded = event_hub
                             .update_web_command(CommandSnapshot::from_execution(&execution, None))
                             .await
                             .unwrap_or(false);
-                        if recorded && event.kind == CommandEventKind::Updated {
+                        if recorded {
                             event_hub.forget_web_command(&event.command_id).await;
                         }
                     }
@@ -283,15 +279,14 @@ async fn reconcile_web_commands(hub: &HubState, tracker: &CommandTracker) {
             hub.forget_missing_web_command(&command_id).await;
             continue;
         };
-        if !execution.status.is_terminal() {
+        if !execution.status.is_terminal() || !execution.result_ready {
             continue;
         }
-        let presentation_ready = execution.output.is_some() || !execution.output_truncated;
         let recorded = hub
             .update_web_command(CommandSnapshot::from_execution(&execution, None))
             .await
             .unwrap_or(false);
-        if recorded && presentation_ready {
+        if recorded {
             hub.forget_web_command(&command_id).await;
         }
     }
@@ -604,14 +599,13 @@ async fn send_command(
             .into_response();
     }
     if let Some(execution) = context.tracker.get_command(&command_id).await {
-        if execution.status.is_terminal() {
-            let presentation_ready = execution.output.is_some() || !execution.output_truncated;
+        if execution.status.is_terminal() && execution.result_ready {
             let recorded = context
                 .hub
                 .update_web_command(CommandSnapshot::from_execution(&execution, None))
                 .await
                 .unwrap_or(false);
-            if recorded && presentation_ready {
+            if recorded {
                 context.hub.forget_web_command(&command_id).await;
             }
         }
@@ -911,6 +905,7 @@ mod tests {
                 exit_code: Some(0),
                 output: Some("done".into()),
                 output_truncated: false,
+                result_ready: true,
                 reason: None,
                 started_at: now,
                 completed_at: Some(now),
@@ -944,6 +939,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorize_pane_action(
     context: &AppContext,
     tool: &str,

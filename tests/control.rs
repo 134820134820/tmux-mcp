@@ -128,6 +128,7 @@ fn action_lifecycle_keeps_one_record_and_attaches_terminal_command() {
         socket: None,
         output: Some("ok".into()),
         output_truncated: false,
+        result_ready: true,
         elapsed_ms: 12,
         reason: None,
         wait_timed_out: None,

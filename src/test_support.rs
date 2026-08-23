@@ -109,8 +109,12 @@ case "$cmd" in
           printf '%b' "${TMUX_STUB_CAPTURE_AFTER_OUTPUT:-}"
         fi
       else
-        if [ -n "${TMUX_MCP_TEST_COMMAND_ID:-}" ]; then
-          printf '%b' "prompt\nTMUX_MCP_START_${TMUX_MCP_TEST_COMMAND_ID}\nstub-output\nTMUX_MCP_DONE_${TMUX_MCP_TEST_COMMAND_ID}_0\n"
+        command_id="${TMUX_MCP_TEST_COMMAND_ID:-}"
+        if [ -z "$command_id" ] && [ -n "${TMUX_STUB_COMMAND_ID_FILE:-}" ] && [ -f "$TMUX_STUB_COMMAND_ID_FILE" ]; then
+          command_id=$(cat "$TMUX_STUB_COMMAND_ID_FILE")
+        fi
+        if [ -n "$command_id" ]; then
+          printf '%b' "prompt\nTMUX_MCP_START_${command_id}\nstub-output\nTMUX_MCP_DONE_${command_id}_0\n"
         else
           printf '%b' "prompt\nTMUX_MCP_START_default\nstub-output\nTMUX_MCP_DONE_default_0\n"
         fi
@@ -147,6 +151,18 @@ case "$cmd" in
     printf '%b' "${TMUX_STUB_BREAK_PANE_OUTPUT:-@9\tbroken\t1\t%1}"
     ;;
   send-keys)
+    if [ -n "${TMUX_STUB_COMMAND_ID_FILE:-}" ]; then
+      for arg in "$@"; do
+        case "$arg" in
+          *TMUX_MCP_START_*)
+            command_id=$(printf '%s' "$arg" | sed -n 's/.*TMUX_MCP_START_\([[:alnum:]-]*\).*/\1/p')
+            if [ -n "$command_id" ]; then
+              printf '%s' "$command_id" > "$TMUX_STUB_COMMAND_ID_FILE"
+            fi
+            ;;
+        esac
+      done
+    fi
     if [ -n "${TMUX_STUB_SEND_KEYS_LOG:-}" ]; then
       printf '%s\n' "send-keys $*" >> "$TMUX_STUB_SEND_KEYS_LOG"
     fi
@@ -216,6 +232,8 @@ impl TmuxStub {
             path.push(existing);
         }
         stub.set_var("PATH", path);
+        let command_id_file = stub._dir.path().join("command-id");
+        stub.set_var("TMUX_STUB_COMMAND_ID_FILE", command_id_file);
 
         stub
     }

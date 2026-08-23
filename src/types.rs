@@ -302,7 +302,7 @@ pub fn command_resource_uri(command_id: &str) -> String {
     format!("tmux://command/{command_id}/result")
 }
 
-/// Shared tool/resource snapshot for a tracked command (schemaVersion 1).
+/// Shared tool/resource snapshot for a tracked command (schemaVersion 2).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandSnapshot {
@@ -329,12 +329,16 @@ pub struct CommandSnapshot {
     ///
     /// This describes capture completeness, not whether the command lifecycle is terminal.
     pub output_truncated: bool,
+    /// True after the bounded final pane-capture attempt has finished.
+    /// This may be true while `output_truncated` is also true.
+    #[serde(default)]
+    pub result_ready: bool,
     /// Wall time from accept to completion (or now if still running).
     pub elapsed_ms: u64,
     /// Explanation for cancelled / tracking_error terminals.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Present on get-command-result when a wait budget expired while still non-terminal.
+    /// Present when a wait budget expired before the final result became ready.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_timed_out: Option<bool>,
     /// Wire schema version (currently [`CommandSnapshot::SCHEMA_VERSION`]).
@@ -342,13 +346,13 @@ pub struct CommandSnapshot {
 }
 
 impl CommandSnapshot {
-    /// Wire schema version embedded in every tool/resource snapshot (currently 1).
-    pub const SCHEMA_VERSION: u32 = 1;
+    /// Wire schema version embedded in every tool/resource snapshot (currently 2).
+    pub const SCHEMA_VERSION: u32 = 2;
 
     /// Project in-memory tracking state into the shared MCP snapshot shape.
     ///
-    /// `wait_timed_out` is set only when `get-command-result` hit its wait budget
-    /// while the command was still non-terminal; other callers pass `None`.
+    /// `wait_timed_out` is set only when a tool wait hit its budget before
+    /// `result_ready`; other callers pass `None`.
     pub fn from_execution(exec: &CommandExecution, wait_timed_out: Option<bool>) -> Self {
         let elapsed = exec
             .completed_at
@@ -364,6 +368,7 @@ impl CommandSnapshot {
             socket: exec.socket.clone(),
             output: exec.output.clone(),
             output_truncated: exec.output_truncated,
+            result_ready: exec.result_ready,
             elapsed_ms: elapsed.as_millis() as u64,
             reason: exec.reason.clone(),
             wait_timed_out,
@@ -397,6 +402,8 @@ pub struct CommandExecution {
     /// Whether the bounded pane capture could not recover complete output boundaries.
     /// This is independent of command completion, which is side-channel authoritative.
     pub output_truncated: bool,
+    /// True after the tracker has completed its final bounded capture attempt.
+    pub result_ready: bool,
     /// Human-readable explanation for cancelled/tracking_error terminals.
     pub reason: Option<String>,
     /// Accept time; used for abandon windows and `elapsed_ms` projection.
@@ -425,6 +432,7 @@ mod tests {
             exit_code: Some(0),
             output: Some("tail".to_string()),
             output_truncated: true,
+            result_ready: true,
             reason: None,
             started_at: now,
             completed_at: Some(now),
@@ -435,9 +443,11 @@ mod tests {
         let snapshot = CommandSnapshot::from_execution(&execution, None);
         assert_eq!(snapshot.output.as_deref(), Some("tail"));
         assert!(snapshot.output_truncated);
+        assert!(snapshot.result_ready);
 
         let wire = serde_json::to_value(snapshot).expect("serialize command snapshot");
         assert_eq!(wire["output"], "tail");
         assert_eq!(wire["outputTruncated"], true);
+        assert_eq!(wire["resultReady"], true);
     }
 }
