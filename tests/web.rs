@@ -47,6 +47,7 @@ async fn web_command_terminal_snapshot_updates_same_record() {
             socket: None,
             output: Some("clean output\n".into()),
             output_truncated: false,
+            result_ready: true,
             elapsed_ms: 42,
             reason: None,
             wait_timed_out: None,

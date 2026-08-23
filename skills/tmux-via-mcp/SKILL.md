@@ -12,10 +12,9 @@ Use this skill when a task needs a real TTY, persistent shell state, or multiple
 - Start with discovery. Call `list-sessions`, then `list-windows(sessionId)`, then `list-panes(windowId)` to get stable IDs before you act.
 - Prefer IDs over names. Names are for humans; IDs are for tooling. If you need clarity, use `rename-session`, `rename-window`, or `rename-pane`.
 - Isolate by socket when possible. Use `socket-for-path(path=<project-root>)` and pass the returned `socket` on every call that supports it.
-- For non-interactive commands, use tracked execution. Call `execute-command(paneId, command, socket?)` and use the returned `resourceUri`.
-- **Preferred completion path:** `resources/subscribe` on `resourceUri`, wait for `notifications/resources/updated`, then `resources/read`.
-- **Fallback:** `get-command-result(commandId, waitMs=N, socket?)` — do not invent sleep-poll loops.
-- Tracked commands queue one-at-a-time per pane; a second execute on a busy pane starts as `queued`.
+- For non-interactive commands, use tracked execution. Call `execute-command(paneId, command, waitMs=N, socket?)`; read the nested `result` when `resultReady=true`.
+- If the command outlives that wait, call `get-command-result(commandId, waitMs=N, socket?)` — do not invent sleep-poll loops.
+- A second tracked execute on the same busy pane is rejected; retry only after the tracker releases that pane.
 - Do not trust `TMUX_MCP_DONE_*` lines in pane text; completion is side-channel based.
 - Avoid the fragile loop of send-keys -> send-enter -> capture-pane for routine command output.
 - Do not send interactive keys into a pane while a tracked command is running on it.
@@ -25,7 +24,7 @@ Use this skill when a task needs a real TTY, persistent shell state, or multiple
 - `send-keys` accepts `enter=true` to type and submit in one call, avoiding a separate `send-enter`.
 - Treat `capture-pane` as a state probe. Use it to check progress, verify prompts, or read live output when tracking is unavailable.
 - Broadcast carefully. If you enable `set-synchronize-panes(windowId, enabled=true)`, disable it as soon as the fan-out step is done.
-- For large outputs, move data into buffers and explore incrementally. Use `set-buffer`/`load-buffer` with `search-buffer` and `subsearch-buffer`, or trigger the `tmux-buffer-explorer` skill.
+- Tracked output is a bounded pane-history snapshot. If complete large output is required, make the command write to an appropriate durable sink; `capture-pane` cannot recover history already lost.
 - Be conservative with destructive actions. Use `list-clients` before `detach-client`, and confirm targets before `kill-pane`, `kill-window`, or `kill-session`.
 
 ## Playbooks
@@ -53,22 +52,22 @@ Use this when you are about to run multiple related commands or agents.
 
    `list-panes(windowId="<windowId>", socket="<socket>")`
 
-### 2) Run a command with reliable output capture
+### 2) Run a command with bounded tracked output
 
 Use this for builds, tests, and scripts that do not require interactivity.
 
 1. Start the command:
 
-   `execute-command(paneId="<paneId>", command="sh -lc '<cmd>'", socket="<socket>")`
+   `execute-command(paneId="<paneId>", command="sh -lc '<cmd>'", waitMs=120000, socket="<socket>")`
 
-   Response includes `commandId` and `resourceUri` (`tmux://command/{id}/result`).
+   When the wait finishes, the response includes a nested `result` CommandSnapshot.
 
-2. Prefer subscribe + read:
+2. Check `resultReady`:
 
-   - `resources/subscribe` on `resourceUri`
-   - on `notifications/resources/updated`, `resources/read` the URI for the CommandSnapshot JSON
+   - `true`: the final bounded capture attempt is done; use `output` and inspect `outputTruncated`.
+   - `false`: the wait expired; continue with `get-command-result`.
 
-3. Fallback without resource subscribe:
+3. Continue a long-running command without poll loops:
 
    `get-command-result(commandId="<commandId>", waitMs=120000, socket="<socket>")`
 
@@ -78,6 +77,7 @@ Use this for builds, tests, and scripts that do not require interactivity.
 
 Notes:
 - Prefer the default tracking mode. `rawMode=true` or `noEnter=true` disables side-channel tracking.
+- `resultReady=true` does not guarantee complete output: `outputTruncated=true` means tmux history could not provide complete marker boundaries.
 - For pipes, quoting, or shell features, wrapping with `sh -lc '...'` is usually the least error-prone.
 
 ### 3) Drive an interactive terminal safely
@@ -126,7 +126,7 @@ Use this when you need multiple concurrent runners with periodic summaries.
    - `execute-command(paneId="<paneA>", command="sh -lc '<cmdA>'", socket="<socket>")`
    - `execute-command(paneId="<paneB>", command="sh -lc '<cmdB>'", socket="<socket>")`
 
-3. Prefer resource subscriptions per `resourceUri`, or `get-command-result(..., waitMs=...)` per command; probe panes only for live context:
+3. Use `get-command-result(..., waitMs=...)` per command; probe panes only for live context:
 
    - `get-command-result(commandId="<idA>", waitMs=60000, socket="<socket>")`
    - `capture-pane(paneId="<paneA>", lines=120, join=true, socket="<socket>")`
@@ -141,6 +141,6 @@ Use this when you need multiple concurrent runners with periodic summaries.
 ## Selection heuristics
 
 - Reach for tmux MCP when you need interactivity, persistent shell state, or pane-level parallelism.
-- Reach for `execute-command` when you want clean, attributable output and exit codes.
+- Reach for `execute-command` when you want tracked lifecycle, exit codes, and bounded attributable output.
 - Reach for `send-keys` only when the target program expects keystrokes.
 - If a tool call is denied, check the server security configuration and allowed scopes (socket/session/pane restrictions).

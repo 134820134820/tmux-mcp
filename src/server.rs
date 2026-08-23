@@ -270,7 +270,7 @@ macro_rules! read_resource_request {
 // Tool Output Schemas
 // ============================================================================
 
-/// Accept response for `execute-command` (before optional wait completion).
+/// Accept response for `execute-command`, optionally including a waited result.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteCommandOutput {
@@ -278,10 +278,13 @@ pub struct ExecuteCommandOutput {
     pub command_id: String,
     /// `tmux://command/{id}/result` URI for resources/subscribe.
     pub resource_uri: String,
-    /// Initial lifecycle status wire string (`running`).
+    /// Latest lifecycle status wire string.
     pub status: String,
     /// Human-readable accept note (not the command's shell output).
     pub message: String,
+    /// Present when `waitMs` produced a current result snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<CommandSnapshot>,
 }
 
 /// `list-sessions` structured payload.
@@ -662,8 +665,8 @@ pub struct SplitPaneInput {
 /// `execute-command`: tracked shell work in a pane.
 ///
 /// Wraps with a private exit-code side
-/// channel, and rejects unquoted `#`, `&`, and embedded newlines. Prefer
-/// resources/subscribe on the returned URI over tight poll loops.
+/// channel, and rejects unquoted `#`, `&`, and embedded newlines. Use `waitMs`
+/// or `get-command-result` instead of tight poll loops.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteCommandInput {
     /// Pane target id (`%N`).
@@ -686,7 +689,7 @@ pub struct ExecuteCommandInput {
     /// Per-character send delay in milliseconds (slow typing).
     #[serde(rename = "delayMs")]
     pub delay_ms: Option<u64>,
-    /// Optional block until terminal or timeout after accept. Prefer resource subscribe.
+    /// Optional block until the final result is ready or timeout after accept.
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
@@ -1352,15 +1355,11 @@ impl TmuxMcpServer {
             tokio::spawn(async move {
                 loop {
                     match events.recv().await {
-                        Ok(event)
-                            if event.kind == CommandEventKind::Terminal
-                                || (event.kind == CommandEventKind::Updated
-                                    && event.status.is_terminal()) =>
-                        {
+                        Ok(event) if event.kind == CommandEventKind::Terminal => {
                             if let Some(execution) = tracker.get_command(&event.command_id).await {
                                 let snapshot = CommandSnapshot::from_execution(&execution, None);
                                 let recorded = control.complete_command(snapshot).await.is_ok();
-                                if recorded && event.kind == CommandEventKind::Updated {
+                                if recorded {
                                     control.forget_command(&event.command_id).await;
                                 }
                             }
@@ -3346,7 +3345,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "execute-command",
-        description = "Run one tracked shell command in a pane with side-channel exit-code tracking. Returns JSON: {commandId, resourceUri, status, message}. Prefer resources/subscribe on resourceUri then resources/read on notifications/resources/updated; fallback: get-command-result with waitMs. A second command for the same busy pane is rejected. For interactive programs (vim/htop), use send-keys instead.",
+        description = "Run one tracked shell command in a pane with side-channel exit-code tracking. With waitMs, the response includes a result snapshot after final bounded output capture or timeout; otherwise use get-command-result with waitMs. A second command for the same busy pane is rejected. For interactive programs (vim/htop), use send-keys instead.",
         annotations(open_world_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<ExecuteCommandOutput>()
     )]
@@ -3386,21 +3385,38 @@ impl TmuxMcpServer {
             .await
         {
             Ok(command_id) => {
-                if let Some(wait_ms) = input.0.wait_ms.filter(|ms| *ms > 0) {
-                    let _ = self.tracker.wait_for(&command_id, wait_ms).await;
-                }
-                let status = self
-                    .tracker
-                    .get_command(&command_id)
-                    .await
-                    .map(|c| c.status.as_str().to_string())
-                    .unwrap_or_else(|| "running".into());
+                let result = if let Some(wait_ms) = input.0.wait_ms.filter(|ms| *ms > 0) {
+                    self.tracker
+                        .wait_for(&command_id, wait_ms)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|(cmd, timed_out)| {
+                            CommandSnapshot::from_execution(&cmd, timed_out.then_some(true))
+                        })
+                } else {
+                    None
+                };
+                let status = if let Some(result) = &result {
+                    result.status.as_str().to_string()
+                } else {
+                    self.tracker
+                        .get_command(&command_id)
+                        .await
+                        .map(|c| c.status.as_str().to_string())
+                        .unwrap_or_else(|| "running".into())
+                };
+                let message = match &result {
+                    Some(result) if result.result_ready => "Command result is ready in result",
+                    Some(_) => "Wait timed out; continue with get-command-result and waitMs",
+                    None => "Command accepted; use get-command-result with waitMs",
+                };
                 let response = ExecuteCommandOutput {
                     command_id: command_id.clone(),
                     resource_uri: command_resource_uri(&command_id),
                     status,
-                    message: "Command accepted; prefer resources/subscribe on resourceUri or get-command-result with waitMs"
-                        .into(),
+                    message: message.into(),
+                    result,
                 };
                 Ok(structured_output(&response))
             }
@@ -3412,7 +3428,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "get-command-result",
-        description = "Get status/output of a tracked command by ID (CommandSnapshot JSON). Prefer resources/subscribe + read for async completion; use waitMs to block until terminal or timeout without inventing poll loops. Timeout leaves the command running.",
+        description = "Get status/output of a tracked command by ID (CommandSnapshot JSON). Use waitMs to block until resultReady or timeout without inventing poll loops. outputTruncated means the final bounded tmux history capture was incomplete; capture-pane cannot recover history already lost.",
         annotations(read_only_hint = true, idempotent_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<GetCommandResultOutput>()
     )]
@@ -4820,12 +4836,10 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         let command_id = command_id.to_string();
                         let _ = control.track_command(&command_id, record).await;
                         if let Some(execution) = self.tracker.get_command(&command_id).await {
-                            if execution.status.is_terminal() {
-                                let presentation_ready =
-                                    execution.output.is_some() || !execution.output_truncated;
+                            if execution.status.is_terminal() && execution.result_ready {
                                 let snapshot = CommandSnapshot::from_execution(&execution, None);
                                 let recorded = control.complete_command(snapshot).await.is_ok();
-                                if recorded && presentation_ready {
+                                if recorded {
                                     control.forget_command(&command_id).await;
                                 }
                             }
@@ -5191,8 +5205,8 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             let mut subs = self.subscriptions.write().await;
             subs.insert(uri.clone());
         }
-        // Already-terminal commands never emit Updated/Terminal after subscribe; chime once.
-        if cmd.status.is_terminal() {
+        // Already-ready terminal commands will not emit another Terminal event; chime once.
+        if cmd.status.is_terminal() && cmd.result_ready {
             let peer = self.peer.read().await;
             if let Some(peer) = peer.as_ref() {
                 let _ = peer
@@ -6312,6 +6326,7 @@ mod tests {
                 exit_code: Some(0),
                 output: Some("done".into()),
                 output_truncated: false,
+                result_ready: true,
                 reason: None,
                 started_at: now,
                 completed_at: Some(now),
@@ -6798,6 +6813,7 @@ mod tests {
                 exit_code: None,
                 output: None,
                 output_truncated: true,
+                result_ready: false,
                 reason: None,
                 started_at: now,
                 completed_at: None,
@@ -7927,7 +7943,6 @@ mod tests {
             .expect("execute command");
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         let command_id = payload["commandId"].as_str().unwrap();
-
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
                 command_id: command_id.to_string(),
@@ -9187,7 +9202,7 @@ mod tests {
             no_enter: None,
             delay_ms: None,
             socket: None,
-            wait_ms: None,
+            wait_ms: Some(5_000),
         });
 
         let result = server
@@ -9196,6 +9211,9 @@ mod tests {
             .expect("execute command");
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         let command_id = payload["commandId"].as_str().unwrap();
+        assert_eq!(payload["result"]["status"], "completed");
+        assert_eq!(payload["result"]["output"], "stub-output");
+        assert_eq!(payload["result"]["resultReady"], true);
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
@@ -9209,6 +9227,7 @@ mod tests {
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["exitCode"], 0);
+        assert_eq!(payload["resultReady"], true);
         assert!(payload.get("resourceUri").is_some());
     }
 

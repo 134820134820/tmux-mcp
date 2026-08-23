@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `execute-command` with `waitMs` now includes the current `CommandSnapshot` as `result`.
+- `CommandSnapshot` schema version 2 adds `resultReady` to distinguish capture-in-progress from a finished but truncated capture.
+
+### Fixed
+- Terminal waits and resource notifications now become ready only after the final bounded pane capture attempt, before the pane accepts another tracked command.
+
 ## [0.6.0] - 2026-07-11
 
 ### Added

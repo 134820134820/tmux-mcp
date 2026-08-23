@@ -376,15 +376,14 @@ impl ControlClient {
                 self.forget_missing_command(&command_id).await;
                 continue;
             };
-            if !execution.status.is_terminal() {
+            if !execution.status.is_terminal() || !execution.result_ready {
                 continue;
             }
-            let presentation_ready = execution.output.is_some() || !execution.output_truncated;
             let recorded = self
                 .complete_command(CommandSnapshot::from_execution(&execution, None))
                 .await
                 .is_ok();
-            if recorded && presentation_ready {
+            if recorded {
                 self.forget_command(&command_id).await;
             }
         }
