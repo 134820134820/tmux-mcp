@@ -32,10 +32,11 @@ use crate::types::{CommandSnapshot, Pane, PaneInfo, Session, Window};
 const PER_PANE_LIMIT: usize = 200;
 const OPERATION_LIMIT: usize = 200;
 const FULL_LOG_LIMIT: usize = 200;
-const COMPACT_AT_BYTES: u64 = 4 * 1024 * 1024;
+const EVENT_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = AGENT_RECORD_MAX_BYTES;
 const TOKEN_HEADER: &str = "x-tmux-mcp-token";
 const TOPOLOGY_CACHE_TTL: Duration = Duration::from_secs(5);
+const PANE_INFO_CACHE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct HubState {
@@ -65,6 +66,8 @@ struct RecordStore {
     records: HashMap<String, ActionRecord>,
 }
 
+type PaneInfoCache = Option<(String, Instant, Option<PaneInfo>)>;
+
 #[derive(Clone)]
 struct AppContext {
     hub: HubState,
@@ -73,11 +76,14 @@ struct AppContext {
     socket: Option<String>,
     tracker: Arc<CommandTracker>,
     topology_cache: Arc<Mutex<TopologyCache>>,
+    pane_info_cache: Arc<Mutex<PaneInfoCache>>,
 }
 
 #[derive(Default)]
 struct TopologyCache {
     value: Option<(Instant, Result<Topology, String>)>,
+    refreshing: bool,
+    generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +251,7 @@ pub fn build_router(
         socket,
         tracker,
         topology_cache: Arc::new(Mutex::new(TopologyCache::default())),
+        pane_info_cache: Arc::new(Mutex::new(None)),
     };
     let api = Router::new()
         .route("/api/state", get(api_state))
@@ -349,9 +356,7 @@ async fn api_state(
     };
     let pane_info = match (query.pane_id.as_deref(), topology.as_ref()) {
         (Some(pane_id), Some(topology)) if pane_exists(pane_id, topology) => {
-            tmux::pane_info(pane_id, context.socket.as_deref())
-                .await
-                .ok()
+            cached_pane_info(&context, pane_id).await
         }
         _ => None,
     };
@@ -619,6 +624,27 @@ async fn cached_topology(context: &AppContext) -> Result<Topology, String> {
     if let Some(value) = cache.get(now) {
         return value;
     }
+
+    // Serve the last snapshot immediately after its TTL and refresh once in the
+    // background. The first load still stays synchronous so the initial page
+    // never renders a fabricated topology.
+    if let Some((_, stale_value)) = cache.value.clone() {
+        if !cache.refreshing {
+            cache.refreshing = true;
+            let generation = cache.generation;
+            let refresh_context = context.clone();
+            tokio::spawn(async move {
+                let value = load_topology(&refresh_context).await;
+                let mut cache = refresh_context.topology_cache.lock().await;
+                if cache.generation == generation {
+                    cache.value = Some((Instant::now(), value));
+                }
+                cache.refreshing = false;
+            });
+        }
+        return stale_value;
+    }
+
     let value = load_topology(context).await;
     cache.value = Some((Instant::now(), value.clone()));
     value
@@ -634,7 +660,27 @@ impl TopologyCache {
 
     fn invalidate(&mut self) {
         self.value = None;
+        self.generation = self.generation.wrapping_add(1);
     }
+}
+
+async fn cached_pane_info(context: &AppContext, pane_id: &str) -> Option<PaneInfo> {
+    let now = Instant::now();
+    {
+        let cache = context.pane_info_cache.lock().await;
+        if let Some((cached_pane, loaded_at, value)) = cache.as_ref() {
+            if cached_pane == pane_id && now.duration_since(*loaded_at) < PANE_INFO_CACHE_TTL {
+                return value.clone();
+            }
+        }
+    }
+
+    let value = tmux::pane_info(pane_id, context.socket.as_deref())
+        .await
+        .ok();
+    let mut cache = context.pane_info_cache.lock().await;
+    *cache = Some((pane_id.to_string(), Instant::now(), value.clone()));
+    value
 }
 
 async fn load_topology(context: &AppContext) -> Result<Topology, String> {
@@ -649,14 +695,32 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
         .check_socket(context.socket.as_deref())
         .map_err(|error| error.to_string())?;
 
-    let sessions = tmux::list_sessions(context.socket.as_deref())
-        .await
-        .map_err(|error| error.to_string())?;
-    let server_started_at_ms = tmux::server_start_time(context.socket.as_deref())
-        .await
+    let (topology_result, server_start_result) = tokio::join!(
+        tmux::list_topology(context.socket.as_deref()),
+        tmux::server_start_time(context.socket.as_deref())
+    );
+    let (sessions, windows, panes) = topology_result.map_err(|error| error.to_string())?;
+    let server_started_at_ms = server_start_result
         .ok()
         .flatten()
         .map(|seconds| seconds.saturating_mul(1000));
+
+    let mut windows_by_session: HashMap<String, Vec<Window>> = HashMap::new();
+    for window in windows {
+        windows_by_session
+            .entry(window.session_id.clone())
+            .or_default()
+            .push(window);
+    }
+    let mut panes_by_window: HashMap<String, Vec<Pane>> = HashMap::new();
+    for pane in panes {
+        if context.policy.check_pane(&pane.id).is_ok() {
+            panes_by_window
+                .entry(pane.window_id.clone())
+                .or_default()
+                .push(pane);
+        }
+    }
     let mut nodes = Vec::new();
     for session in sessions {
         if context
@@ -666,19 +730,15 @@ async fn load_topology(context: &AppContext) -> Result<Topology, String> {
         {
             continue;
         }
-        let windows = tmux::list_windows(&session.id, context.socket.as_deref())
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut window_nodes = Vec::new();
-        for window in windows {
-            let panes = tmux::list_panes(&window.id, context.socket.as_deref())
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|pane| context.policy.check_pane(&pane.id).is_ok())
-                .collect();
-            window_nodes.push(WindowNode { window, panes });
-        }
+        let window_nodes = windows_by_session
+            .remove(&session.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|window| {
+                let panes = panes_by_window.remove(&window.id).unwrap_or_default();
+                WindowNode { window, panes }
+            })
+            .collect();
         nodes.push(SessionNode {
             session,
             windows: window_nodes,
@@ -702,6 +762,8 @@ mod tests {
         let loaded_at = Instant::now();
         let cache = TopologyCache {
             value: Some((loaded_at, Err("tmux unavailable".into()))),
+            refreshing: false,
+            generation: 0,
         };
 
         assert!(matches!(
@@ -1354,7 +1416,16 @@ impl RecordStore {
             Err(error) => return Err(error),
         }
         repair_partial_tail(&path)?;
-        Ok(Self { path, records })
+        let mut store = Self { path, records };
+        let oversized = match store.path.metadata() {
+            Ok(metadata) => metadata.len() > EVENT_LOG_MAX_BYTES,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if oversized {
+            store.compact()?;
+        }
+        Ok(store)
     }
 
     fn mark_interrupted_incomplete(&mut self) -> io::Result<()> {
@@ -1380,6 +1451,13 @@ impl RecordStore {
     }
 
     fn upsert(&mut self, record: ActionRecord) -> io::Result<()> {
+        let encoded = serde_json::to_vec(&record)?;
+        if encoded.len().saturating_add(1) > AGENT_RECORD_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent event record exceeds 1 MiB",
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1388,10 +1466,10 @@ impl RecordStore {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, &record)?;
+        file.write_all(&encoded)?;
         file.write_all(b"\n")?;
         file.flush()?;
-        let should_compact = file.metadata()?.len() > COMPACT_AT_BYTES;
+        let should_compact = file.metadata()?.len() > EVENT_LOG_MAX_BYTES;
         drop(file);
         self.records.insert(record.id.clone(), record);
         if should_compact {
@@ -1494,17 +1572,34 @@ impl RecordStore {
                 keep.insert(record.id);
             }
         }
+        let mut retained = Vec::new();
+        let mut retained_bytes = 0_u64;
+        for record in self
+            .sorted_records()
+            .into_iter()
+            .rev()
+            .filter(|record| keep.contains(&record.id))
+        {
+            let encoded = serde_json::to_vec(&record)?;
+            let line_bytes = encoded.len() as u64 + 1;
+            if retained_bytes.saturating_add(line_bytes) > EVENT_LOG_MAX_BYTES {
+                break;
+            }
+            retained_bytes += line_bytes;
+            retained.push((record, encoded));
+        }
+        retained.reverse();
+        let retained_ids = retained
+            .iter()
+            .map(|(record, _)| record.id.clone())
+            .collect::<HashSet<_>>();
         let temporary = self.path.with_extension("jsonl.tmp");
         let backup = self.path.with_extension("jsonl.bak");
         remove_file_if_exists(&temporary)?;
         remove_file_if_exists(&backup)?;
         let mut file = File::create(&temporary)?;
-        for record in self
-            .sorted_records()
-            .into_iter()
-            .filter(|record| keep.contains(&record.id))
-        {
-            serde_json::to_writer(&mut file, &record)?;
+        for (_, encoded) in retained {
+            file.write_all(&encoded)?;
             file.write_all(b"\n")?;
         }
         file.sync_all()?;
@@ -1518,7 +1613,7 @@ impl RecordStore {
             }
             return Err(error);
         }
-        self.records.retain(|id, _| keep.contains(id));
+        self.records.retain(|id, _| retained_ids.contains(id));
         remove_file_if_exists(&backup)
     }
 }

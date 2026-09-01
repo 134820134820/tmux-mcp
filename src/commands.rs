@@ -103,7 +103,7 @@ pub struct TrackingConfig {
     /// Cap on retained terminal records (oldest completed first when over budget).
     #[serde(default = "default_completed_max_entries")]
     pub completed_max_entries: u32,
-    /// Max wait for the side-channel `wait-for` signal before `tracking_error`.
+    /// Interval for checking whether a long-running side-channel waiter was purged.
     #[serde(default = "default_tracking_deadline_seconds")]
     pub tracking_deadline_seconds: u64,
 }
@@ -128,7 +128,7 @@ fn default_completed_max_entries() -> u32 {
     1000
 }
 
-/// How long the side-channel watcher waits for `wait-for` before tracking_error.
+/// How often a side-channel watcher checks whether its command was purged.
 fn default_tracking_deadline_seconds() -> u64 {
     600
 }
@@ -240,6 +240,8 @@ impl CommandTracker {
         let command_id = Uuid::new_v4().to_string();
         let resolved_socket = tmux::resolve_socket(socket.as_deref());
         let tracking_disabled = raw_mode || no_enter;
+        // `Some(0)` must not fall into the slow per-character path.
+        let delay_ms = delay_ms.filter(|delay| *delay > 0);
 
         if !tracking_disabled && command.contains(['\n', '\r']) {
             return Err(Error::InvalidArgument {
@@ -378,7 +380,7 @@ impl CommandTracker {
         socket: Option<&str>,
         command_id: &str,
     ) -> Result<()> {
-        if let Some(delay) = delay_ms {
+        if let Some(delay) = delay_ms.filter(|delay| *delay > 0) {
             for ch in wrapped_command.chars() {
                 if let Err(e) = tmux::send_keys(pane_id, &ch.to_string(), true, socket).await {
                     self.remove_command(command_id).await;
@@ -392,17 +394,16 @@ impl CommandTracker {
                     return Err(e);
                 }
             }
-        } else {
+        } else if no_enter {
             if let Err(e) = tmux::send_keys(pane_id, wrapped_command, false, socket).await {
                 self.remove_command(command_id).await;
                 return Err(e);
             }
-            if !no_enter {
-                if let Err(e) = tmux::send_keys(pane_id, "Enter", false, socket).await {
-                    self.remove_command(command_id).await;
-                    return Err(e);
-                }
-            }
+        } else if let Err(e) =
+            tmux::send_keys_with_enter(pane_id, wrapped_command, false, socket).await
+        {
+            self.remove_command(command_id).await;
+            return Err(e);
         }
         Ok(())
     }
@@ -461,6 +462,15 @@ impl CommandTracker {
         }
 
         Ok(Some(execution))
+    }
+
+    /// Return the current in-memory status without an implicit `capture-pane`.
+    ///
+    /// This is the cheap path for polling APIs. Callers that need fresh partial
+    /// scrollback should use `check_status` explicitly or call `capture-pane`.
+    pub async fn status_snapshot(&self, command_id: &str) -> Option<CommandExecution> {
+        self.cleanup_completed().await;
+        self.get_command(command_id).await
     }
 
     /// Block until the terminal result is ready or `wait_ms` elapses.
@@ -796,14 +806,31 @@ fn spawn_side_channel_watcher(
     secret: String,
 ) {
     tokio::spawn(async move {
-        let deadline = Duration::from_secs(tracking.tracking_deadline_seconds);
+        let checkpoint =
+            Duration::from_secs(tracking.tracking_deadline_seconds).max(Duration::from_secs(1));
         let channel = tmux::wait_signal_name(&secret);
-        let wait_result =
-            tokio::time::timeout(deadline, tmux::wait_for_signal(&channel, socket.as_deref()))
-                .await;
+        let wait_result = {
+            let wait = tmux::wait_for_signal(&channel, socket.as_deref());
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    result = &mut wait => break result,
+                    _ = tokio::time::sleep(checkpoint) => {
+                        let still_tracked = active_commands
+                            .read()
+                            .await
+                            .get(&command_id)
+                            .is_some_and(|exec| !exec.status.is_terminal());
+                        if !still_tracked {
+                            return;
+                        }
+                    }
+                }
+            }
+        };
 
         let (status, exit_code, reason, final_capture) = match wait_result {
-            Ok(Ok(())) => match tmux::read_exit_code_buffer(&secret, socket.as_deref()).await {
+            Ok(()) => match tmux::read_exit_code_buffer(&secret, socket.as_deref()).await {
                 Ok(exit_code) => (
                     if exit_code == 0 {
                         CommandStatus::Completed
@@ -821,16 +848,10 @@ fn spawn_side_channel_watcher(
                     true,
                 ),
             },
-            Ok(Err(e)) => (
+            Err(e) => (
                 CommandStatus::TrackingError,
                 None,
                 Some(format!("wait-for failed: {e}")),
-                false,
-            ),
-            Err(_) => (
-                CommandStatus::TrackingError,
-                None,
-                Some("tracking deadline exceeded waiting for side channel".to_string()),
                 false,
             ),
         };
@@ -876,7 +897,7 @@ fn spawn_side_channel_watcher(
                     captured
                 }
             };
-            let captured = tokio::time::timeout(deadline, capture)
+            let captured = tokio::time::timeout(checkpoint, capture)
                 .await
                 .unwrap_or_else(|_| CapturedOutput::unavailable());
 
@@ -928,15 +949,14 @@ async fn dispatch_keys_free(
     delay_ms: Option<u64>,
     socket: Option<&str>,
 ) -> Result<()> {
-    if let Some(delay) = delay_ms {
+    if let Some(delay) = delay_ms.filter(|delay| *delay > 0) {
         for ch in wrapped_command.chars() {
             tmux::send_keys(pane_id, &ch.to_string(), true, socket).await?;
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         tmux::send_keys(pane_id, "Enter", false, socket).await?;
     } else {
-        tmux::send_keys(pane_id, wrapped_command, false, socket).await?;
-        tmux::send_keys(pane_id, "Enter", false, socket).await?;
+        tmux::send_keys_with_enter(pane_id, wrapped_command, false, socket).await?;
     }
     Ok(())
 }
@@ -1509,6 +1529,31 @@ mod tests {
         assert!(!observed.output_truncated);
     }
 
+    #[tokio::test]
+    async fn status_snapshot_does_not_capture_running_output() {
+        let mut stub = TmuxStub::new();
+        let capture_log = NamedTempFile::new().expect("capture log");
+        stub.set_var("TMUX_STUB_CAPTURE_LOG", capture_log.path());
+        let tracker = CommandTracker::new(ShellType::Bash);
+        tracker
+            .active_commands
+            .write()
+            .await
+            .insert("cmd-snapshot".into(), running_execution("cmd-snapshot"));
+
+        let snapshot = tracker
+            .status_snapshot("cmd-snapshot")
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.status, CommandStatus::Running);
+        assert!(
+            !capture_log.path().exists()
+                || std::fs::read_to_string(capture_log.path())
+                    .expect("read capture log")
+                    .is_empty()
+        );
+    }
+
     #[test]
     fn test_wrap_includes_side_channel() {
         let wrapped = wrap_tracked_command_side_channel(
@@ -1759,23 +1804,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_timeout_leaves_running() {
+    async fn caller_timeout_stays_running_after_tracking_checkpoint() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "3");
-        let tracker = CommandTracker::new(ShellType::Bash);
+        let tracker = CommandTracker::with_tracking(
+            ShellType::Bash,
+            TrackingConfig {
+                tracking_deadline_seconds: 1,
+                ..TrackingConfig::default()
+            },
+        );
         let id = tracker
             .execute_command("%1", "sleep 99", false, false, None, None)
             .await
             .expect("execute");
         let (cmd, timed_out) = tracker
-            .wait_for(&id, 100)
+            .wait_for(&id, 1_200)
             .await
             .expect("wait")
             .expect("found");
         assert!(timed_out);
         assert!(
             !cmd.status.is_terminal(),
-            "timeout must not terminalize; got {:?}",
+            "elapsed waits must not terminalize; got {:?}",
             cmd.status
         );
     }
@@ -1845,6 +1896,27 @@ mod tests {
             !logged.contains("set __tmux_mcp_ec $status"),
             "bash pane must not receive fish syntax, got: {logged}"
         );
+        assert_eq!(
+            logged.lines().count(),
+            1,
+            "payload and Enter should share one call"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_zero_delay_does_not_type_character_by_character() {
+        let mut stub = TmuxStub::new();
+        let log = NamedTempFile::new().expect("log");
+        stub.set_var("TMUX_STUB_SEND_KEYS_LOG", log.path());
+        let tracker = CommandTracker::new(ShellType::Bash);
+
+        tracker
+            .execute_command("%1", "true", false, false, Some(0), None)
+            .await
+            .expect("execute");
+
+        let logged = std::fs::read_to_string(log.path()).expect("read log");
+        assert_eq!(logged.lines().count(), 1);
     }
 
     #[tokio::test]

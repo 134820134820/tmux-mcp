@@ -1917,52 +1917,44 @@ impl TmuxMcpServer {
                 error.to_string(),
             )]));
         }
-        let sessions = match tmux::list_sessions(socket.as_deref()).await {
-            Ok(sessions) => sessions
-                .into_iter()
-                .filter(|session| {
-                    self.policy
-                        .check_session_identity(&session.id, Some(&session.name))
-                        .is_ok()
-                })
-                .collect::<Vec<_>>(),
+        let (topology_result, current_session_result) = tokio::join!(
+            tmux::list_topology(socket.as_deref()),
+            tmux::get_current_session(socket.as_deref())
+        );
+        let (all_sessions, all_windows, all_panes) = match topology_result {
+            Ok(topology) => topology,
             Err(error) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Error listing tmux state: {error}"
                 ))]))
             }
         };
+        let sessions = all_sessions
+            .into_iter()
+            .filter(|session| {
+                self.policy
+                    .check_session_identity(&session.id, Some(&session.name))
+                    .is_ok()
+            })
+            .collect::<Vec<_>>();
         let mut windows = Vec::new();
         let mut panes = Vec::new();
         for session in &sessions {
-            let session_windows = match tmux::list_windows(&session.id, socket.as_deref()).await {
-                Ok(windows) => windows,
-                Err(error) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error listing windows for {}: {error}",
-                        session.id
-                    ))]))
-                }
-            };
-            for window in &session_windows {
-                match tmux::list_panes(&window.id, socket.as_deref()).await {
-                    Ok(window_panes) => panes.extend(
-                        window_panes
-                            .into_iter()
-                            .filter(|pane| self.policy.check_pane(&pane.id).is_ok()),
-                    ),
-                    Err(error) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Error listing panes for {}: {error}",
-                            window.id
-                        ))]))
-                    }
-                }
+            for window in all_windows
+                .iter()
+                .filter(|window| window.session_id == session.id)
+            {
+                panes.extend(
+                    all_panes
+                        .iter()
+                        .filter(|pane| pane.window_id == window.id)
+                        .filter(|pane| self.policy.check_pane(&pane.id).is_ok())
+                        .cloned(),
+                );
+                windows.push(window.clone());
             }
-            windows.extend(session_windows);
         }
-        let current_session_id = tmux::get_current_session(socket.as_deref())
-            .await
+        let current_session_id = current_session_result
             .ok()
             .filter(|session| {
                 self.policy
@@ -3428,7 +3420,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "get-command-result",
-        description = "Get status/output of a tracked command by ID (CommandSnapshot JSON). Use waitMs to block until resultReady or timeout without inventing poll loops. outputTruncated means the final bounded tmux history capture was incomplete; capture-pane cannot recover history already lost.",
+        description = "Get status/output of a tracked command by ID (CommandSnapshot JSON). Without waitMs this is an in-memory snapshot; use waitMs to block until resultReady or timeout without inventing poll loops. Use capture-pane explicitly when fresh partial scrollback is needed. outputTruncated means the final bounded tmux history capture was incomplete; capture-pane cannot recover history already lost.",
         annotations(read_only_hint = true, idempotent_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<GetCommandResultOutput>()
     )]
@@ -3504,21 +3496,12 @@ impl TmuxMcpServer {
                 }
             }
         } else {
-            match self
-                .tracker
-                .check_status(&input.0.command_id, socket.as_deref())
-                .await
-            {
-                Ok(Some(cmd)) => (cmd, None),
-                Ok(None) => {
+            match self.tracker.status_snapshot(&input.0.command_id).await {
+                Some(cmd) => (cmd, None),
+                None => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
                         "Command not found: {}",
                         input.0.command_id
-                    ))]));
-                }
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error getting command result: {e}"
                     ))]));
                 }
             }
@@ -4311,8 +4294,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         let repeat_count = input.0.repeat.unwrap_or(1).max(1);
+        // Zero means no delay; it must not trigger one remote call per character.
+        let delay_ms = input.0.delay_ms.filter(|delay| *delay > 0);
+        let enter = input.0.enter.unwrap_or(false);
+        let combine_enter = enter && !literal && delay_ms.is_none();
         for _ in 0..repeat_count {
-            if let Some(delay) = input.0.delay_ms {
+            if let Some(delay) = delay_ms {
                 if literal {
                     for ch in input.0.keys.chars() {
                         if let Err(e) = tmux::send_keys(
@@ -4340,6 +4327,19 @@ impl TmuxMcpServer {
                     }
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
+            } else if combine_enter {
+                if let Err(e) = tmux::send_keys_with_enter(
+                    &input.0.pane_id,
+                    &input.0.keys,
+                    false,
+                    socket.as_deref(),
+                )
+                .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error sending keys: {e}"
+                    ))]));
+                }
             } else if let Err(e) =
                 tmux::send_keys(&input.0.pane_id, &input.0.keys, literal, socket.as_deref()).await
             {
@@ -4347,7 +4347,7 @@ impl TmuxMcpServer {
                     "Error sending keys: {e}"
                 ))]));
             }
-            if input.0.enter.unwrap_or(false) {
+            if enter && !combine_enter {
                 if let Err(e) =
                     tmux::send_keys(&input.0.pane_id, "Enter", false, socket.as_deref()).await
                 {
@@ -5585,8 +5585,8 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )],
                     });
                 }
-                match self.tracker.check_status(command_id, None).await {
-                    Ok(Some(cmd)) => {
+                match self.tracker.status_snapshot(command_id).await {
+                    Some(cmd) => {
                         let result = CommandSnapshot::from_execution(&cmd, None);
                         Ok(read_resource_result! {
                             contents: vec![ResourceContents::text(
@@ -5595,14 +5595,11 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                             )],
                         })
                     }
-                    Ok(None) => Ok(read_resource_result! {
+                    None => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(
                             format!("Command not found: {command_id}"),
                             uri,
                         )],
-                    }),
-                    Err(e) => Ok(read_resource_result! {
-                        contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
                 }
             } else {

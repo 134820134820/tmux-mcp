@@ -522,6 +522,54 @@ async fn oversized_jsonl_is_compacted_to_retained_records() {
     assert_eq!(reloaded.operations().await.len(), 200);
 }
 
+#[tokio::test]
+async fn compaction_enforces_the_event_log_byte_budget() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+    let mut file = std::fs::File::create(&paths.events).expect("create oversized event log");
+    let payload = "x".repeat(32 * 1024);
+
+    for index in 0..200_u64 {
+        let mut operation = ActionRecord::new(
+            "Codex",
+            "select-layout",
+            json!({"windowId": "@1", "layout": "tiled", "payload": payload}),
+        );
+        operation.id = format!("operation-{index:03}");
+        operation.requested_at_ms = index;
+        operation.updated_at_ms = index;
+        operation.mark_completed(None);
+        serde_json::to_writer(&mut file, &operation).expect("serialize event");
+        file.write_all(b"\n").expect("terminate event line");
+    }
+    file.flush().expect("flush oversized event log");
+    assert!(std::fs::metadata(&paths.events).unwrap().len() > 4 * 1024 * 1024);
+
+    let state = HubState::open(paths.clone()).expect("open and compact event log");
+    let operations = state.operations().await;
+
+    assert!(std::fs::metadata(&paths.events).unwrap().len() <= 4 * 1024 * 1024);
+    assert!(operations.len() < 200);
+    assert_eq!(operations.last().unwrap().id, "operation-199");
+}
+
+#[tokio::test]
+async fn individual_event_records_cannot_exceed_the_transport_limit() {
+    let dir = tempdir().expect("temp state dir");
+    let paths = StatePaths::new(dir.path());
+    let state = HubState::open(paths.clone()).expect("open hub");
+    let mut record = ActionRecord::new("Codex", "read-file", json!({"paneId": "%1"}));
+    record.mark_completed(Some(json!({"content": "x".repeat(1024 * 1024)})));
+
+    let error = state
+        .upsert(record)
+        .await
+        .expect_err("reject oversized event record");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!paths.events.exists());
+}
+
 #[test]
 fn bind_address_must_be_loopback() {
     assert!(validate_bind_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 38473)).is_ok());

@@ -48,10 +48,26 @@ case "$cmd" in
     printf '%b' "${TMUX_STUB_LIST_SESSIONS:-%1\talpha\t1\t2\n%2\tbeta\t0\t1}"
     ;;
   list-windows)
-    printf '%b' "${TMUX_STUB_LIST_WINDOWS:-@1\tfirst\t1\n@2\tsecond\t0}"
+    all=0
+    for arg in "$@"; do
+      if [ "$arg" = "-a" ]; then all=1; fi
+    done
+    if [ "$all" = "1" ]; then
+      printf '%b' "${TMUX_STUB_LIST_WINDOWS_ALL:-@1\tfirst\t1\t%1\n@2\tsecond\t0\t%2}"
+    else
+      printf '%b' "${TMUX_STUB_LIST_WINDOWS:-@1\tfirst\t1\n@2\tsecond\t0}"
+    fi
     ;;
   list-panes)
-    printf '%b' "${TMUX_STUB_LIST_PANES:-%1\tpane-one\t1\n%2\tpane-two\t0}"
+    all=0
+    for arg in "$@"; do
+      if [ "$arg" = "-a" ]; then all=1; fi
+    done
+    if [ "$all" = "1" ]; then
+      printf '%b' "${TMUX_STUB_LIST_PANES_ALL:-%1\tpane-one\t1\t@1\n%2\tpane-two\t0\t@2}"
+    else
+      printf '%b' "${TMUX_STUB_LIST_PANES:-%1\tpane-one\t1\n%2\tpane-two\t0}"
+    fi
     ;;
   list-clients)
     printf '%b' "${TMUX_STUB_LIST_CLIENTS:-/dev/ttys000\tclient0\talpha\t123\t1}"
