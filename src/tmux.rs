@@ -41,6 +41,10 @@ const PARALLEL_BUFFER_THRESHOLD: usize = 10;
 /// Fuzzy scoring skips individual lines larger than this to bound CPU.
 const FUZZY_MAX_LINE_BYTES: usize = 4_096;
 const READ_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound one ordinary tmux/SSH request. Long-lived `wait-for` calls use their
+/// own intentionally unbounded path and do not go through this wrapper.
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+const SSH_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const GIT_ERROR_MAX_BYTES: usize = 65_536;
 const GIT_ROOT_MAX_BYTES: usize = 16_384;
 const GIT_ARGUMENT_MAX_BYTES: usize = 16_384;
@@ -250,10 +254,45 @@ pub fn parse_ssh_args(value: &str) -> Result<Option<Vec<String>>> {
     }
 }
 
+fn ssh_args_have_connect_timeout(args: &[String]) -> bool {
+    let mut expects_value = false;
+    for arg in args {
+        if expects_value {
+            if arg.to_ascii_lowercase().starts_with("connecttimeout=") {
+                return true;
+            }
+            expects_value = false;
+            continue;
+        }
+        if arg == "-o" {
+            expects_value = true;
+        } else if arg
+            .strip_prefix("-o")
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("connecttimeout="))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Get SSH arguments for tmux commands.
 fn get_ssh_args() -> Result<Option<Vec<String>>> {
     match std::env::var("TMUX_MCP_SSH") {
-        Ok(value) => parse_ssh_args(&value),
+        Ok(value) => Ok(parse_ssh_args(&value)?.map(|args| {
+            // OpenSSH uses the first occurrence of an option. Preserve an
+            // explicit caller timeout; otherwise prepend the conservative
+            // default before the destination host.
+            if ssh_args_have_connect_timeout(&args) {
+                return args;
+            }
+            let mut configured = vec![
+                "-o".to_string(),
+                format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}"),
+            ];
+            configured.extend(args);
+            configured
+        })),
         Err(_) => Ok(None),
     }
 }
@@ -344,42 +383,61 @@ async fn run_tmux_with_socket(
     socket: Option<&str>,
     stdin: Option<&[u8]>,
 ) -> Result<std::process::Output> {
-    let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
-        message: format!("tmux semaphore closed: {e}"),
-    })?;
+    let _permit = tokio::time::timeout(TMUX_COMMAND_TIMEOUT, TMUX_SEMAPHORE.acquire())
+        .await
+        .map_err(|_| Error::Tmux {
+            message: format!(
+                "tmux request queue timed out after {} seconds",
+                TMUX_COMMAND_TIMEOUT.as_secs()
+            ),
+        })?
+        .map_err(|e| Error::Tmux {
+            message: format!("tmux semaphore closed: {e}"),
+        })?;
 
     let mut command = build_tmux_command(args, socket, stdin.is_some())?;
+    command.kill_on_drop(true);
 
-    let output = if let Some(input) = stdin {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::Tmux {
-                message: format!("failed to spawn tmux: {e}"),
-            })?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin
-                .write_all(input)
+    let operation = async move {
+        if let Some(input) = stdin {
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| Error::Tmux {
+                    message: format!("failed to spawn tmux: {e}"),
+                })?;
+            if let Some(mut child_stdin) = child.stdin.take() {
+                child_stdin
+                    .write_all(input)
+                    .await
+                    .map_err(|e| Error::Tmux {
+                        message: format!("failed to write tmux stdin: {e}"),
+                    })?;
+            }
+            child.wait_with_output().await.map_err(|e| Error::Tmux {
+                message: format!("failed to wait for tmux: {e}"),
+            })
+        } else {
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
                 .await
                 .map_err(|e| Error::Tmux {
-                    message: format!("failed to write tmux stdin: {e}"),
-                })?;
+                    message: format!("failed to spawn tmux: {e}"),
+                })
         }
-        child.wait_with_output().await.map_err(|e| Error::Tmux {
-            message: format!("failed to wait for tmux: {e}"),
-        })?
-    } else {
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| Error::Tmux {
-                message: format!("failed to spawn tmux: {e}"),
-            })?
     };
+    let output = tokio::time::timeout(TMUX_COMMAND_TIMEOUT, operation)
+        .await
+        .map_err(|_| Error::Tmux {
+            message: format!(
+                "tmux command timed out after {} seconds",
+                TMUX_COMMAND_TIMEOUT.as_secs()
+            ),
+        })??;
 
     Ok(output)
 }
@@ -1436,6 +1494,30 @@ pub fn parse_windows(output: &str, session_id: &str) -> Vec<Window> {
         .collect()
 }
 
+/// Parse all-window output where the owning session id is the fourth field.
+pub fn parse_all_windows(output: &str) -> Vec<Window> {
+    if output.is_empty() {
+        return Vec::new();
+    }
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts = split_tmux_fields(line);
+            if parts.len() == 4 {
+                Some(Window {
+                    id: parts[0].clone(),
+                    name: parts[1].clone(),
+                    active: parts[2] == "1",
+                    session_id: parts[3].clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Parse structured `list-panes -F` output.
 pub fn parse_panes(output: &str, window_id: &str) -> Vec<Pane> {
     if output.is_empty() {
@@ -1452,6 +1534,30 @@ pub fn parse_panes(output: &str, window_id: &str) -> Vec<Pane> {
                     title: parts[1].to_string(),
                     active: parts[2] == "1",
                     window_id: window_id.to_string(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parse all-pane output where the owning window id is the fourth field.
+pub fn parse_all_panes(output: &str) -> Vec<Pane> {
+    if output.is_empty() {
+        return Vec::new();
+    }
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts = split_tmux_fields(line);
+            if parts.len() == 4 {
+                Some(Pane {
+                    id: parts[0].clone(),
+                    title: parts[1].clone(),
+                    active: parts[2] == "1",
+                    window_id: parts[3].clone(),
                 })
             } else {
                 None
@@ -1583,12 +1689,51 @@ pub async fn list_windows(session_id: &str, socket: Option<&str>) -> Result<Vec<
     Ok(parse_windows(output.trim(), session_id))
 }
 
+/// Enumerate every window on a socket in one tmux request.
+pub async fn list_all_windows(socket: Option<&str>) -> Result<Vec<Window>> {
+    let format =
+        "#{window_id}|#{s,%,%25,;s,\\|,%7C,:window_name}|#{?window_active,1,0}|#{session_id}";
+    let output = execute_tmux_with_socket(&["list-windows", "-a", "-F", format], socket).await?;
+    Ok(parse_all_windows(output.trim()))
+}
+
 /// Enumerate panes for a window target (`-t window_id`).
 pub async fn list_panes(window_id: &str, socket: Option<&str>) -> Result<Vec<Pane>> {
     let format = "#{pane_id}|#{s,%,%25,;s,\\|,%7C,:pane_title}|#{?pane_active,1,0}";
     let output =
         execute_tmux_with_socket(&["list-panes", "-t", window_id, "-F", format], socket).await?;
     Ok(parse_panes(output.trim(), window_id))
+}
+
+/// Enumerate every pane on a socket in one tmux request.
+pub async fn list_all_panes(socket: Option<&str>) -> Result<Vec<Pane>> {
+    let format = "#{pane_id}|#{s,%,%25,;s,\\|,%7C,:pane_title}|#{?pane_active,1,0}|#{window_id}";
+    let output = execute_tmux_with_socket(&["list-panes", "-a", "-F", format], socket).await?;
+    Ok(parse_all_panes(output.trim()))
+}
+
+/// Read the complete topology with a fixed three-call fan-out.
+///
+/// The lists are independent, so this removes the old per-session/per-window
+/// N+1 round trips while the process semaphore still bounds local concurrency.
+pub async fn list_topology(socket: Option<&str>) -> Result<(Vec<Session>, Vec<Window>, Vec<Pane>)> {
+    let (sessions_result, windows_result, panes_result) = tokio::join!(
+        list_sessions(socket),
+        list_all_windows(socket),
+        list_all_panes(socket)
+    );
+    let sessions = sessions_result?;
+    let windows = match windows_result {
+        Ok(windows) => windows,
+        Err(_error) if sessions.is_empty() => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let panes = match panes_result {
+        Ok(panes) => panes,
+        Err(_error) if sessions.is_empty() && windows.is_empty() => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    Ok((sessions, windows, panes))
 }
 
 /// Capture pane scrollback/history as text for tools and partial command output.
@@ -3176,6 +3321,7 @@ pub fn wait_signal_name(secret: &str) -> String {
 /// Does **not** use the global tmux semaphore so long waits do not stall other ops.
 pub async fn wait_for_signal(channel: &str, socket: Option<&str>) -> Result<()> {
     let mut command = build_tmux_command(&["wait-for", channel], socket, false)?;
+    command.kill_on_drop(true);
     let output = command.output().await.map_err(|e| Error::Tmux {
         message: format!("failed to run tmux wait-for: {e}"),
     })?;
@@ -3261,6 +3407,26 @@ pub async fn send_keys(
         }
     } else {
         execute_tmux_with_socket(&["send-keys", "-t", pane_id, "--", keys], socket).await?;
+    }
+    Ok(())
+}
+
+/// Send a non-literal payload and the Enter key in one tmux invocation.
+///
+/// Literal payloads cannot use this form because `Enter` would be treated as
+/// literal text under `-l`; callers keep the two-call path for those payloads.
+pub async fn send_keys_with_enter(
+    pane_id: &str,
+    keys: &str,
+    literal: bool,
+    socket: Option<&str>,
+) -> Result<()> {
+    if literal {
+        send_keys(pane_id, keys, true, socket).await?;
+        send_keys(pane_id, "Enter", false, socket).await?;
+    } else {
+        execute_tmux_with_socket(&["send-keys", "-t", pane_id, "--", keys, "Enter"], socket)
+            .await?;
     }
     Ok(())
 }
@@ -3848,11 +4014,29 @@ mod tests {
         let no_payload = build_tmux_command(&["-V"], None, false).expect("no-payload command");
         let no_payload_args: Vec<_> = no_payload.as_std().get_args().collect();
         assert!(no_payload_args.iter().any(|arg| *arg == "-n"));
+        assert!(no_payload_args
+            .windows(2)
+            .any(|pair| pair[0] == "-o" && pair[1] == "ConnectTimeout=5"));
 
         let payload =
             build_tmux_command(&["load-buffer", "-"], None, true).expect("payload command");
         let payload_args: Vec<_> = payload.as_std().get_args().collect();
         assert!(!payload_args.iter().any(|arg| *arg == "-n"));
+    }
+
+    #[test]
+    fn ssh_connect_timeout_can_be_overridden() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SSH", "-o ConnectTimeout=30 user@host");
+
+        let command = build_tmux_command(&["-V"], None, false).expect("ssh command");
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "-o" && pair[1] == "ConnectTimeout=30" }));
+        assert!(!args
+            .windows(2)
+            .any(|pair| { pair[0] == "-o" && pair[1] == "ConnectTimeout=5" }));
     }
 
     #[test]
@@ -3903,6 +4087,44 @@ mod tests {
         assert_eq!(result[1].name, "vim");
     }
 
+    #[test]
+    fn parse_all_lists_keep_parent_ids() {
+        assert_eq!(
+            parse_all_windows("@1\tfirst\t1\t$0\n@2\tsecond\t0\t$1"),
+            vec![
+                Window {
+                    id: "@1".into(),
+                    name: "first".into(),
+                    active: true,
+                    session_id: "$0".into()
+                },
+                Window {
+                    id: "@2".into(),
+                    name: "second".into(),
+                    active: false,
+                    session_id: "$1".into()
+                },
+            ]
+        );
+        assert_eq!(
+            parse_all_panes("%1\tone\t1\t@1\n%2\ttwo\t0\t@2"),
+            vec![
+                Pane {
+                    id: "%1".into(),
+                    title: "one".into(),
+                    active: true,
+                    window_id: "@1".into()
+                },
+                Pane {
+                    id: "%2".into(),
+                    title: "two".into(),
+                    active: false,
+                    window_id: "@2".into()
+                },
+            ]
+        );
+    }
+
     #[rstest]
     #[case(
         "%0\tbash\t1\n%1\thtop\t0",
@@ -3943,6 +4165,24 @@ mod tests {
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("-l -- hello"));
+    }
+
+    #[tokio::test]
+    async fn send_keys_with_enter_uses_one_non_literal_call() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var("TMUX_STUB_SEND_KEYS_LOG", &log_path);
+
+        send_keys_with_enter("%1", "echo hi", false, None)
+            .await
+            .expect("send keys with enter");
+
+        let lines = std::fs::read_to_string(log_path)
+            .expect("read send-keys log")
+            .lines()
+            .count();
+        assert_eq!(lines, 1);
     }
 
     #[tokio::test]
@@ -4474,6 +4714,22 @@ mod tests {
 
         let panes = list_panes("@1", None).await.expect("list panes");
         assert_eq!(panes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_topology_uses_all_scope_records() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_LIST_WINDOWS_ALL",
+            "@1\tfirst\t1\t%1\n@2\tsecond\t0\t%2",
+        );
+        stub.set_var("TMUX_STUB_LIST_PANES_ALL", "%1\tone\t1\t@1\n%2\ttwo\t0\t@2");
+
+        let (_sessions, windows, panes) = list_topology(None).await.expect("topology");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1].session_id, "%2");
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].window_id, "@1");
     }
 
     #[tokio::test]

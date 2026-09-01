@@ -259,7 +259,7 @@ pub enum ShellType {
 
 /// Lifecycle status of a tracked command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum CommandStatus {
     /// Legacy wire value retained for compatibility; new commands are never queued.
     Queued,
@@ -271,7 +271,8 @@ pub enum CommandStatus {
     Failed,
     /// Explicitly cancelled or pane purged while active.
     Cancelled,
-    /// Side channel lost, send failure after accept, or tracking deadline exceeded.
+    /// Side channel lost or failed after the command was accepted.
+    #[serde(alias = "trackingerror")]
     TrackingError,
 }
 
@@ -449,5 +450,17 @@ mod tests {
         assert_eq!(wire["output"], "tail");
         assert_eq!(wire["outputTruncated"], true);
         assert_eq!(wire["resultReady"], true);
+    }
+
+    #[test]
+    fn tracking_error_uses_snake_case_and_accepts_legacy_logs() {
+        assert_eq!(
+            serde_json::to_string(&CommandStatus::TrackingError).unwrap(),
+            "\"tracking_error\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandStatus>("\"trackingerror\"").unwrap(),
+            CommandStatus::TrackingError
+        );
     }
 }

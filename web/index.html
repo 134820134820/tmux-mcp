@@ -767,7 +767,7 @@
           </div>
           <div class="terminal-wrap">
             <pre id="terminal-snapshot" tabindex="0" aria-label="当前 tmux pane，可直接键入"></pre>
-            <span class="terminal-hint">点击后直接输入 · 每 250ms 刷新 · 同一 pane 合并至 Enter 或切换 pane</span>
+            <span class="terminal-hint">点击后直接输入 · 每 500ms 刷新 · 同一 pane 合并至 Enter 或切换 pane</span>
           </div>
         </section>
 
@@ -864,17 +864,27 @@
         const headers = new Headers(options.headers || {});
         headers.set("x-tmux-mcp-token", controlToken);
         if (options.body !== undefined) headers.set("content-type", "application/json");
-        const response = await fetch(path, {
-          method: options.method || "GET",
-          headers,
-          body: options.body === undefined ? undefined : JSON.stringify(options.body),
-          cache: "no-store"
-        });
-        if (!response.ok) {
-          const message = await response.text();
-          throw new Error(message || `HTTP ${response.status}`);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        try {
+          const response = await fetch(path, {
+            method: options.method || "GET",
+            headers,
+            body: options.body === undefined ? undefined : JSON.stringify(options.body),
+            cache: "no-store",
+            signal: controller.signal
+          });
+          if (!response.ok) {
+            const message = await response.text();
+            throw new Error(message || `HTTP ${response.status}`);
+          }
+          return await response.json();
+        } catch (error) {
+          if (error?.name === "AbortError") throw new Error("请求超时，请稍后重试");
+          throw error;
+        } finally {
+          clearTimeout(timeout);
         }
-        return response.json();
       }
 
       function setConnection(online, text) {
@@ -1634,7 +1644,7 @@
       setMode(mode);
       void refreshState();
       setInterval(() => void refreshState(), 750);
-      setInterval(() => void refreshCapture(), 250);
+      setInterval(() => void refreshCapture(), 500);
     </script>
   </body>
 </html>

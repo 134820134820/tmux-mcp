@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Terminal waits and resource notifications now become ready only after the final bounded pane capture attempt, before the pane accepts another tracked command.
+- Long-running commands no longer become `tracking_error` merely because the background tracking interval elapsed; caller `waitMs` expiry remains non-terminal and non-error.
+- Command status JSON now emits `tracking_error` consistently while continuing to read the legacy `trackingerror` spelling.
 
 ## [0.6.0] - 2026-07-11
 

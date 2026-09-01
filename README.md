@@ -22,6 +22,8 @@
 
 打开 `http://127.0.0.1:38473/`。
 
+控制中心的本机运行状态保存在 `%LOCALAPPDATA%\tmux-mcp`（Linux/macOS 优先使用 `$XDG_STATE_HOME/tmux-mcp`），其中包括最多 4 MiB 的 `events.jsonl` 调用日志、Gate 状态和 `control.token`；不要把该目录复制进仓库或提交到版本控制。
+
 stdio MCP 默认只暴露核心工具。需要 buffer、布局、重命名、删除等高级工具时，在现有 MCP 参数末尾增加 `--full-tools` 并重启客户端。完整清单和选择性开放方法见 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md)。
 
 ## Codex

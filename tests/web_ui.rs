@@ -90,7 +90,7 @@ fn page_polls_snapshots_and_uses_the_control_api() {
         "/keys",
         "/api/gate",
         "/api/approvals/",
-        "250",
+        "500",
         "Enter 或切换 pane",
         "输入已清空",
     ] {
