@@ -14,6 +14,8 @@ pub mod errors;
 pub mod gpu_monitor;
 /// Security policy: tool surface, allowlists, command filters, buffer path sandbox.
 pub mod security;
+pub mod targets;
+pub mod timing;
 /// Local/SSH tmux process adapter, parsers, and buffer search.
 pub mod tmux;
 /// Shared session/window/pane/buffer/search DTOs used by tools and resources.

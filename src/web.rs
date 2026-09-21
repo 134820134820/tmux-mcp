@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
@@ -59,6 +59,7 @@ struct PendingApproval {
 struct HumanGroup {
     id: String,
     pane_id: String,
+    target: String,
 }
 
 struct RecordStore {
@@ -66,7 +67,7 @@ struct RecordStore {
     records: HashMap<String, ActionRecord>,
 }
 
-type PaneInfoCache = Option<(String, Instant, Option<PaneInfo>)>;
+type PaneInfoCache = Option<(String, String, Instant, Option<PaneInfo>)>;
 
 #[derive(Clone)]
 struct AppContext {
@@ -77,11 +78,13 @@ struct AppContext {
     tracker: Arc<CommandTracker>,
     topology_cache: Arc<Mutex<TopologyCache>>,
     pane_info_cache: Arc<Mutex<PaneInfoCache>>,
+    targets: Arc<crate::targets::TargetsFile>,
+    default_target: String,
 }
 
 #[derive(Default)]
 struct TopologyCache {
-    value: Option<(Instant, Result<Topology, String>)>,
+    value: Option<(String, Instant, Result<Topology, String>)>,
     refreshing: bool,
     generation: u64,
 }
@@ -90,11 +93,14 @@ struct TopologyCache {
 #[serde(rename_all = "camelCase")]
 struct StateQuery {
     pane_id: Option<String>,
+    target: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StateResponse {
+    target: String,
+    targets: BTreeMap<String, crate::targets::TargetConfig>,
     ai_pause: Option<AiPause>,
     gate_enabled: bool,
     gate_mode: GateMode,
@@ -148,11 +154,13 @@ struct OkResponse {
 struct KeyInput {
     key: String,
     literal: bool,
+    target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CommandInput {
     command: String,
+    target: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -216,10 +224,21 @@ pub fn build_router(
     socket: Option<String>,
     tracker: Arc<CommandTracker>,
 ) -> Router {
+    let targets = Arc::new(crate::targets::load_configured().unwrap_or_else(|_| {
+        crate::targets::TargetsFile {
+            targets: BTreeMap::new(),
+        }
+    }));
+    let default_target = std::env::var("TMUX_MCP_SSH")
+        .ok()
+        .and_then(|value| value.split_whitespace().last().map(str::to_owned))
+        .filter(|value| targets.targets.contains_key(value))
+        .or_else(|| targets.targets.keys().next().cloned())
+        .unwrap_or_default();
     let mut events = tracker.subscribe_events();
     let event_tracker = Arc::clone(&tracker);
     let event_hub = hub.clone();
-    tokio::spawn(async move {
+    crate::targets::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) if event.kind == CommandEventKind::Terminal => {
@@ -252,6 +271,8 @@ pub fn build_router(
         tracker,
         topology_cache: Arc::new(Mutex::new(TopologyCache::default())),
         pane_info_cache: Arc::new(Mutex::new(None)),
+        targets,
+        default_target,
     };
     let api = Router::new()
         .route("/api/state", get(api_state))
@@ -270,6 +291,19 @@ pub fn build_router(
         .route("/", get(index))
         .merge(api)
         .with_state(context)
+}
+
+fn resolve_target(context: &AppContext, requested: Option<&str>) -> Result<String, String> {
+    let target = requested
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&context.default_target);
+    if target.is_empty() {
+        return Err("no SSH targets are configured".into());
+    }
+    if !context.targets.targets.contains_key(target) {
+        return Err(format!("unknown target '{target}'"));
+    }
+    Ok(target.to_owned())
 }
 
 async fn reconcile_web_commands(hub: &HubState, tracker: &CommandTracker) {
@@ -328,11 +362,22 @@ async fn index(State(context): State<AppContext>, headers: HeaderMap) -> Respons
     response
 }
 
-async fn api_state(
-    State(context): State<AppContext>,
-    Query(query): Query<StateQuery>,
+async fn api_state(State(context): State<AppContext>, Query(query): Query<StateQuery>) -> Response {
+    let target = match resolve_target(&context, query.target.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    crate::targets::scope(target.clone(), api_state_for_target(context, query, target))
+        .await
+        .into_response()
+}
+
+async fn api_state_for_target(
+    context: AppContext,
+    query: StateQuery,
+    target: String,
 ) -> Json<StateResponse> {
-    let (topology, topology_error) = match cached_topology(&context).await {
+    let (topology, topology_error) = match cached_topology(&context, &target).await {
         Ok(topology) => (Some(topology), None),
         Err(error) => (None, Some(error)),
     };
@@ -345,18 +390,25 @@ async fn api_state(
         })
     };
     let messages = match (query.pane_id.as_deref(), topology.as_ref()) {
-        (Some(pane_id), Some(topology)) if pane_exists(pane_id, topology) => {
-            context
-                .hub
-                .records_for_pane_since(pane_id, topology.server_started_at_ms)
-                .await
-        }
-        (Some(pane_id), None) => context.hub.records_for_pane(pane_id).await,
+        (Some(pane_id), Some(topology)) if pane_exists(pane_id, topology) => context
+            .hub
+            .records_for_pane_since(pane_id, topology.server_started_at_ms)
+            .await
+            .into_iter()
+            .filter(|record| record_matches_target(record, &target))
+            .collect(),
+        (Some(pane_id), None) => context
+            .hub
+            .records_for_pane(pane_id)
+            .await
+            .into_iter()
+            .filter(|record| record_matches_target(record, &target))
+            .collect(),
         _ => Vec::new(),
     };
     let pane_info = match (query.pane_id.as_deref(), topology.as_ref()) {
         (Some(pane_id), Some(topology)) if pane_exists(pane_id, topology) => {
-            cached_pane_info(&context, pane_id).await
+            cached_pane_info(&context, &target, pane_id).await
         }
         _ => None,
     };
@@ -372,6 +424,8 @@ async fn api_state(
         }
     }
     Json(StateResponse {
+        target: target.clone(),
+        targets: context.targets.targets.clone(),
         ai_pause: context.hub.paths().ai_pause().unwrap_or_else(|_| {
             Some(AiPause {
                 pane_id: "未知".into(),
@@ -379,15 +433,41 @@ async fn api_state(
         }),
         gate_enabled: context.hub.paths().gate_enabled(),
         gate_mode: context.hub.paths().gate_mode(),
-        pending: context.hub.pending().await,
+        pending: context
+            .hub
+            .pending()
+            .await
+            .into_iter()
+            .filter(|record| record_matches_target(record, &target))
+            .collect(),
         messages,
-        operations: context.hub.operations().await,
-        full_log: context.hub.full_log().await,
+        operations: context
+            .hub
+            .operations()
+            .await
+            .into_iter()
+            .filter(|record| record_matches_target(record, &target))
+            .collect(),
+        full_log: context
+            .hub
+            .full_log()
+            .await
+            .into_iter()
+            .filter(|record| record_matches_target(record, &target))
+            .collect(),
         topology,
         topology_error,
         pane_info,
         activity,
     })
+}
+
+fn record_matches_target(record: &ActionRecord, target: &str) -> bool {
+    record
+        .arguments
+        .get("target")
+        .and_then(Value::as_str)
+        .map_or(true, |record_target| record_target == target)
 }
 
 async fn api_clear_ai_pause(State(context): State<AppContext>) -> Response {
@@ -464,10 +544,25 @@ fn record_changes_topology(record: &ActionRecord) -> bool {
         && record.status == ActionStatus::Completed
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetQuery {
+    target: Option<String>,
+}
+
 async fn api_capture(
     State(context): State<AppContext>,
     AxumPath(pane_id): AxumPath<String>,
+    Query(query): Query<TargetQuery>,
 ) -> Response {
+    let target = match resolve_target(&context, query.target.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    crate::targets::scope(target, api_capture_inner(context, pane_id)).await
+}
+
+async fn api_capture_inner(context: AppContext, pane_id: String) -> Response {
     if let Err(error) = validate_pane_id(&pane_id) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
@@ -503,6 +598,14 @@ async fn api_keys(
     AxumPath(pane_id): AxumPath<String>,
     Json(input): Json<KeyInput>,
 ) -> Response {
+    let target = match resolve_target(&context, input.target.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    crate::targets::scope(target, api_keys_inner(context, pane_id, input)).await
+}
+
+async fn api_keys_inner(context: AppContext, pane_id: String, input: KeyInput) -> Response {
     if let Err(error) = validate_pane_id(&pane_id) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
@@ -545,6 +648,14 @@ async fn send_command(
     AxumPath(pane_id): AxumPath<String>,
     Json(input): Json<CommandInput>,
 ) -> Response {
+    let target = match resolve_target(&context, input.target.as_deref()) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    crate::targets::scope(target, send_command_inner(context, pane_id, input)).await
+}
+
+async fn send_command_inner(context: AppContext, pane_id: String, input: CommandInput) -> Response {
     if let Err(error) = validate_pane_id(&pane_id) {
         return (StatusCode::BAD_REQUEST, error).into_response();
     }
@@ -560,7 +671,7 @@ async fn send_command(
     let mut record = ActionRecord::new(
         "你",
         "execute-command",
-        json!({"paneId": pane_id, "command": input.command}),
+        json!({"target": crate::targets::current().unwrap_or_default(), "paneId": pane_id, "command": input.command}),
     );
     record.mark_running();
     let command_id = match context
@@ -618,26 +729,32 @@ async fn send_command(
     (StatusCode::ACCEPTED, Json(CommandAccepted { command_id })).into_response()
 }
 
-async fn cached_topology(context: &AppContext) -> Result<Topology, String> {
+async fn cached_topology(context: &AppContext, target: &str) -> Result<Topology, String> {
     let mut cache = context.topology_cache.lock().await;
     let now = Instant::now();
-    if let Some(value) = cache.get(now) {
+    if let Some(value) = cache.get(target, now) {
         return value;
     }
 
     // Serve the last snapshot immediately after its TTL and refresh once in the
     // background. The first load still stays synchronous so the initial page
     // never renders a fabricated topology.
-    if let Some((_, stale_value)) = cache.value.clone() {
+    if let Some((cached_target, _, stale_value)) = cache.value.clone() {
+        if cached_target != target {
+            let value = load_topology(context).await;
+            cache.value = Some((target.to_owned(), Instant::now(), value.clone()));
+            return value;
+        }
         if !cache.refreshing {
             cache.refreshing = true;
             let generation = cache.generation;
             let refresh_context = context.clone();
-            tokio::spawn(async move {
+            let target_name = target.to_owned();
+            crate::targets::spawn(async move {
                 let value = load_topology(&refresh_context).await;
                 let mut cache = refresh_context.topology_cache.lock().await;
                 if cache.generation == generation {
-                    cache.value = Some((Instant::now(), value));
+                    cache.value = Some((target_name, Instant::now(), value));
                 }
                 cache.refreshing = false;
             });
@@ -646,16 +763,18 @@ async fn cached_topology(context: &AppContext) -> Result<Topology, String> {
     }
 
     let value = load_topology(context).await;
-    cache.value = Some((Instant::now(), value.clone()));
+    cache.value = Some((target.to_owned(), Instant::now(), value.clone()));
     value
 }
 
 impl TopologyCache {
-    fn get(&self, now: Instant) -> Option<Result<Topology, String>> {
+    fn get(&self, target: &str, now: Instant) -> Option<Result<Topology, String>> {
         self.value
             .as_ref()
-            .filter(|(loaded_at, _)| now.duration_since(*loaded_at) < TOPOLOGY_CACHE_TTL)
-            .map(|(_, value)| value.clone())
+            .filter(|(cached_target, loaded_at, _)| {
+                cached_target == target && now.duration_since(*loaded_at) < TOPOLOGY_CACHE_TTL
+            })
+            .map(|(_, _, value)| value.clone())
     }
 
     fn invalidate(&mut self) {
@@ -664,12 +783,15 @@ impl TopologyCache {
     }
 }
 
-async fn cached_pane_info(context: &AppContext, pane_id: &str) -> Option<PaneInfo> {
+async fn cached_pane_info(context: &AppContext, target: &str, pane_id: &str) -> Option<PaneInfo> {
     let now = Instant::now();
     {
         let cache = context.pane_info_cache.lock().await;
-        if let Some((cached_pane, loaded_at, value)) = cache.as_ref() {
-            if cached_pane == pane_id && now.duration_since(*loaded_at) < PANE_INFO_CACHE_TTL {
+        if let Some((cached_target, cached_pane, loaded_at, value)) = cache.as_ref() {
+            if cached_target == target
+                && cached_pane == pane_id
+                && now.duration_since(*loaded_at) < PANE_INFO_CACHE_TTL
+            {
                 return value.clone();
             }
         }
@@ -679,7 +801,12 @@ async fn cached_pane_info(context: &AppContext, pane_id: &str) -> Option<PaneInf
         .await
         .ok();
     let mut cache = context.pane_info_cache.lock().await;
-    *cache = Some((pane_id.to_string(), Instant::now(), value.clone()));
+    *cache = Some((
+        target.to_string(),
+        pane_id.to_string(),
+        Instant::now(),
+        value.clone(),
+    ));
     value
 }
 
@@ -761,16 +888,22 @@ mod tests {
     fn topology_cache_reuses_fresh_errors_and_expires_stale_data() {
         let loaded_at = Instant::now();
         let cache = TopologyCache {
-            value: Some((loaded_at, Err("tmux unavailable".into()))),
+            value: Some((
+                "test-target".into(),
+                loaded_at,
+                Err("tmux unavailable".into()),
+            )),
             refreshing: false,
             generation: 0,
         };
 
         assert!(matches!(
-            cache.get(loaded_at + Duration::from_secs(4)),
+            cache.get("test-target", loaded_at + Duration::from_secs(4)),
             Some(Err(error)) if error == "tmux unavailable"
         ));
-        assert!(cache.get(loaded_at + Duration::from_secs(5)).is_none());
+        assert!(cache
+            .get("test-target", loaded_at + Duration::from_secs(5))
+            .is_none());
     }
 
     #[test]
@@ -798,6 +931,26 @@ mod tests {
         assert!(validate_command_input(&rejected).is_err());
     }
 
+    #[test]
+    fn web_target_selection_rejects_unknown_aliases() {
+        let temp = tempfile::tempdir().expect("temp state dir");
+        let context = AppContext {
+            hub: HubState::open(StatePaths::new(temp.path())).expect("open hub"),
+            token: Arc::from("test"),
+            policy: Arc::new(SecurityPolicy::default()),
+            socket: None,
+            tracker: Arc::new(CommandTracker::new(ShellType::Bash)),
+            topology_cache: Arc::new(Mutex::new(TopologyCache::default())),
+            pane_info_cache: Arc::new(Mutex::new(None)),
+            targets: Arc::new(
+                crate::targets::TargetsFile::parse("[targets.a]\nnote='a'\n").expect("targets"),
+            ),
+            default_target: "a".into(),
+        };
+        assert_eq!(resolve_target(&context, None).unwrap(), "a");
+        assert!(resolve_target(&context, Some("missing")).is_err());
+    }
+
     #[tokio::test]
     async fn web_command_mapping_is_published_after_running_record_is_persisted() {
         let dir = tempfile::tempdir().expect("temp state dir");
@@ -811,7 +964,7 @@ mod tests {
         record.mark_running();
         let registering = {
             let hub = hub.clone();
-            tokio::spawn(async move {
+            crate::targets::spawn(async move {
                 hub.track_web_command("cmd-1".into(), record)
                     .await
                     .expect("track command");
@@ -835,7 +988,7 @@ mod tests {
         let pending = hub.inner.pending.lock().await;
         let authorizing = {
             let hub = hub.clone();
-            tokio::spawn(async move {
+            crate::targets::spawn(async move {
                 hub.authorize(ActionRecord::new(
                     "Codex",
                     "send-keys",
@@ -883,7 +1036,7 @@ mod tests {
         let pending = hub.inner.pending.lock().await;
         let enabling = {
             let hub = hub.clone();
-            tokio::spawn(async move { hub.set_gate_mode(GateMode::Approval).await })
+            crate::targets::spawn(async move { hub.set_gate_mode(GateMode::Approval).await })
         };
         tokio::task::yield_now().await;
 
@@ -901,7 +1054,7 @@ mod tests {
         let pending = hub.inner.pending.lock().await;
         let authorizing = {
             let hub = hub.clone();
-            tokio::spawn(async move {
+            crate::targets::spawn(async move {
                 hub.authorize(ActionRecord::new(
                     "Codex",
                     "send-keys",
@@ -959,6 +1112,7 @@ mod tests {
         let now = Instant::now();
         tracker
             .insert_test_execution(CommandExecution {
+                target: None,
                 id: "cmd-lagged".into(),
                 pane_id: "%lagged".into(),
                 socket: None,
@@ -1337,9 +1491,11 @@ impl HubState {
     ) -> io::Result<ActionRecord> {
         let mut last = self.inner.last_human.lock().await;
         let mut store = self.inner.store.lock().await;
-        let reusable_id = last
-            .as_ref()
-            .and_then(|group| (group.pane_id == pane_id).then(|| group.id.clone()));
+        let reusable_id = last.as_ref().and_then(|group| {
+            (group.pane_id == pane_id
+                && group.target == crate::targets::current().unwrap_or_default())
+            .then(|| group.id.clone())
+        });
 
         let mut record = reusable_id
             .and_then(|id| store.records.get(&id).cloned())
@@ -1347,7 +1503,7 @@ impl HubState {
                 let mut record = ActionRecord::new(
                     "你",
                     "web-input",
-                    json!({"paneId": pane_id, "text": "", "literal": literal}),
+                    json!({"target": crate::targets::current().unwrap_or_default(), "paneId": pane_id, "text": "", "literal": literal}),
                 );
                 record.requested_at_ms = at_ms;
                 record
@@ -1378,6 +1534,7 @@ impl HubState {
             Some(HumanGroup {
                 id: record.id.clone(),
                 pane_id: pane_id.to_owned(),
+                target: crate::targets::current().unwrap_or_default(),
             })
         };
         Ok(record)

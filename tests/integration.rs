@@ -896,6 +896,62 @@ async fn test_workflow_agent_orchestration() {
 }
 
 #[tokio::test]
+async fn test_tracked_sigint_releases_pane_after_result_ready() {
+    if !should_run_integration_tests() {
+        return;
+    }
+    use tmux_mcp_rs::{
+        commands::CommandTracker,
+        tmux,
+        types::{CommandStatus, ShellType},
+    };
+
+    let mut fixture = TmuxFixture::new();
+    let name = unique_session_name("tracked-sigint");
+    fixture.track_session(&name);
+    let socket = Some(fixture.socket());
+    let session = tmux::create_session(&name, socket).await.unwrap();
+    let windows = tmux::list_windows(&session.id, socket).await.unwrap();
+    let panes = tmux::list_panes(&windows[0].id, socket).await.unwrap();
+    let pane = &panes[0].id;
+    let tracker = CommandTracker::new(ShellType::Bash);
+
+    for command in ["sleep 30", "for x in 1 2; do sleep 30; done"] {
+        let id = tracker
+            .execute_command(pane, command, false, false, None, socket.map(str::to_owned))
+            .await
+            .unwrap();
+        // Wait for the foreground job, not just the typed wrapper, before one Ctrl-C.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tmux::pane_info(pane, socket).await.unwrap().current_command == "sleep" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sleep must reach foreground");
+        tmux::send_keys(pane, "C-c", false, socket).await.unwrap();
+        let (result, timed_out) = tracker.wait_for(&id, 5_000).await.unwrap().unwrap();
+        assert!(!timed_out, "tracked SIGINT must close: {result:?}");
+        assert_eq!(result.status, CommandStatus::Failed);
+        assert_eq!(result.exit_code, Some(130));
+        assert!(result.result_ready);
+        assert!(!result.output_truncated);
+
+        let next = tracker
+            .execute_command(pane, "true", false, false, None, socket.map(str::to_owned))
+            .await
+            .expect("interrupted command must release pane");
+        let (result, timed_out) = tracker.wait_for(&next, 5_000).await.unwrap().unwrap();
+        assert!(!timed_out);
+        assert!(result.result_ready);
+        assert_eq!(result.exit_code, Some(0));
+    }
+}
+
+#[tokio::test]
 async fn test_workflow_interactive_interrupts() {
     if !should_run_integration_tests() {
         return;

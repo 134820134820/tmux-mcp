@@ -1,18 +1,21 @@
 # MCP 工具暴露
 
+本清单描述 v0.6.1，已更新根目录程序；已有客户端重新连接后生效。参见 [改进与验证范围](IMPROVEMENTS.md)。
+
 ## 默认核心工具
 
 未加 `--full-tools` 时，stdio MCP 只暴露 `@agent-core`：
 
-- tmux 状态：`get-tmux-state`、`capture-pane`
-- 文件只读：`list-directory`、`read-file`、`find-files`、`search-text`
+- tmux 状态：`list-targets`、`get-tmux-state`、`capture-pane`
+- 文件只读：`list-directory`、`file-stat`、`read-file`、`find-files`、`search-text`
 - Git 只读：`git-status`、`git-diff`、`git-log`、`git-show`
 - 命令：`execute-command`、`get-command-result`
 - 创建：`create-session`、`create-window`、`split-pane`
 - 输入：`send-keys`、`paste-text`、`press-special-key`
 - GPU（仅加 `--claude-channel`）：`watch-gpu-idle`、`get-gpu-watch`、`stop-gpu-watch`
+- GPU 只读快照（不需要 Channel）：`gpu-snapshot`
 
-默认共 18 个工具；启用 Claude Channel 后为 21 个。
+默认共 21 个工具；启用 Claude Channel 后为 24 个。
 
 ## 默认隐藏工具
 
@@ -33,7 +36,7 @@
 加载全部工具：
 
 ```powershell
-.\tmux-mcp.exe --ssh milab-ten --full-tools
+.\tmux-mcp.exe --targets .\targets.toml --full-tools
 ```
 
 Codex/Claude Code 配置中同样只需在现有 `args` 末尾增加：
@@ -46,7 +49,7 @@ Codex/Claude Code 配置中同样只需在现有 `args` 末尾增加：
 
 ```powershell
 $env:TMUX_MCP_TOOLS = "allow:@agent-core,@move"
-.\tmux-mcp.exe --ssh milab-ten --full-tools
+.\tmux-mcp.exe --targets .\targets.toml --full-tools
 ```
 
 也可写入 `config.toml`：
@@ -60,6 +63,8 @@ items = ["@agent-core", "@move"]
 可用分组包括 `@agent-core`、`@read`、`@file-read`、`@git-read`、`@buffer-read`、`@buffer-write`、`@list`、`@capture`、`@create`、`@split`、`@kill`、`@execute`、`@gpu-monitor`、`@rename`、`@move`、`@interactive`、`@special-keys`、`@raw-input`、`@socket` 和 `@all`。
 
 `TMUX_MCP_TOOLS`/`[security.tools]` 只能进一步缩小 `--full-tools` 的工具面，不能绕过其他安全策略。
+
+多服务器/多账号由同一份 `targets.toml` 管理。stdio 客户端启动时传入 `--targets`，工具调用使用清单中的 `target` 别名；不再为每个 SSH 别名单独注册 MCP。网页控制中心使用 `--web --targets`，`--ssh <默认别名>` 为可选项；省略时默认使用清单中的第一个目标，页面打开后可切换其他目标。
 
 ## 已合并的旧工具
 

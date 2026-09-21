@@ -130,6 +130,8 @@ impl ActionTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<crate::timing::CallTiming>,
     pub schema_version: u32,
     pub id: String,
     pub source: String,
@@ -154,6 +156,7 @@ impl ActionRecord {
         let now = unix_time_ms();
         Self {
             schema_version: ACTION_SCHEMA_VERSION,
+            timing: None,
             id: Uuid::new_v4().to_string(),
             source: source.into(),
             kind: ActionKind::for_tool(&tool),

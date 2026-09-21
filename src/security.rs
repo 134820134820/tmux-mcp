@@ -63,6 +63,10 @@ struct ToolManifestEntry {
 
 const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     ToolManifestEntry {
+        name: "list-targets",
+        groups: &["list", "read", "agent-core"],
+    },
+    ToolManifestEntry {
         name: "socket-for-path",
         groups: &["socket", "read"],
     },
@@ -101,6 +105,14 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     ToolManifestEntry {
         name: "read-file",
         groups: &["file-read", "read", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "file-stat",
+        groups: &["file-read", "read", "agent-core"],
+    },
+    ToolManifestEntry {
+        name: "gpu-snapshot",
+        groups: &["gpu-monitor", "read", "agent-core"],
     },
     ToolManifestEntry {
         name: "find-files",
@@ -947,7 +959,7 @@ impl SecurityPolicy {
 
         match &self.config.allowed_buffer_paths {
             None => {
-                if path_obj.is_absolute() {
+                if path_obj.has_root() {
                     return Err(Error::PolicyDenied {
                         message: format!(
                             "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
@@ -982,7 +994,7 @@ impl SecurityPolicy {
 
         match &self.config.allowed_buffer_paths {
             None => {
-                if path_obj.is_absolute() {
+                if path_obj.has_root() {
                     return Err(Error::PolicyDenied {
                         message: format!(
                             "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
@@ -1022,7 +1034,7 @@ impl SecurityPolicy {
             });
         }
 
-        if self.config.allowed_buffer_paths.is_none() && path_obj.is_absolute() {
+        if self.config.allowed_buffer_paths.is_none() && path.starts_with('/') {
             return Err(Error::PolicyDenied {
                 message: format!(
                     "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
@@ -1073,7 +1085,7 @@ impl SecurityPolicy {
             return Ok(path.to_string());
         }
 
-        if path_obj.is_absolute() {
+        if path.starts_with('/') {
             return Err(Error::PolicyDenied {
                 message: format!(
                     "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
@@ -1131,7 +1143,7 @@ impl SecurityPolicy {
             });
         }
 
-        if self.config.allowed_buffer_paths.is_none() && path_obj.is_absolute() {
+        if self.config.allowed_buffer_paths.is_none() && path.starts_with('/') {
             return Err(Error::PolicyDenied {
                 message: format!(
                     "buffer path '{path}' must be relative when no allowed_buffer_paths are configured"
@@ -2293,7 +2305,11 @@ mod tests {
             .expect("resolve allowed path");
         assert_eq!(resolved, fixture.canonicalize().unwrap().to_string_lossy());
 
-        let err = policy.resolve_local_buffer_path("/etc/passwd").unwrap_err();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "outside allowlist").expect("write outside fixture");
+        let err = policy
+            .resolve_local_buffer_path(&outside.to_string_lossy())
+            .unwrap_err();
         assert!(matches!(
             err,
             Error::PolicyDenied { message } if message.contains("not under allowed buffer paths")

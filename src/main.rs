@@ -10,8 +10,10 @@ mod errors;
 mod gpu_monitor;
 mod security;
 mod server;
+mod targets;
 #[cfg(test)]
 mod test_support;
+mod timing;
 mod tmux;
 mod types;
 mod web;
@@ -54,6 +56,10 @@ struct Cli {
     /// Remote tmux via OpenSSH (`user@host` or extra ssh argv). Overrides config/env.
     #[arg(short = 'r', long = "ssh")]
     ssh: Option<String>,
+
+    /// Explicit target inventory (SSH aliases and notes).
+    #[arg(long, default_value = "targets.toml")]
+    targets: PathBuf,
 
     /// Run the local web control center instead of the stdio MCP server.
     #[arg(long)]
@@ -130,6 +136,12 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    if let Err(error) = crate::targets::TargetsFile::load(&cli.targets) {
+        eprintln!("Error loading targets file: {error}");
+        std::process::exit(1);
+    }
+    std::env::set_var("TMUX_MCP_TARGETS", &cli.targets);
 
     if let Err(error) = crate::web::validate_bind_address(cli.web_bind) {
         eprintln!("Error parsing web bind address: {error}");
@@ -226,7 +238,6 @@ async fn main() {
             }
         }
     }
-
     if let Some((major, minor)) = crate::tmux::tmux_version().await {
         if major < 3 {
             eprintln!("Error: tmux-mcp-rs requires tmux 3.0 or newer; found tmux {major}.{minor}");

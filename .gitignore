@@ -18,3 +18,4 @@ docs/
 !docs/
 docs/*
 !docs/TOOL_SURFACE.md
+!docs/IMPROVEMENTS.md
