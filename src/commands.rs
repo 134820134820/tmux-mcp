@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::errors::{Error, Result};
 use crate::tmux;
-use crate::types::{command_resource_uri, CommandExecution, CommandStatus, ShellType};
+#[cfg(test)]
+use crate::types::command_resource_uri;
+use crate::types::{CommandExecution, CommandStatus, ShellType};
 
 /// Prefix for the start marker, followed by command id.
 pub const START_MARKER_PREFIX: &str = "TMUX_MCP_START_";
@@ -89,6 +91,7 @@ pub enum CommandEventKind {
 pub struct TrackingConfig {
     /// Lines of scrollback captured when refreshing partial output for running commands.
     #[serde(default = "default_capture_initial_lines")]
+    #[allow(dead_code)] // Used by the public library's explicit check_status refresh API.
     pub capture_initial_lines: u32,
     /// Upper bound on lines used when bracketing START/DONE markers for output only.
     #[serde(default = "default_capture_max_lines")]
@@ -159,15 +162,15 @@ struct TrackedLaunch {
 /// In-process registry of running and recently completed pane commands.
 ///
 /// One tracker instance is shared by the MCP server. A second tracked launch for
-/// the same `socket|pane_id` is rejected while the first command is unresolved.
+/// the same `target|socket|pane_id` is rejected while the first command is unresolved.
 /// Completion is side-channel authoritative; pane scrollback is presentation only.
 pub struct CommandTracker {
     /// All live records keyed by command id (including terminal until eviction).
     active_commands: Arc<RwLock<HashMap<String, CommandExecution>>>,
     /// Private side-channel secrets (never exposed on CommandExecution).
     secrets: Arc<RwLock<HashMap<String, String>>>,
-    /// `socket|pane_id` → current tracked command id. Tracking errors retain this
-    /// entry until the caller captures and acknowledges the uncertain pane.
+    /// `target|socket|pane_id` → current tracked command id. Tracking errors retain this
+    /// entry when execution is uncertain; inspecting output does not release it.
     pane_running: Arc<RwLock<HashMap<String, String>>>,
     /// Process-default shell dialect; pane `current_command` may override at wrap time.
     shell_type: ShellType,
@@ -213,7 +216,7 @@ impl CommandTracker {
     fn emit(&self, kind: CommandEventKind, exec: &CommandExecution) {
         let _ = self.events.send(CommandEvent {
             command_id: exec.id.clone(),
-            resource_uri: command_resource_uri(&exec.id),
+            resource_uri: exec.resource_uri(),
             kind,
             status: exec.status,
         });
@@ -221,7 +224,12 @@ impl CommandTracker {
     }
 
     fn pane_key(pane_id: &str, socket: Option<&str>) -> String {
-        format!("{}|{}", socket.unwrap_or(""), pane_id)
+        format!(
+            "{}|{}|{}",
+            crate::targets::current().as_deref().unwrap_or(""),
+            socket.unwrap_or(""),
+            pane_id
+        )
     }
 
     /// Send a command into a pane. Tracked mode uses side-channel completion.
@@ -269,6 +277,7 @@ impl CommandTracker {
         };
 
         let execution = CommandExecution {
+            target: crate::targets::current(),
             id: command_id.clone(),
             pane_id: pane_id.to_string(),
             socket: resolved_socket.clone(),
@@ -290,6 +299,25 @@ impl CommandTracker {
             tracking_disabled,
         };
 
+        let key = Self::pane_key(pane_id, resolved_socket.as_deref());
+        if let Some(active_id) = self
+            .pane_command_id(pane_id, resolved_socket.as_deref())
+            .await
+        {
+            self.recover_completed(&active_id).await;
+        }
+        {
+            let mut running = self.pane_running.write().await;
+            if let Some(active_id) = running.get(&key) {
+                return Err(Error::InvalidArgument {
+                    message: format!(
+                        "pane {pane_id} is busy with command {active_id}; do not retry in another window. If its state is uncertain, stop and report to the user"
+                    ),
+                });
+            }
+            running.insert(key, command_id.clone());
+        }
+
         if tracking_disabled {
             self.active_commands
                 .write()
@@ -297,29 +325,20 @@ impl CommandTracker {
                 .insert(command_id.clone(), execution.clone());
             self.emit(CommandEventKind::Created, &execution);
             self.cleanup_completed().await;
-            self.dispatch_keys(
-                pane_id,
-                command,
-                delay_ms,
-                no_enter,
-                resolved_socket.as_deref(),
-                &command_id,
-            )
-            .await?;
-            return Ok(command_id);
-        }
-
-        let key = Self::pane_key(pane_id, resolved_socket.as_deref());
-        {
-            let mut running = self.pane_running.write().await;
-            if let Some(active_id) = running.get(&key) {
-                return Err(Error::InvalidArgument {
-                    message: format!(
-                        "pane {pane_id} is busy with tracked command {active_id}; wait for it to finish"
-                    ),
-                });
+            if let Err(error) = self
+                .dispatch_keys(
+                    pane_id,
+                    command,
+                    delay_ms,
+                    no_enter,
+                    resolved_socket.as_deref(),
+                )
+                .await
+            {
+                self.mark_dispatch_uncertain(&command_id, &error).await;
+                return Err(error);
             }
-            running.insert(key, command_id.clone());
+            return Ok(command_id);
         }
 
         let secret = secret.expect("tracked mode always has a secret");
@@ -344,13 +363,7 @@ impl CommandTracker {
         self.cleanup_completed().await;
 
         if let Err(error) = self.start_tracked_launch(launch).await {
-            release_pane(
-                &self.pane_running,
-                pane_id,
-                resolved_socket.as_deref(),
-                &command_id,
-            )
-            .await;
+            self.mark_dispatch_uncertain(&command_id, &error).await;
             return Err(error);
         }
 
@@ -378,58 +391,50 @@ impl CommandTracker {
         delay_ms: Option<u64>,
         no_enter: bool,
         socket: Option<&str>,
-        command_id: &str,
     ) -> Result<()> {
         if let Some(delay) = delay_ms.filter(|delay| *delay > 0) {
             for ch in wrapped_command.chars() {
-                if let Err(e) = tmux::send_keys(pane_id, &ch.to_string(), true, socket).await {
-                    self.remove_command(command_id).await;
-                    return Err(e);
-                }
+                tmux::send_keys(pane_id, &ch.to_string(), true, socket).await?;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             if !no_enter {
-                if let Err(e) = tmux::send_keys(pane_id, "Enter", false, socket).await {
-                    self.remove_command(command_id).await;
-                    return Err(e);
-                }
+                tmux::send_keys(pane_id, "Enter", false, socket).await?;
             }
         } else if no_enter {
-            if let Err(e) = tmux::send_keys(pane_id, wrapped_command, false, socket).await {
-                self.remove_command(command_id).await;
-                return Err(e);
-            }
-        } else if let Err(e) =
-            tmux::send_keys_with_enter(pane_id, wrapped_command, false, socket).await
-        {
-            self.remove_command(command_id).await;
-            return Err(e);
+            tmux::send_keys(pane_id, wrapped_command, false, socket).await?;
+        } else {
+            tmux::send_keys_with_enter(pane_id, wrapped_command, false, socket).await?;
         }
         Ok(())
     }
 
-    async fn remove_command(&self, command_id: &str) {
+    async fn mark_dispatch_uncertain(&self, command_id: &str, error: &Error) {
         let mut commands = self.active_commands.write().await;
-        commands.remove(command_id);
-        let mut secrets = self.secrets.write().await;
-        secrets.remove(command_id);
+        if let Some(exec) = commands.get_mut(command_id) {
+            exec.status = CommandStatus::TrackingError;
+            exec.reason = Some(format!("Input delivery is uncertain: {error}. Stop and report to the user; do not retry, clear input, or switch windows to repeat the command."));
+            exec.completed_at = Some(Instant::now());
+            exec.result_ready = true;
+            self.emit(CommandEventKind::Terminal, exec);
+        }
     }
 
-    /// Return the latest execution snapshot without using scrollback as an oracle.
-    ///
-    /// While `Running`, may refresh partial pane output for convenience.
+    /// Return the latest execution snapshot, reconciling a durable side-channel completion
+    /// before using scrollback for partial output.
+    #[allow(dead_code)] // Library API; MCP waits return cached state at their deadline.
     pub async fn check_status(
         &self,
         command_id: &str,
         socket_override: Option<&str>,
     ) -> Result<Option<CommandExecution>> {
         self.cleanup_completed().await;
+        self.recover_completed(command_id).await;
 
         let mut execution = {
             let commands = self.active_commands.read().await;
             match commands.get(command_id) {
-                Some(e) => e.clone(),
-                None => return Ok(None),
+                Some(e) if e.target == crate::targets::current() => e.clone(),
+                _ => return Ok(None),
             }
         };
 
@@ -464,12 +469,11 @@ impl CommandTracker {
         Ok(Some(execution))
     }
 
-    /// Return the current in-memory status without an implicit `capture-pane`.
-    ///
-    /// This is the cheap path for polling APIs. Callers that need fresh partial
-    /// scrollback should use `check_status` explicitly or call `capture-pane`.
+    /// Return the current status after reconciling a durable completion, without
+    /// capturing partial scrollback for a still-running command.
     pub async fn status_snapshot(&self, command_id: &str) -> Option<CommandExecution> {
         self.cleanup_completed().await;
+        self.recover_completed(command_id).await;
         self.get_command(command_id).await
     }
 
@@ -481,34 +485,125 @@ impl CommandTracker {
         command_id: &str,
         wait_ms: u64,
     ) -> Result<Option<(CommandExecution, bool)>> {
-        let deadline = Instant::now() + Duration::from_millis(wait_ms);
-        loop {
-            if let Some(exec) = self.get_command(command_id).await {
-                if exec.status.is_terminal() && exec.result_ready {
-                    let exec = self.check_status(command_id, None).await?.unwrap_or(exec);
-                    return Ok(Some((exec, false)));
+        let waiting = async {
+            self.recover_completed(command_id).await;
+            loop {
+                if let Some(exec) = self.get_command(command_id).await {
+                    if exec.tracking_disabled {
+                        return Ok(Some((exec, false)));
+                    }
+                    if exec.status.is_terminal() && exec.result_ready {
+                        return Ok(Some((exec, false)));
+                    }
+                } else {
+                    return Ok(None);
                 }
-            } else {
-                return Ok(None);
+                tokio::select! {
+                    _ = self.notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
             }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                let exec = self.check_status(command_id, None).await?;
-                return Ok(exec.map(|e| (e, true)));
-            }
-
-            tokio::select! {
-                _ = self.notify.notified() => {}
-                _ = tokio::time::sleep(remaining.min(Duration::from_millis(50))) => {}
-            }
+        };
+        match tokio::time::timeout(Duration::from_millis(wait_ms), waiting).await {
+            Ok(result) => result,
+            // A caller deadline does not cancel the remote command or trigger more IO.
+            Err(_) => Ok(self.get_command(command_id).await.map(|exec| (exec, true))),
         }
     }
 
-    /// Snapshot a tracked command without side effects beyond memory read.
+    /// Snapshot a tracked command, recovering a durable completion if its watcher missed it.
     pub async fn get_command(&self, id: &str) -> Option<CommandExecution> {
         let commands = self.active_commands.read().await;
-        commands.get(id).cloned()
+        commands
+            .get(id)
+            .filter(|execution| execution.visible_to_current_target())
+            .cloned()
+    }
+
+    /// Recover a terminal command when the long-lived `wait-for` watcher missed its signal.
+    /// The private exit buffer is authoritative; a DONE marker must also be visible so a
+    /// buffer left by a still-running stub/test cannot release the pane early.
+    async fn recover_completed(&self, command_id: &str) -> bool {
+        let (execution, secret) = {
+            let commands = self.active_commands.read().await;
+            let Some(execution) = commands.get(command_id).cloned() else {
+                return false;
+            };
+            if execution.target != crate::targets::current() {
+                return false;
+            }
+            if execution.status.is_terminal() || execution.tracking_disabled || execution.raw_mode {
+                return execution.status.is_terminal();
+            }
+            let Some(secret) = self.secrets.read().await.get(command_id).cloned() else {
+                return false;
+            };
+            (execution, secret)
+        };
+
+        let exit_code =
+            match tmux::read_exit_code_buffer(&secret, execution.socket.as_deref()).await {
+                Ok(exit_code) => exit_code,
+                Err(_) => return false,
+            };
+        if !matches!(
+            capture_bracketed_output(
+                &execution.pane_id,
+                &execution.id,
+                self.tracking.capture_max_lines.max(1),
+                execution.socket.as_deref(),
+            )
+            .await,
+            Ok(BracketedOutput::Complete(_))
+        ) {
+            return false;
+        }
+
+        let checkpoint = Duration::from_secs(self.tracking.tracking_deadline_seconds)
+            .max(Duration::from_secs(1));
+        let captured = tokio::time::timeout(
+            checkpoint,
+            capture_terminal_output(
+                &execution.pane_id,
+                &execution.id,
+                self.tracking.capture_max_lines.max(1),
+                execution.socket.as_deref(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| CapturedOutput::unavailable());
+        let status = if exit_code == 0 {
+            CommandStatus::Completed
+        } else {
+            CommandStatus::Failed
+        };
+        let snapshot = {
+            let mut commands = self.active_commands.write().await;
+            let mut secrets = self.secrets.write().await;
+            let mut running = self.pane_running.write().await;
+            let Some(stored) = commands.get_mut(command_id) else {
+                return false;
+            };
+            if stored.status.is_terminal() {
+                return true;
+            }
+            stored.status = status;
+            stored.exit_code = Some(exit_code);
+            stored.reason = None;
+            stored.completed_at = Some(Instant::now());
+            apply_captured_output(stored, captured);
+            stored.result_ready = true;
+            // Commit readiness and release together, with no cancellation point between them.
+            secrets.remove(command_id);
+            let key = Self::pane_key(&execution.pane_id, execution.socket.as_deref());
+            if running.get(&key).is_some_and(|id| id == command_id) {
+                running.remove(&key);
+            }
+            stored.clone()
+        };
+        self.emit(CommandEventKind::Terminal, &snapshot);
+        let _ = tmux::delete_exit_code_buffer(&secret, execution.socket.as_deref()).await;
+        true
     }
 
     /// Return the tracked command id occupying one pane.
@@ -531,25 +626,12 @@ impl CommandTracker {
         command_ids.into_iter().find_map(|id| {
             commands
                 .get(&id)
-                .filter(|exec| exec.status == CommandStatus::TrackingError)
+                .filter(|exec| {
+                    exec.target == crate::targets::current()
+                        && exec.status == CommandStatus::TrackingError
+                })
                 .cloned()
         })
-    }
-
-    /// Release an uncertain pane after a successful human/model-visible capture.
-    pub async fn acknowledge_uncertain(&self, command_id: &str) {
-        let Some(exec) = self.get_command(command_id).await else {
-            return;
-        };
-        if exec.status == CommandStatus::TrackingError {
-            release_pane(
-                &self.pane_running,
-                &exec.pane_id,
-                exec.socket.as_deref(),
-                command_id,
-            )
-            .await;
-        }
     }
 
     #[cfg(test)]
@@ -582,18 +664,24 @@ impl CommandTracker {
     /// List ids currently held in the tracker map.
     pub async fn get_active_ids(&self) -> Vec<String> {
         let commands = self.active_commands.read().await;
-        commands.keys().cloned().collect()
+        commands
+            .iter()
+            .filter(|(_, execution)| execution.visible_to_current_target())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// True if a command record exists (including terminal until eviction).
     pub async fn has_command(&self, id: &str) -> bool {
         let commands = self.active_commands.read().await;
-        commands.contains_key(id)
+        commands
+            .get(id)
+            .is_some_and(|execution| execution.visible_to_current_target())
     }
 
     /// Drop every tracked entry bound to a pane on one tmux socket.
     ///
-    /// Occupancy is keyed by `socket|pane_id` because pane ids are only unique
+    /// Occupancy is keyed by `target|socket|pane_id` because pane ids are only unique
     /// within a tmux server.
     pub async fn purge_pane(&self, pane_id: &str, socket: Option<&str>) -> usize {
         let mut commands = self.active_commands.write().await;
@@ -601,7 +689,11 @@ impl CommandTracker {
         let mut removed = 0usize;
         let ids: Vec<String> = commands
             .iter()
-            .filter(|(_, e)| e.pane_id == pane_id && e.socket.as_deref() == socket)
+            .filter(|(_, e)| {
+                e.target == crate::targets::current()
+                    && e.pane_id == pane_id
+                    && e.socket.as_deref() == socket
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -610,7 +702,7 @@ impl CommandTracker {
                 removed += 1;
                 let _ = self.events.send(CommandEvent {
                     command_id: exec.id.clone(),
-                    resource_uri: command_resource_uri(&exec.id),
+                    resource_uri: exec.resource_uri(),
                     kind: CommandEventKind::Evicted,
                     status: exec.status,
                 });
@@ -703,7 +795,7 @@ impl CommandTracker {
         for exec in evicted {
             let _ = self.events.send(CommandEvent {
                 command_id: exec.id.clone(),
-                resource_uri: command_resource_uri(&exec.id),
+                resource_uri: exec.resource_uri(),
                 kind: CommandEventKind::Evicted,
                 status: exec.status,
             });
@@ -758,23 +850,14 @@ async fn run_tracked_launch(
     if let Some(exec) = running_snapshot {
         let _ = events.send(CommandEvent {
             command_id: exec.id.clone(),
-            resource_uri: command_resource_uri(&exec.id),
+            resource_uri: exec.resource_uri(),
             kind: CommandEventKind::Updated,
             status: exec.status,
         });
         notify.notify_waiters();
     }
 
-    if let Err(e) = dispatch_keys_free(&pane_id, &wrapped, delay_ms, socket.as_deref()).await {
-        {
-            let mut commands = active_commands.write().await;
-            commands.remove(&command_id);
-            secrets.write().await.remove(&command_id);
-        }
-        notify.notify_waiters();
-        release_pane(&pane_running, &pane_id, socket.as_deref(), &command_id).await;
-        return Err(e);
-    }
+    dispatch_keys_free(&pane_id, &wrapped, delay_ms, socket.as_deref()).await?;
 
     spawn_side_channel_watcher(
         active_commands,
@@ -805,7 +888,7 @@ fn spawn_side_channel_watcher(
     socket: Option<String>,
     secret: String,
 ) {
-    tokio::spawn(async move {
+    crate::targets::spawn(async move {
         let checkpoint =
             Duration::from_secs(tracking.tracking_deadline_seconds).max(Duration::from_secs(1));
         let channel = tmux::wait_signal_name(&secret);
@@ -823,6 +906,24 @@ fn spawn_side_channel_watcher(
                             .is_some_and(|exec| !exec.status.is_terminal());
                         if !still_tracked {
                             return;
+                        }
+                        // `wait-for -S` is not a durable queue. Re-check the durable
+                        // exit buffer so a lost watcher signal cannot strand the pane.
+                        if tmux::read_exit_code_buffer(&secret, socket.as_deref())
+                            .await
+                            .is_ok()
+                            && matches!(
+                                capture_bracketed_output(
+                                    &pane_id,
+                                    &command_id,
+                                    tracking.capture_max_lines.max(1),
+                                    socket.as_deref(),
+                                )
+                                .await,
+                                Ok(BracketedOutput::Complete(_))
+                            )
+                        {
+                            break Ok(());
                         }
                     }
                 }
@@ -877,7 +978,7 @@ fn spawn_side_channel_watcher(
         secrets.write().await.remove(&command_id);
         let cleanup_socket = socket.clone();
         let cleanup_secret = secret.clone();
-        tokio::spawn(async move {
+        crate::targets::spawn(async move {
             let _ = tmux::delete_exit_code_buffer(&cleanup_secret, cleanup_socket.as_deref()).await;
         });
 
@@ -920,7 +1021,7 @@ fn spawn_side_channel_watcher(
             if let Some(exec) = ready_snapshot {
                 let _ = events.send(CommandEvent {
                     command_id: exec.id.clone(),
-                    resource_uri: command_resource_uri(&exec.id),
+                    resource_uri: exec.resource_uri(),
                     kind: CommandEventKind::Terminal,
                     status: exec.status,
                 });
@@ -961,6 +1062,7 @@ async fn dispatch_keys_free(
     Ok(())
 }
 
+#[allow(dead_code)] // Used by the library's explicit refresh API.
 fn partial_capture_lines(tracking: &TrackingConfig) -> u32 {
     tracking
         .capture_initial_lines
@@ -1101,7 +1203,32 @@ fn wrap_tracked_command_side_channel(
                 "echo \"{start_marker}\"; {command} ; set __tmux_mcp_ec $status; {tmux_bin} set-buffer -b {buf_q} -- $__tmux_mcp_ec; echo \"{END_MARKER_PREFIX}{command_id}_$__tmux_mcp_ec\"; {tmux_bin} wait-for -S {chan_q}"
             )
         }
-        ShellType::Bash | ShellType::Zsh | ShellType::Unknown => {
+        ShellType::Bash | ShellType::Unknown => {
+            // A foreground SIGINT can discard the rest of an interactive Bash input
+            // line, including a trap-protected loop. Finish at the next prompt in
+            // that case; do not change INT traps or treat key delivery as completion.
+            // Use per-command names so an old command cannot finalize a newer one.
+            // ponytail: recovery needs the next prompt; shell exit/exec or commands
+            // that replace PROMPT_COMMAND still require separate recovery handling.
+            let saved = format!("__tmux_mcp_prompt_{secret}");
+            let finish = format!("__tmux_mcp_finish_{secret}");
+            let ec = format!("__tmux_mcp_ec_{secret}");
+            let complete = format!(
+                "{tmux_bin} set-buffer -b {buf_q} -- \"${ec}\"; echo \"{END_MARKER_PREFIX}{command_id}_${ec}\"; {tmux_bin} wait-for -S {chan_q}"
+            );
+            let finalize = tmux::shell_single_quote(&format!(
+                "{ec}=${{{ec}-$?}}; {complete}; unset PROMPT_COMMAND; eval \"${saved}\"; unset {saved} {finish} {ec}"
+            ));
+            // Keep array syntax inside eval: sh/dash can use the legacy tail even
+            // when configured as Bash. Preserve scalar/array prompt hooks verbatim.
+            let prompt = tmux::shell_single_quote(&format!(
+                "PROMPT_COMMAND=('eval \"${finish}\"' \"${{PROMPT_COMMAND[@]}}\")"
+            ));
+            format!(
+                "if [ -n \"${{BASH_VERSION-}}\" ]; then {saved}=$(declare -p PROMPT_COMMAND 2>/dev/null); {finish}={finalize}; eval {prompt}; fi; echo \"{start_marker}\"; {command} ; {ec}=$?; if [ -n \"${{BASH_VERSION-}}\" ]; then eval \"${finish}\"; else {complete}; unset {ec}; fi"
+            )
+        }
+        ShellType::Zsh => {
             format!(
                 "echo \"{start_marker}\"; {command} ; __tmux_mcp_ec=$?; {tmux_bin} set-buffer -b {buf_q} -- \"$__tmux_mcp_ec\"; echo \"{END_MARKER_PREFIX}{command_id}_$__tmux_mcp_ec\"; {tmux_bin} wait-for -S {chan_q}"
             )
@@ -1176,7 +1303,7 @@ fn has_unquoted_shell_comment_marker(command: &str) -> bool {
 
 /// True when an unquoted `&` would background work and skip the side-channel epilogue.
 ///
-/// Treats `&&` and `&>` as non-background operators so normal control flow still tracks.
+/// Treats `&&`, `&>`, and redirections such as `2>&1` as non-background operators.
 fn has_unquoted_shell_background_operator(command: &str) -> bool {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -1210,6 +1337,12 @@ fn has_unquoted_shell_background_operator(command: &str) -> bool {
                 }
 
                 return true;
+            }
+            '>' | '<' | '|'
+                if !in_single_quote && !in_double_quote && iter.peek() == Some(&'&') =>
+            {
+                // File-descriptor redirections and Bash |& are not background jobs.
+                iter.next();
             }
             _ => {}
         }
@@ -1280,6 +1413,7 @@ mod tests {
 
     fn running_execution(id: &str) -> CommandExecution {
         CommandExecution {
+            target: None,
             id: id.to_string(),
             pane_id: "%1".to_string(),
             socket: None,
@@ -1494,7 +1628,7 @@ mod tests {
 
         let status_task = {
             let tracker = Arc::clone(&tracker);
-            tokio::spawn(async move { tracker.check_status("cmd-race", None).await })
+            crate::targets::spawn(async move { tracker.check_status("cmd-race", None).await })
         };
 
         let mut capture_started = false;
@@ -1572,6 +1706,138 @@ mod tests {
         );
     }
 
+    /// Real local shells with a shell-function tmux double: never contacts tmux/SSH.
+    /// On Windows set TMUX_MCP_TEST_BASH to a Git Bash executable.
+    #[tokio::test]
+    async fn test_bash_interrupt_finalizes_once_and_restores_shell() {
+        use std::process::Stdio;
+        use tokio::io::AsyncWriteExt;
+
+        let bash = std::env::var_os("TMUX_MCP_TEST_BASH").unwrap_or_else(|| "bash".into());
+        if cfg!(windows) && std::env::var_os("TMUX_MCP_TEST_BASH").is_none() {
+            eprintln!("set TMUX_MCP_TEST_BASH to run the real Bash regression on Windows");
+            return;
+        }
+        // With no controlling terminal, explicitly signal this test shell as well
+        // as its child to model terminal SIGINT delivery without touching any peer.
+        let interrupt = "bash --noprofile --norc -c 'kill -INT \"$PPID\"; kill -INT $$'";
+        let cases = [
+            ("true".to_string(), 0, "unset PROMPT_COMMAND; trap - INT"),
+            ("false".to_string(), 1, "PROMPT_COMMAND=':'; trap ':' INT"),
+            (
+                "bash -c 'exit 130'".to_string(),
+                130,
+                "unset PROMPT_COMMAND",
+            ),
+            (
+                interrupt.to_string(),
+                130,
+                "unset PROMPT_COMMAND; trap - INT",
+            ),
+            (interrupt.to_string(), 130, "PROMPT_COMMAND=':'; trap - INT"),
+            (
+                interrupt.to_string(),
+                130,
+                "PROMPT_COMMAND=':'; trap ':' INT",
+            ),
+            (
+                "bash -c 'kill -INT \"$PPID\"; kill -INT \"$PPID\"; kill -INT $$'".to_string(),
+                130,
+                "PROMPT_COMMAND=(':' ':'); trap - INT",
+            ),
+            (
+                format!("for x in 1 2; do {interrupt}; echo UNEXPECTED_LOOP_TAIL; done"),
+                130,
+                "PROMPT_COMMAND=(':' ':'); trap - INT",
+            ),
+            (
+                "bash -c 'trap \"\" INT; kill -INT $$; echo CHILD_STILL_RUNNING; exit 0'"
+                    .to_string(),
+                0,
+                "unset PROMPT_COMMAND; trap - INT",
+            ),
+            (
+                "cd /; export TMUX_MCP_TEST_STATE=kept; false".to_string(),
+                1,
+                "PROMPT_COMMAND=(':' ':'); trap ':' INT",
+            ),
+        ];
+        for (index, (command, exit_code, setup)) in cases.iter().enumerate() {
+            let wrapped = wrap_tracked_command_side_channel(
+                command,
+                "interrupt-test",
+                "abcdef",
+                &ShellType::Bash,
+                Some("/unused-test-socket"),
+            );
+            let script = format!(
+                "PATH=/usr/bin:/bin; PS1=; PS2=\n\
+                 tmux() {{ if [ \"$1\" = -S ]; then shift 2; fi; case \"$1\" in set-buffer) printf 'EXIT_CODE=%s\\n' \"${{@: -1}}\";; wait-for) echo COMPLETION_SIGNAL;; *) return 99;; esac; }}\n\
+                 {setup}\n\
+                 before_prompt=$(declare -p PROMPT_COMMAND 2>/dev/null); before_trap=$(trap -p INT)\n\
+                 {wrapped}\n\
+                 [ \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" = \"$before_prompt\" ] && echo PROMPT_RESTORED\n\
+                 [ \"$(trap -p INT)\" = \"$before_trap\" ] && echo TRAP_RESTORED\n\
+                 [ -z \"${{__tmux_mcp_finish_abcdef+x}}${{__tmux_mcp_prompt_abcdef+x}}${{__tmux_mcp_ec_abcdef+x}}\" ] && echo STATE_CLEANED\n\
+                 printf 'SHELL_STATE=%s:%s\\n' \"$PWD\" \"${{TMUX_MCP_TEST_STATE-}}\"\n\
+                 exit 0\n"
+            );
+            let mut child = tokio::process::Command::new(&bash)
+                .args(["--noprofile", "--norc", "-i"])
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
+                .env_remove("PROMPT_COMMAND")
+                .env("INPUTRC", "/dev/null")
+                .env("TERM", "dumb")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("start local Bash");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .await
+                .unwrap();
+            let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+                .await
+                .expect("local shell must not hang")
+                .expect("local shell output");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "case {index}: {stdout}\n{stderr}");
+            for expected in [
+                format!("EXIT_CODE={exit_code}"),
+                "COMPLETION_SIGNAL".into(),
+                "PROMPT_RESTORED".into(),
+                "TRAP_RESTORED".into(),
+                "STATE_CLEANED".into(),
+            ] {
+                assert_eq!(
+                    stdout.lines().filter(|line| *line == expected).count(),
+                    1,
+                    "case {index}, expected exactly one {expected}: {stdout}\n{stderr}"
+                );
+            }
+            assert!(
+                !stdout.contains("UNEXPECTED_LOOP_TAIL"),
+                "case {index}: {stdout}"
+            );
+            if command.contains("CHILD_STILL_RUNNING") {
+                assert!(
+                    stdout.find("CHILD_STILL_RUNNING").unwrap()
+                        < stdout.find("COMPLETION_SIGNAL").unwrap()
+                );
+            }
+            if command.contains("TMUX_MCP_TEST_STATE") {
+                assert!(stdout.contains("SHELL_STATE=/:kept"), "{stdout}");
+            }
+        }
+    }
+
     #[rstest]
     #[case(ShellType::Fish, "bash", ShellType::Bash)]
     #[case(ShellType::Fish, "zsh", ShellType::Zsh)]
@@ -1605,6 +1871,38 @@ mod tests {
         let terminal = wait_until_terminal(&tracker, &id).await;
         assert_eq!(terminal.status, CommandStatus::Completed);
         assert_eq!(terminal.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_recovers_completed_side_channel_without_watcher() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_EXIT_CODE", "7");
+        let id = "orphaned-command";
+        let secret = "orphaned-secret";
+        let tracker = CommandTracker::new(ShellType::Bash);
+        tracker.insert_test_occupant(running_execution(id)).await;
+        tracker
+            .secrets
+            .write()
+            .await
+            .insert(id.to_string(), secret.to_string());
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            format!("TMUX_MCP_START_{id}\noutput\nTMUX_MCP_DONE_{id}_7\n"),
+        );
+
+        let snapshot = tracker.status_snapshot(id).await.expect("snapshot");
+        assert_eq!(snapshot.status, CommandStatus::Failed);
+        assert_eq!(snapshot.exit_code, Some(7));
+        assert!(snapshot.result_ready);
+        assert_eq!(tracker.pane_command_id("%1", None).await, None);
+        assert!(
+            tracker
+                .execute_command("%1", "echo next", false, false, None, None)
+                .await
+                .is_ok(),
+            "a recovered command must release its pane"
+        );
     }
 
     #[tokio::test]
@@ -1712,6 +2010,7 @@ mod tests {
     async fn execute_command_spoof_done_does_not_complete() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "2");
+        stub.set_var("TMUX_STUB_EXIT_CODE_MISSING", "1");
         let tracker = CommandTracker::new(ShellType::Bash);
         let id = tracker
             .execute_command("%1", "sleep 30", false, false, None, None)
@@ -1752,7 +2051,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracking_error_keeps_pane_busy_until_acknowledged() {
+    async fn test_detach_cannot_bypass_occupied_pane() {
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let mut execution = running_execution("detached");
+        execution.raw_mode = true;
+        execution.tracking_disabled = true;
+        tracker.insert_test_occupant(execution).await;
+        for detach in [false, true] {
+            let error = tracker
+                .execute_command("%1", "next", detach, false, None, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("busy"));
+        }
+        tracker
+            .mark_dispatch_uncertain(
+                "detached",
+                &Error::InvalidArgument {
+                    message: "connection lost".into(),
+                },
+            )
+            .await;
+        assert!(tracker.uncertain_command().await.is_some());
+        assert_eq!(
+            tracker.pane_command_id("%1", None).await.as_deref(),
+            Some("detached")
+        );
+    }
+
+    #[tokio::test]
+    async fn tracking_error_keeps_pane_busy_after_inspection_and_retention() {
         let tracker = CommandTracker::with_tracking(
             ShellType::Bash,
             TrackingConfig {
@@ -1781,9 +2109,17 @@ mod tests {
             .expect_err("uncertain pane must remain busy");
         assert!(error.to_string().contains("busy"));
 
-        tracker.acknowledge_uncertain(&id).await;
-        assert!(tracker.uncertain_command().await.is_none());
-        assert!(tracker.pane_command_id("%1", None).await.is_none());
+        tracker.status_snapshot(&id).await;
+        tracker.cleanup_completed().await;
+        assert!(tracker.uncertain_command().await.is_some());
+        assert_eq!(
+            tracker.pane_command_id("%1", None).await.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(tracker
+            .execute_command("%1", "echo detached", true, false, None, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1807,6 +2143,7 @@ mod tests {
     async fn caller_timeout_stays_running_after_tracking_checkpoint() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_WAIT_FOR_SLEEP_SECS", "3");
+        stub.set_var("TMUX_STUB_EXIT_CODE_MISSING", "1");
         let tracker = CommandTracker::with_tracking(
             ShellType::Bash,
             TrackingConfig {
@@ -1864,15 +2201,91 @@ mod tests {
         assert!(matches!(err, Error::InvalidArgument { .. }));
     }
 
+    #[test]
+    fn shell_redirections_are_not_background_operators() {
+        for command in [
+            "sleep 60&true",
+            "sleep 1 &",
+            "sleep 1&",
+            "echo a&&sleep 1&echo b",
+        ] {
+            assert!(has_unquoted_shell_background_operator(command), "{command}");
+        }
+        for command in [
+            "cmd 2>&1",
+            "true && echo ok",
+            "cmd &>log",
+            "cmd 3<&0",
+            "cmd |& cat",
+            "echo 'a&b'",
+            "echo \"a&b\"",
+            r"echo a\&b",
+        ] {
+            assert!(
+                !has_unquoted_shell_background_operator(command),
+                "{command}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn execute_command_rejects_intra_word_background() {
-        let _stub = TmuxStub::new();
+    async fn test_wait_budget_preserves_running_command_without_final_capture() {
         let tracker = CommandTracker::new(ShellType::Bash);
-        let err = tracker
-            .execute_command("%1", "sleep 60&true", false, false, None, None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument { .. }));
+        tracker
+            .insert_test_occupant(running_execution("budget"))
+            .await;
+        let (result, timing) = crate::timing::measure(tracker.wait_for("budget", 5)).await;
+        let (execution, timed_out) = result.unwrap().unwrap();
+        assert!(timed_out);
+        assert_eq!(execution.status, CommandStatus::Running);
+        assert!(!execution.result_ready);
+        assert!(
+            timing.transports.is_empty(),
+            "deadline must not capture output"
+        );
+        assert_eq!(
+            tracker.pane_command_id("%1", None).await.as_deref(),
+            Some("budget")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_target_isolates_identical_panes_results_and_purge() {
+        let tracker = CommandTracker::new(ShellType::Bash);
+        for target in ["server-admin", "server-intern"] {
+            crate::targets::scope(target.into(), async {
+                let mut execution = running_execution(target);
+                execution.target = Some(target.into());
+                tracker.insert_test_occupant(execution).await;
+            })
+            .await;
+        }
+        crate::targets::scope("server-admin".into(), async {
+            assert_eq!(
+                tracker.pane_command_id("%1", None).await.as_deref(),
+                Some("server-admin")
+            );
+            assert!(tracker.get_command("server-intern").await.is_none());
+            assert!(tracker
+                .check_status("server-intern", None)
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(tracker.purge_pane("%1", None).await, 1);
+        })
+        .await;
+        crate::targets::scope("server-intern".into(), async {
+            assert_eq!(
+                tracker.pane_command_id("%1", None).await.as_deref(),
+                Some("server-intern")
+            );
+            let record = tracker.get_command("server-intern").await.unwrap();
+            assert_eq!(
+                record.resource_uri(),
+                "tmux://server-intern/command/server-intern/result"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1889,7 +2302,7 @@ mod tests {
 
         let logged = std::fs::read_to_string(log.path()).expect("read log");
         assert!(
-            logged.contains("__tmux_mcp_ec=$?"),
+            logged.contains("=$?; if [ -n"),
             "bash pane should use POSIX exit status syntax, got: {logged}"
         );
         assert!(
@@ -1920,7 +2333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_command_send_failure_rolls_back() {
+    async fn execute_command_send_failure_retains_uncertain_pane() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_STUB_ERROR_CMD", "send-keys");
         let tracker = CommandTracker::new(ShellType::Bash);
@@ -1929,7 +2342,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Tmux { .. }));
-        assert!(tracker.get_active_ids().await.is_empty());
+        let uncertain = tracker
+            .uncertain_command()
+            .await
+            .expect("retain uncertain input");
+        assert_eq!(
+            tracker.pane_command_id("%1", None).await.as_deref(),
+            Some(uncertain.id.as_str())
+        );
+        assert!(uncertain.reason.unwrap().contains("Stop and report"));
     }
 
     #[tokio::test]
@@ -1969,6 +2390,14 @@ mod tests {
             output.contains("Tracking disabled for raw_mode or no_enter commands")
         }));
         assert_snapshot_output_incomplete(&cmd);
+        assert_eq!(
+            tracker.pane_command_id("%1", None).await.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(tracker
+            .execute_command("%1", "echo next", false, false, None, None)
+            .await
+            .is_err());
     }
 
     #[rstest]

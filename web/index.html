@@ -100,6 +100,23 @@
 
       .header-spacer { flex: 1; }
 
+      .target-picker {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .target-picker select {
+        max-width: 300px;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: var(--text);
+        background: var(--panel);
+      }
+
       .connection {
         display: flex;
         align-items: center;
@@ -680,6 +697,9 @@
           <button id="mode-messages" class="active" type="button">消息</button>
           <button id="mode-interactive" type="button">交互</button>
         </div>
+        <label class="target-picker">目标
+          <select id="target-select" aria-label="SSH 目标"></select>
+        </label>
         <div class="header-spacer"></div>
         <div class="connection">
           <span id="connection-dot" class="status-dot"></span>
@@ -826,12 +846,14 @@
         operationLog: byId("operation-log"),
         operationList: byId("operation-log-list"),
         logCritical: byId("log-critical"),
-        logFull: byId("log-full")
+        logFull: byId("log-full"),
+        targetSelect: byId("target-select")
       };
 
       let mode = localStorage.getItem("tmux-mcp-mode") === "interactive" ? "interactive" : "messages";
       let operationLogMode = "critical";
       let selectedPane = localStorage.getItem("tmux-mcp-pane") || "";
+      let selectedTarget = localStorage.getItem("tmux-mcp-target") || "";
       let latestState = null;
       let previousActivity = {};
       let activityInitialized = false;
@@ -896,6 +918,24 @@
       function showError(message) {
         elements.error.textContent = message || "";
         elements.error.classList.toggle("visible", Boolean(message));
+      }
+
+      function renderTargets(targets, active) {
+        const entries = Object.entries(targets || {});
+        const target = active || selectedTarget || entries[0]?.[0] || "";
+        if (target !== selectedTarget) {
+          selectedTarget = target;
+          selectedPane = "";
+          localStorage.setItem("tmux-mcp-target", selectedTarget);
+        }
+        clear(elements.targetSelect);
+        for (const [name, config] of entries) {
+          const option = node("option", "", `${name}${config.note ? ` · ${config.note}` : ""}`);
+          option.value = name;
+          option.selected = name === selectedTarget;
+          elements.targetSelect.appendChild(option);
+        }
+        elements.targetSelect.value = selectedTarget;
       }
 
       function renderGateMode(value) {
@@ -1403,9 +1443,13 @@
         stateBusy = true;
         const requestedPane = selectedPane;
         try {
-          const query = requestedPane ? `?paneId=${encodeURIComponent(requestedPane)}` : "";
+          const params = new URLSearchParams();
+          if (requestedPane) params.set("paneId", requestedPane);
+          if (selectedTarget) params.set("target", selectedTarget);
+          const query = params.toString() ? `?${params}` : "";
           const state = await api(`/api/state${query}`);
           latestState = state;
+          renderTargets(state.targets, state.target);
           for (const id of decidedApprovalIds) {
             if (!(state.pending || []).some((record) => record.id === id)) {
               decidedApprovalIds.delete(id);
@@ -1444,7 +1488,7 @@
         const paneId = selectedPane;
         captureBusy = true;
         try {
-          const result = await api(`/api/panes/${encodeURIComponent(paneId)}/capture`);
+          const result = await api(`/api/panes/${encodeURIComponent(paneId)}/capture?target=${encodeURIComponent(selectedTarget)}`);
           if (mode === "interactive" && selectedPane === paneId) {
             elements.terminal.textContent = result.text || "";
             elements.terminal.scrollTop = elements.terminal.scrollHeight;
@@ -1463,7 +1507,7 @@
           .then(() =>
             api(`/api/panes/${encodeURIComponent(paneId)}/keys`, {
               method: "POST",
-              body: { key, literal }
+              body: { key, literal, target: selectedTarget }
             })
           )
           .catch((error) => showError(error.message));
@@ -1486,6 +1530,12 @@
 
       elements.modeMessages.addEventListener("click", () => setMode("messages"));
       elements.modeInteractive.addEventListener("click", () => setMode("interactive"));
+      elements.targetSelect.addEventListener("change", () => {
+        selectedTarget = elements.targetSelect.value;
+        selectedPane = "";
+        localStorage.setItem("tmux-mcp-target", selectedTarget);
+        void refreshState();
+      });
 
       elements.commandInput.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.isComposing) {
@@ -1508,7 +1558,7 @@
         try {
           await api(`/api/panes/${encodeURIComponent(paneId)}/commands`, {
             method: "POST",
-            body: { command }
+            body: { command, target: selectedTarget }
           });
           elements.commandInput.value = "";
           await refreshState();

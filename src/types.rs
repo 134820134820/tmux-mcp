@@ -300,7 +300,7 @@ impl CommandStatus {
 
 /// Canonical MCP resource URI for a tracked command result.
 pub fn command_resource_uri(command_id: &str) -> String {
-    format!("tmux://command/{command_id}/result")
+    crate::targets::uri(&format!("tmux://command/{command_id}/result"))
 }
 
 /// Shared tool/resource snapshot for a tracked command (schemaVersion 2).
@@ -316,6 +316,7 @@ pub struct CommandSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Original command text as requested by the client.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub command: String,
     /// Target pane id (`%N`).
     pub pane_id: String,
@@ -361,7 +362,7 @@ impl CommandSnapshot {
             .saturating_duration_since(exec.started_at);
         Self {
             command_id: exec.id.clone(),
-            resource_uri: command_resource_uri(&exec.id),
+            resource_uri: exec.resource_uri(),
             status: exec.status,
             exit_code: exec.exit_code,
             command: exec.command.clone(),
@@ -384,6 +385,8 @@ impl CommandSnapshot {
 /// Side-channel secrets are stored separately and never appear here.
 #[derive(Debug, Clone)]
 pub struct CommandExecution {
+    /// SSH target identity, retained independently of the caller's current target.
+    pub target: Option<String>,
     /// Opaque command id returned by `execute-command` and used in resource URIs.
     pub id: String,
     /// Target pane id (`%N`) for this send.
@@ -417,6 +420,22 @@ pub struct CommandExecution {
     pub tracking_disabled: bool,
 }
 
+impl CommandExecution {
+    pub fn resource_uri(&self) -> String {
+        let uri = format!("tmux://command/{}/result", self.id);
+        match &self.target {
+            Some(target) => crate::targets::uri_for(target, &uri),
+            None => uri,
+        }
+    }
+
+    pub fn visible_to_current_target(&self) -> bool {
+        crate::targets::current().map_or(true, |target| {
+            self.target.as_deref() == Some(target.as_str())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +444,7 @@ mod tests {
     fn command_snapshot_preserves_output_capture_completeness() {
         let now = Instant::now();
         let execution = CommandExecution {
+            target: None,
             id: "cmd-1".to_string(),
             pane_id: "%1".to_string(),
             socket: Some("/tmp/tmux.sock".to_string()),

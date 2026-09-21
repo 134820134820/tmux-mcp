@@ -11,9 +11,9 @@ use std::time::Duration;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock as Content, CustomNotification, Resource, ResourceContents,
-    ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
-    ServerNotification,
+    CallToolResult, ContentBlock as Content, CustomNotification, ListToolsResult, Resource,
+    ResourceContents, ResourceTemplate, ResourceUpdatedNotificationParam, ServerCapabilities,
+    ServerInfo, ServerNotification, Tool,
 };
 use rmcp::schemars::JsonSchema;
 use rmcp::serde::{Deserialize, Serialize};
@@ -309,6 +309,8 @@ pub struct ListPanesOutput {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TmuxStateOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     pub current_session_id: Option<String>,
     pub sessions: Vec<Session>,
     pub windows: Vec<Window>,
@@ -335,6 +337,22 @@ pub struct ListDirectoryOutput {
     pub path: String,
     pub entries: Vec<String>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct FileStatOutput {
+    pub cwd: String,
+    pub path: String,
+    pub metadata: tmux::FileMetadata,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FileStatInput {
+    /// Existing pane used to resolve relative paths; no new window is needed.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    pub path: String,
+    pub socket: Option<String>,
 }
 
 /// `read-file` structured payload.
@@ -456,6 +474,9 @@ pub struct CapturePaneInput {
     pub end: Option<i32>,
     /// Join soft-wrapped lines when true.
     pub join: Option<bool>,
+    /// Return wrapper/marker lines too; default filters MCP bookkeeping noise.
+    #[serde(default)]
+    pub raw: bool,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -692,6 +713,13 @@ pub struct ExecuteCommandInput {
     /// Optional block until the final result is ready or timeout after accept.
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
+    /// Disable completion tracking (default false). Pane safety still applies;
+    /// the pane remains occupied because completion cannot be confirmed automatically.
+    #[serde(default)]
+    pub detach: bool,
+    /// Include the original command text in the response.
+    #[serde(default)]
+    pub verbose: bool,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -705,6 +733,9 @@ pub struct GetCommandResultInput {
     /// Block until terminal or timeout; timeout does not change command status.
     #[serde(rename = "waitMs")]
     pub wait_ms: Option<u64>,
+    /// Include the original command text in the response.
+    #[serde(default)]
+    pub verbose: bool,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
 }
@@ -1307,7 +1338,7 @@ impl TmuxMcpServer {
             let mut events = tracker.subscribe_events();
             let peer = Arc::clone(&peer);
             let subscriptions = Arc::clone(&subscriptions);
-            tokio::spawn(async move {
+            crate::targets::spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(event) => {
@@ -1352,7 +1383,7 @@ impl TmuxMcpServer {
         if let Some(control) = control.clone() {
             let mut events = tracker.subscribe_events();
             let tracker = Arc::clone(&tracker);
-            tokio::spawn(async move {
+            crate::targets::spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(event) if event.kind == CommandEventKind::Terminal => {
@@ -1381,7 +1412,7 @@ impl TmuxMcpServer {
             let mut events = gpu_monitor.subscribe();
             let peer = Arc::clone(&peer);
             let gpu_monitor_for_events = gpu_monitor.clone();
-            tokio::spawn(async move {
+            crate::targets::spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(event)
@@ -1496,11 +1527,15 @@ impl TmuxMcpServer {
         });
     }
 
-    async fn safety_preflight(&self) -> Option<CallToolResult> {
+    async fn safety_preflight(&self, tool_name: &str) -> Option<CallToolResult> {
+        // Inspection must remain possible, but it never acknowledges or clears an anomaly.
+        if self.tool_is_read_only(tool_name) {
+            return None;
+        }
         match self.current_ai_pause().await {
             Ok(Some(pause)) => {
                 return Some(CallToolResult::error(vec![Content::text(format!(
-                    "AI 操作已暂停\n原因：无法确认 pane {} 的状态",
+                    "AI 操作已暂停\n原因：无法确认 pane {} 的状态。停止修改并向用户报告；不要重试、清理输入或换窗口重跑。只读检查仍可使用。",
                     pause.pane_id
                 ))]));
             }
@@ -1513,34 +1548,21 @@ impl TmuxMcpServer {
         }
 
         let uncertain = self.tracker.uncertain_command().await?;
-        match tmux::capture_pane(
-            &uncertain.pane_id,
-            Some(200),
-            false,
-            None,
-            None,
-            true,
-            uncertain.socket.as_deref(),
-        )
-        .await
-        {
-            Ok(content) => {
-                self.tracker.acknowledge_uncertain(&uncertain.id).await;
-                Some(CallToolResult::error(vec![Content::text(format!(
-                    "The previous command {} in pane {} has an uncertain tracking state. \
-                     The requested operation was not executed.\n\ncapture-pane:\n{}\n\n\
-                     Review this pane before sending another request, especially a modifying command.",
-                    uncertain.id, uncertain.pane_id, content
-                ))]))
-            }
-            Err(_) => {
-                self.pause_ai(&uncertain.pane_id).await;
-                Some(CallToolResult::error(vec![Content::text(format!(
-                    "AI 操作已暂停\n原因：无法确认 pane {} 的状态",
-                    uncertain.pane_id
-                ))]))
-            }
-        }
+        Some(CallToolResult::error(vec![Content::text(format!(
+            "Command {} in pane {} has uncertain execution state. This operation was not executed. \
+             Stop modifying this target and report the commandId, paneId and error to the user. \
+             Do not retry, clear input, interrupt the task, or create/switch windows to repeat it. \
+             Read-only inspection is allowed and does not clear this protection. Reason: {}",
+            uncertain.id, uncertain.pane_id, uncertain.reason.as_deref().unwrap_or("completion was not confirmed")
+        ))]))
+    }
+
+    async fn input_failure(&self, pane_id: &str, error: &crate::errors::Error) -> CallToolResult {
+        self.pause_ai(pane_id).await;
+        CallToolResult::error(vec![Content::text(format!(
+            "Input delivery to pane {pane_id} is uncertain: {error}. Stop and report to the user; \
+             do not retry, clear input, interrupt the task, or switch windows to repeat it."
+        ))])
     }
 
     async fn validate_command_input(
@@ -1558,6 +1580,16 @@ impl TmuxMcpServer {
             }
             return Ok(());
         };
+        if self
+            .tracker
+            .get_command(&command_id)
+            .await
+            .is_some_and(|command| command.status == CommandStatus::TrackingError)
+        {
+            return Err(CallToolResult::error(vec![Content::text(format!(
+                "pane {pane_id}, command {command_id}: execution is uncertain. Stop and report to the user; do not send more input."
+            ))]));
+        }
         if allow_cancel {
             return Ok(());
         }
@@ -1580,6 +1612,8 @@ impl TmuxMcpServer {
         let words = shell_words::split(command).ok()?;
         match words.first().map(String::as_str)? {
             "ls" => Some("list-directory"),
+            "stat" => Some("file-stat"),
+            "nvidia-smi" => Some("gpu-snapshot"),
             "cat" | "head" | "tail" => Some("read-file"),
             "find" => Some("find-files"),
             "grep" | "rg" => Some("search-text"),
@@ -1643,7 +1677,7 @@ impl TmuxMcpServer {
 
         let mut templates = Vec::new();
         templates.push(Self::resource_template(
-            "tmux://server/info",
+            "tmux://{target}/server/info",
             "Tmux Server Info",
             "Default socket and SSH context for selecting the right tmux target.",
             "application/json",
@@ -1654,25 +1688,25 @@ impl TmuxMcpServer {
             .is_ok()
         {
             templates.push(Self::resource_template(
-                "tmux://pane/{paneId}",
+                "tmux://{target}/pane/{paneId}",
                 "Tmux Pane Content",
                 "Capture pane content for state checks or log monitoring; use when polling output without sending input.",
                 "text/plain",
             ));
             templates.push(Self::resource_template(
-                "tmux://pane/{paneId}/info",
+                "tmux://{target}/pane/{paneId}/info",
                 "Tmux Pane Info",
                 "Detailed metadata for a pane (cwd, command, size). Use to decide where to run commands or how to resize/layout.",
                 "application/json",
             ));
             templates.push(Self::resource_template(
-                "tmux://pane/{paneId}/tail/{lines}",
+                "tmux://{target}/pane/{paneId}/tail/{lines}",
                 "Tmux Pane Tail",
                 "Tail N lines from a pane for lightweight log polling without full scrollback.",
                 "text/plain",
             ));
             templates.push(Self::resource_template(
-                "tmux://pane/{paneId}/tail/{lines}/ansi",
+                "tmux://{target}/pane/{paneId}/tail/{lines}/ansi",
                 "Tmux Pane Tail (ANSI)",
                 "Tail N lines with ANSI colors when formatting or highlighting matters.",
                 "text/plain",
@@ -1684,7 +1718,7 @@ impl TmuxMcpServer {
             .is_ok()
         {
             templates.push(Self::resource_template(
-                "tmux://window/{windowId}/info",
+                "tmux://{target}/window/{windowId}/info",
                 "Tmux Window Info",
                 "Window metadata (layout, active pane, size). Use to normalize layouts or decide where to focus.",
                 "application/json",
@@ -1696,7 +1730,7 @@ impl TmuxMcpServer {
             .is_ok()
         {
             templates.push(Self::resource_template(
-                "tmux://session/{sessionId}/tree",
+                "tmux://{target}/session/{sessionId}/tree",
                 "Tmux Session Tree",
                 "Snapshot of session, windows, and panes for planning multi-pane workflows.",
                 "application/json",
@@ -1720,7 +1754,7 @@ impl TmuxMcpServer {
             .is_ok()
         {
             templates.push(Self::resource_template(
-                "tmux://command/{commandId}/result",
+                "tmux://{target}/command/{commandId}/result",
                 "Command Execution Result",
                 "Tracked command snapshot; prefer subscribe for updates then read.",
                 "application/json",
@@ -1873,6 +1907,17 @@ impl TmuxMcpServer {
 
     // Core tools
     #[tool(
+        name = "list-targets",
+        description = "List configured SSH targets and notes.",
+        annotations(read_only_hint = true, idempotent_hint = true)
+    )]
+    async fn list_targets(&self) -> Result<CallToolResult, McpError> {
+        let targets = crate::targets::load_configured()
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(structured_output(&targets.targets))
+    }
+
+    #[tool(
         name = "socket-for-path",
         description = "Derive a deterministic tmux socket path for a project directory. Use to pick a per-worktree socket without env vars; returns /tmp/{hash}.sock.",
         annotations(read_only_hint = true, idempotent_hint = true)
@@ -1898,7 +1943,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "get-tmux-state",
-        description = "Return the visible tmux sessions, windows, and panes in one target map.",
+        description = "Inspect visible sessions/windows/panes. Reuse your task's existing pane; a timeout or error is not a reason to create another window. Empty sessions means no visible session: create one explicitly only if needed.",
         annotations(read_only_hint = true, idempotent_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<TmuxStateOutput>()
     )]
@@ -1963,6 +2008,7 @@ impl TmuxMcpServer {
             })
             .map(|session| session.id);
         Ok(structured_output(&TmuxStateOutput {
+            hint: sessions.is_empty().then(|| "No accessible tmux session. Nothing was created. If a new workspace is needed and allowed, call create-session and reuse its initial window/pane.".into()),
             current_session_id,
             sessions,
             windows,
@@ -2201,13 +2247,24 @@ impl TmuxMcpServer {
         )
         .await
         {
-            Ok(content) => Ok(CallToolResult::success(vec![Content::text(
-                if content.is_empty() {
-                    "No content captured".into()
+            Ok(content) => {
+                let content = if input.0.raw {
+                    content
                 } else {
                     content
-                },
-            )])),
+                        .lines()
+                        .filter(|line| !line.contains("TMUX_MCP_") && !line.contains("__tmux_mcp_"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Ok(CallToolResult::success(vec![Content::text(
+                    if content.is_empty() {
+                        "No content captured".into()
+                    } else {
+                        content
+                    },
+                )]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error capturing pane: {e}"
             ))])),
@@ -2261,6 +2318,70 @@ impl TmuxMcpServer {
             })),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error listing directory: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "file-stat",
+        description = "Read file type, byte size, and modification time without reading contents or following symlinks. Linux targets use fixed GNU stat arguments; relative paths use an existing pane cwd. No recursive scan or new window.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<FileStatOutput>()
+    )]
+    async fn file_stat(
+        &self,
+        input: Parameters<FileStatInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("file-stat") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(error) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let pane = match self
+            .checked_pane_info(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            Ok(pane) => pane,
+            Err(error) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    error.to_string(),
+                )]))
+            }
+        };
+        match tmux::file_stat(&pane.current_path, &input.0.path).await {
+            Ok(metadata) => Ok(structured_output(&FileStatOutput {
+                cwd: pane.current_path,
+                path: input.0.path,
+                metadata,
+            })),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "File metadata unavailable: {error}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "gpu-snapshot",
+        description = "One bounded NVIDIA GPU and compute-process snapshot (CSV with headers/units). Read-only: never starts a watcher or changes workloads; needs only target, no session/pane/window. Failures report unavailable diagnostics, not an idle GPU.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<tmux::GpuSnapshot>()
+    )]
+    async fn gpu_snapshot(&self) -> Result<CallToolResult, McpError> {
+        if let Err(error) = self.policy.check_tool("gpu-snapshot") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        match tmux::gpu_snapshot().await {
+            Ok(snapshot) => Ok(structured_output(&snapshot)),
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "GPU snapshot unavailable (connection, nvidia-smi, or driver failure): {error}"
             ))])),
         }
     }
@@ -3032,7 +3153,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "create-session",
-        description = "Create a new tmux session with the given name. Use to start an isolated workspace for an agent task, then create-window or use the default window.",
+        description = "Create a session only when no suitable task session exists. It already includes a window/pane: use that pane, do not immediately create another window. Never creates sessions automatically during inspection.",
         annotations(read_only_hint = false)
     )]
     async fn create_session(
@@ -3062,7 +3183,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "create-window",
-        description = "Create a new window in a tmux session. Use to separate build/test/log/REPL workspaces; returns the created window with its first pane.",
+        description = "Create a window only for a genuinely concurrent task when no suitable task-owned pane is available. Inspect get-tmux-state first; reuse your existing pane for sequential work. Never create a window merely to retry a failed/timed-out command. Returns its first pane.",
         annotations(read_only_hint = false)
     )]
     async fn create_window(
@@ -3092,7 +3213,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "split-pane",
-        description = "Split a pane horizontally or vertically, optionally with a size percentage. Use to create parallel views (logs + REPL, editor + tests); returns the new pane.",
+        description = "Split only when a concurrent task needs its own terminal and no suitable task-owned pane is available. Reuse existing panes for sequential work; do not split to retry errors/timeouts. Returns the new pane.",
         annotations(read_only_hint = false)
     )]
     async fn split_pane(
@@ -3337,7 +3458,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "execute-command",
-        description = "Run one tracked shell command in a pane with side-channel exit-code tracking. With waitMs, the response includes a result snapshot after final bounded output capture or timeout; otherwise use get-command-result with waitMs. A second command for the same busy pane is rejected. For interactive programs (vim/htop), use send-keys instead.",
+        description = "Run one shell command in a task-owned pane, tracked by default. With waitMs, return a result snapshot after final bounded capture or timeout; otherwise use get-command-result. Busy panes reject new commands, including detach:true. For long/verbose tasks, arrange application logging before launch and use read-file to inspect it; MCP does not archive full output. Never rerun a task just to recover missing output. For interactive programs use send-keys.",
         annotations(open_world_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<ExecuteCommandOutput>()
     )]
@@ -3345,8 +3466,14 @@ impl TmuxMcpServer {
         &self,
         input: Parameters<ExecuteCommandInput>,
     ) -> Result<CallToolResult, McpError> {
+        let request_started = std::time::Instant::now();
         if let Err(e) = self.policy.check_tool("execute-command") {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if input.0.detach {
+            if let Err(e) = self.policy.check_raw_mode() {
+                return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+            }
         }
         let socket = tmux::resolve_socket(input.0.socket.as_deref());
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
@@ -3369,7 +3496,7 @@ impl TmuxMcpServer {
             .execute_command(
                 &input.0.pane_id,
                 &input.0.command,
-                false,
+                input.0.detach,
                 false,
                 input.0.delay_ms,
                 socket.clone(),
@@ -3377,14 +3504,26 @@ impl TmuxMcpServer {
             .await
         {
             Ok(command_id) => {
-                let result = if let Some(wait_ms) = input.0.wait_ms.filter(|ms| *ms > 0) {
+                let result = if let Some(wait_ms) = input
+                    .0
+                    .wait_ms
+                    .filter(|ms| *ms > 0 && !input.0.detach)
+                    .map(|ms| {
+                        ms.min(110_000)
+                            .saturating_sub(crate::timing::millis(request_started))
+                    }) {
                     self.tracker
                         .wait_for(&command_id, wait_ms)
                         .await
                         .ok()
                         .flatten()
                         .map(|(cmd, timed_out)| {
-                            CommandSnapshot::from_execution(&cmd, timed_out.then_some(true))
+                            let mut snapshot =
+                                CommandSnapshot::from_execution(&cmd, timed_out.then_some(true));
+                            if !input.0.verbose {
+                                snapshot.command.clear();
+                            }
+                            snapshot
                         })
                 } else {
                     None
@@ -3399,6 +3538,9 @@ impl TmuxMcpServer {
                         .unwrap_or_else(|| "running".into())
                 };
                 let message = match &result {
+                    _ if input.0.detach => "Tracking disabled; this pane remains occupied. Inspect with capture-pane; completion cannot be confirmed automatically. Do not poll for a final result or reuse the pane for another command.",
+                    Some(result) if result.status == CommandStatus::TrackingError => "Execution is uncertain. Stop modifications and report to the user; do not retry, clear input, interrupt, or switch windows to repeat the command.",
+                    Some(result) if result.result_ready && result.output_truncated => "Result ready; output is incomplete. Read an existing application log if available. Arrange logging before future long tasks; do not rerun this command to recover output.",
                     Some(result) if result.result_ready => "Command result is ready in result",
                     Some(_) => "Wait timed out; continue with get-command-result and waitMs",
                     None => "Command accepted; use get-command-result with waitMs",
@@ -3412,15 +3554,23 @@ impl TmuxMcpServer {
                 };
                 Ok(structured_output(&response))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error executing command: {e}"
-            ))])),
+            Err(e) => {
+                if let Some(uncertain) = self.tracker.uncertain_command().await {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Command {} in pane {} may have been partially or fully delivered: {e}. Stop and report to the user; do not retry, clear input, or switch windows to repeat it.",
+                        uncertain.id, uncertain.pane_id
+                    ))]));
+                }
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error executing command: {e}"
+                ))]))
+            }
         }
     }
 
     #[tool(
         name = "get-command-result",
-        description = "Get status/output of a tracked command by ID (CommandSnapshot JSON). Without waitMs this is an in-memory snapshot; use waitMs to block until resultReady or timeout without inventing poll loops. Use capture-pane explicitly when fresh partial scrollback is needed. outputTruncated means the final bounded tmux history capture was incomplete; capture-pane cannot recover history already lost.",
+        description = "Get status/output by command ID. Without waitMs, reconcile completion and return a snapshot; use waitMs to wait for resultReady. capture-pane reads fresh partial scrollback. outputTruncated means capture is unavailable/incomplete; lost history cannot be recovered. Read an existing application log if available; never rerun the command to recreate output. Arrange logging before future long/verbose tasks; MCP does not archive full output.",
         annotations(read_only_hint = true, idempotent_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<GetCommandResultOutput>()
     )]
@@ -3428,6 +3578,7 @@ impl TmuxMcpServer {
         &self,
         input: Parameters<GetCommandResultInput>,
     ) -> Result<CallToolResult, McpError> {
+        let request_started = std::time::Instant::now();
         if let Err(e) = self.policy.check_tool("get-command-result") {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
@@ -3479,8 +3630,11 @@ impl TmuxMcpServer {
             ))]));
         }
 
-        let wait_ms = input.0.wait_ms.unwrap_or(0);
-        let (cmd, wait_timed_out) = if wait_ms > 0 {
+        let requested_wait = input.0.wait_ms.unwrap_or(0);
+        let wait_ms = requested_wait
+            .min(110_000)
+            .saturating_sub(crate::timing::millis(request_started));
+        let (cmd, wait_timed_out) = if requested_wait > 0 {
             match self.tracker.wait_for(&input.0.command_id, wait_ms).await {
                 Ok(Some((cmd, timed_out))) => (cmd, timed_out.then_some(true)),
                 Ok(None) => {
@@ -3507,15 +3661,24 @@ impl TmuxMcpServer {
             }
         };
 
-        let result = CommandSnapshot::from_execution(&cmd, wait_timed_out);
-        if matches!(
+        let mut result = CommandSnapshot::from_execution(&cmd, wait_timed_out);
+        if !input.0.verbose {
+            result.command.clear();
+        }
+        let mut response = if matches!(
             cmd.status,
             CommandStatus::Failed | CommandStatus::TrackingError
         ) {
-            Ok(structured_error_output(&result))
+            structured_error_output(&result)
         } else {
-            Ok(structured_output(&result))
+            structured_output(&result)
+        };
+        if result.status == CommandStatus::TrackingError {
+            response.content.push(Content::text("Execution is uncertain. Stop modifications and report to the user; do not retry, clear input, interrupt, or switch windows to repeat the command."));
+        } else if result.result_ready && result.output_truncated {
+            response.content.push(Content::text("Output is incomplete. Read an existing application log if available. Arrange logging before future long tasks; do not rerun this command to recover output."));
         }
+        Ok(response)
     }
 
     #[tool(
@@ -4310,9 +4473,7 @@ impl TmuxMcpServer {
                         )
                         .await
                         {
-                            return Ok(CallToolResult::error(vec![Content::text(format!(
-                                "Error sending keys: {e}"
-                            ))]));
+                            return Ok(self.input_failure(&input.0.pane_id, &e).await);
                         }
                         tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
@@ -4321,9 +4482,7 @@ impl TmuxMcpServer {
                         tmux::send_keys(&input.0.pane_id, &input.0.keys, false, socket.as_deref())
                             .await
                     {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Error sending keys: {e}"
-                        ))]));
+                        return Ok(self.input_failure(&input.0.pane_id, &e).await);
                     }
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
@@ -4336,24 +4495,18 @@ impl TmuxMcpServer {
                 )
                 .await
                 {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error sending keys: {e}"
-                    ))]));
+                    return Ok(self.input_failure(&input.0.pane_id, &e).await);
                 }
             } else if let Err(e) =
                 tmux::send_keys(&input.0.pane_id, &input.0.keys, literal, socket.as_deref()).await
             {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error sending keys: {e}"
-                ))]));
+                return Ok(self.input_failure(&input.0.pane_id, &e).await);
             }
             if enter && !combine_enter {
                 if let Err(e) =
                     tmux::send_keys(&input.0.pane_id, "Enter", false, socket.as_deref()).await
                 {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Error sending Enter: {e}"
-                    ))]));
+                    return Ok(self.input_failure(&input.0.pane_id, &e).await);
                 }
             }
         }
@@ -4423,9 +4576,7 @@ impl TmuxMcpServer {
                 "Hex bytes sent to pane {}",
                 input.0.pane_id
             ))])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error sending hex: {e}"
-            ))])),
+            Err(e) => Ok(self.input_failure(&input.0.pane_id, &e).await),
         }
     }
 
@@ -4473,9 +4624,7 @@ impl TmuxMcpServer {
                 "Pasted text into pane {}",
                 input.0.pane_id
             ))])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error pasting text: {e}"
-            ))])),
+            Err(e) => Ok(self.input_failure(&input.0.pane_id, &e).await),
         }
     }
 }
@@ -4741,9 +4890,7 @@ impl TmuxMcpServer {
                 "{key} sent to pane {}",
                 input.pane_id
             ))])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error sending {key}: {e}"
-            ))])),
+            Err(e) => Ok(self.input_failure(&input.pane_id, &e).await),
         }
     }
 }
@@ -4752,14 +4899,14 @@ impl TmuxMcpServer {
 // ServerHandler Implementation
 // ============================================================================
 
-#[rmcp::tool_handler(router = self.router)]
-impl rmcp::ServerHandler for TmuxMcpServer {
-    async fn call_tool(
+impl TmuxMcpServer {
+    async fn call_tool_inner(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
-        if let Some(result) = self.safety_preflight().await {
+        let call_started = std::time::Instant::now();
+        if let Some(result) = self.safety_preflight(&request.name).await {
             return Ok(result);
         }
         let mut action: Option<ActionRecord> = None;
@@ -4821,10 +4968,41 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         }
 
         let tool_name = request.name.to_string();
+        let requested_wait_ms = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("waitMs"))
+            .and_then(serde_json::Value::as_u64);
         let tool_call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.router.call(tool_call).await;
+        let before_dispatch_ms = crate::timing::millis(call_started);
+        let (result, mut timing) = crate::timing::measure(self.router.call(tool_call)).await;
+        timing.before_dispatch_ms = before_dispatch_ms;
+        timing.requested_wait_ms = requested_wait_ms;
+        timing.outcome = if result
+            .as_ref()
+            .is_ok_and(|result| result.is_error != Some(true))
+        {
+            "ok"
+        } else {
+            "error"
+        }
+        .into();
+        timing.wait_timed_out = result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.structured_content.as_ref())
+            .and_then(|value| {
+                value.get("waitTimedOut").or_else(|| {
+                    value
+                        .get("result")
+                        .and_then(|result| result.get("waitTimedOut"))
+                })
+            })
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         if let (Some(control), Some(mut record)) = (&self.control, action) {
+            record.timing = Some(timing);
             if let Ok(tool_result) = &result {
                 if tool_name == "execute-command" && tool_result.is_error != Some(true) {
                     if let Some(command_id) = tool_result
@@ -4862,373 +5040,22 @@ impl rmcp::ServerHandler for TmuxMcpServer {
 
         result
     }
-
-    fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder()
-            .enable_tools()
-            .enable_resources()
-            .enable_resources_subscribe()
-            .enable_resources_list_changed()
-            .build();
-        if self.claude_channel {
-            capabilities.experimental = Some(BTreeMap::from([(
-                "claude/channel".to_string(),
-                Default::default(),
-            )]));
-        }
-        ServerInfo::new(capabilities).with_instructions(
-            "Tmux MCP server for sessions, panes, tracked commands, and optional conversation-scoped GPU alerts. GPU alerts are status only; do not modify workloads without user instruction.",
+}
+fn target_uri(uri: &str) -> Result<(String, String), McpError> {
+    let rest = uri.strip_prefix("tmux://").ok_or_else(|| {
+        McpError::invalid_params(
+            format!("target-qualified resource URI required: {uri}"),
+            None,
         )
-    }
+    })?;
+    let (target, suffix) = rest
+        .split_once('/')
+        .ok_or_else(|| McpError::invalid_params(format!("invalid resource URI: {uri}"), None))?;
+    Ok((target.to_owned(), format!("tmux://{suffix}")))
+}
 
-    async fn list_resources(
-        &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
-        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
-        self.capture_peer(&context).await;
-        let mut resources: Vec<Resource> = Vec::new();
-
-        let socket = tmux::resolve_socket(None);
-        if self.policy.check_socket(socket.as_deref()).is_ok() {
-            resources.push(Annotated::new(
-                RawResource {
-                    uri: "tmux://server/info".into(),
-                    name: "Tmux Server Info".into(),
-                    title: None,
-                    description: Some(
-                        "Default socket and SSH context for routing tool calls without env vars."
-                            .into(),
-                    ),
-                    mime_type: Some("application/json".into()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                None,
-            ));
-        }
-
-        if let Err(_e) = self.policy.check_socket(socket.as_deref()) {
-            return Ok(rmcp::model::ListResourcesResult {
-                resources,
-                next_cursor: None,
-                meta: None,
-            });
-        }
-
-        let can_discover_topology = self
-            .check_resource_capability(ResourceCapability::SessionTree)
-            .is_ok();
-        let can_publish_panes = can_discover_topology
-            && self
-                .check_resource_capability(ResourceCapability::Pane)
-                .is_ok();
-        let can_publish_windows = can_discover_topology;
-        let can_publish_session_trees = can_discover_topology;
-
-        if can_publish_panes || can_publish_windows || can_publish_session_trees {
-            let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
-                McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
-            })?;
-            for session in sessions {
-                if self
-                    .policy
-                    .check_session_identity(&session.id, Some(&session.name))
-                    .is_err()
-                {
-                    continue;
-                }
-                let mut session_has_visible_window = false;
-                let windows = tmux::list_windows(&session.id, socket.as_deref())
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(
-                            format!("Error listing tmux windows for session {}: {e}", session.id),
-                            None,
-                        )
-                    })?;
-                for window in windows {
-                    let inspect_panes = can_discover_topology || self.policy.has_pane_allowlist();
-                    let (window_has_allowed_panes, all_window_panes_allowed) = if inspect_panes {
-                        let panes = tmux::list_panes(&window.id, socket.as_deref())
-                            .await
-                            .map_err(|e| {
-                                McpError::internal_error(
-                                    format!(
-                                        "Error listing tmux panes for window {}: {e}",
-                                        window.id
-                                    ),
-                                    None,
-                                )
-                            })?;
-                        let all_allowed = panes
-                            .iter()
-                            .all(|pane| self.policy.check_pane(&pane.id).is_ok());
-                        let mut any_allowed = false;
-                        for pane in panes {
-                            if self.policy.check_pane(&pane.id).is_err() {
-                                continue;
-                            }
-                            any_allowed = true;
-                            if can_publish_panes {
-                                resources.push(Annotated::new(
-                                    RawResource {
-                                        uri: format!("tmux://pane/{}", pane.id),
-                                        name: format!(
-                                            "Pane: {} - {} - {}",
-                                            session.name, pane.id, pane.title
-                                        ),
-                                        title: None,
-                                        description: Some(format!(
-                                            "Pane output for state checks or log monitoring in session {} (pane {}).",
-                                            session.name, pane.id
-                                        )),
-                                        mime_type: Some("text/plain".into()),
-                                        size: None,
-                                        icons: None,
-                                        meta: None,
-                                    },
-                                    None,
-                                ));
-                                resources.push(Annotated::new(
-                                    RawResource {
-                                        uri: format!("tmux://pane/{}/info", pane.id),
-                                        name: format!(
-                                            "Pane Info: {} - {} - {}",
-                                            session.name, pane.id, pane.title
-                                        ),
-                                        title: None,
-                                        description: Some(format!(
-                                            "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
-                                            session.name, pane.id
-                                        )),
-                                        mime_type: Some("application/json".into()),
-                                        size: None,
-                                        icons: None,
-                                        meta: None,
-                                    },
-                                    None,
-                                ));
-                            }
-                        }
-                        (any_allowed, all_allowed)
-                    } else {
-                        // A tmux window always owns at least one pane. Without a pane
-                        // allowlist, no pane IDs need to be discovered to publish its
-                        // independently authorized window-info resource.
-                        (true, true)
-                    };
-
-                    if window_has_allowed_panes && all_window_panes_allowed {
-                        session_has_visible_window = true;
-                    }
-
-                    if can_publish_windows && window_has_allowed_panes && all_window_panes_allowed {
-                        resources.push(Annotated::new(
-                            RawResource {
-                                uri: format!("tmux://window/{}/info", window.id),
-                                name: format!("Window Info: {} - {}", session.name, window.name),
-                                title: None,
-                                description: Some(format!(
-                                    "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
-                                    session.name, window.name
-                                )),
-                                mime_type: Some("application/json".into()),
-                                size: None,
-                                icons: None,
-                                meta: None,
-                            },
-                            None,
-                        ));
-                    }
-                }
-                if can_publish_session_trees && session_has_visible_window {
-                    resources.push(Annotated::new(
-                        RawResource {
-                            uri: format!("tmux://session/{}/tree", session.id),
-                            name: format!("Session Tree: {}", session.name),
-                            title: None,
-                            description: Some(format!(
-                                "Session snapshot to plan multi-pane workflows and choose targets in {}.",
-                                session.name
-                            )),
-                            mime_type: Some("application/json".into()),
-                            size: None,
-                            icons: None,
-                            meta: None,
-                        },
-                        None,
-                    ));
-                }
-            }
-        }
-
-        if self
-            .check_resource_capability(ResourceCapability::Clients)
-            .is_ok()
-        {
-            resources.push(Annotated::new(
-                RawResource {
-                    uri: "tmux://clients".into(),
-                    name: "Tmux Clients".into(),
-                    title: None,
-                    description: Some(
-                        "Clients list to detect observers before detaching or resizing.".into(),
-                    ),
-                    mime_type: Some("application/json".into()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                None,
-            ));
-        }
-
-        if self
-            .check_resource_capability(ResourceCapability::CommandResult)
-            .is_ok()
-        {
-            for id in self.tracker.get_active_ids().await {
-                let Some(cmd) = self.tracker.get_command(&id).await else {
-                    continue;
-                };
-                if self.policy.check_socket(cmd.socket.as_deref()).is_err() {
-                    continue;
-                }
-                if self.policy.check_pane(&cmd.pane_id).is_err() {
-                    continue;
-                }
-                if self
-                    .enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                let truncated_cmd = truncate_command_label(&cmd.command);
-                resources.push(Annotated::new(
-                    RawResource {
-                        uri: command_resource_uri(&id),
-                        name: format!("Command: {truncated_cmd}"),
-                        title: None,
-                        description: Some(format!(
-                            "Tracked command status: {}. Subscribe for updates; read for snapshot.",
-                            cmd.status.as_str()
-                        )),
-                        mime_type: Some("application/json".into()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    },
-                    None,
-                ));
-            }
-        }
-
-        Ok(rmcp::model::ListResourcesResult {
-            resources,
-            next_cursor: None,
-            meta: None,
-        })
-    }
-
-    async fn list_resource_templates(
-        &self,
-        _request: Option<rmcp::model::PaginatedRequestParams>,
-        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
-        self.capture_peer(&context).await;
-        Ok(rmcp::model::ListResourceTemplatesResult {
-            resource_templates: self.policy_filtered_resource_templates(),
-            next_cursor: None,
-            meta: None,
-        })
-    }
-
-    async fn subscribe(
-        &self,
-        request: rmcp::model::SubscribeRequestParams,
-        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<(), McpError> {
-        self.capture_peer(&context).await;
-        let uri = request.uri;
-        if let Err(e) = self.check_resource_capability(ResourceCapability::CommandResult) {
-            return Err(McpError::invalid_params(
-                format!("Access denied: {e}"),
-                None,
-            ));
-        }
-        let Some(command_id) = uri
-            .strip_prefix("tmux://command/")
-            .and_then(|rest| rest.strip_suffix("/result"))
-        else {
-            return Err(McpError::invalid_params(
-                format!("unsupported resource URI for subscribe: {uri}"),
-                None,
-            ));
-        };
-        if !self.tracker.has_command(command_id).await {
-            return Err(McpError::invalid_params(
-                format!("unknown command resource: {uri}"),
-                None,
-            ));
-        }
-        let Some(cmd) = self.tracker.get_command(command_id).await else {
-            return Err(McpError::invalid_params(
-                format!("unknown command resource: {uri}"),
-                None,
-            ));
-        };
-        if let Err(e) = self.policy.check_socket(cmd.socket.as_deref()) {
-            return Err(McpError::invalid_params(
-                format!("Access denied: {e}"),
-                None,
-            ));
-        }
-        if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
-            return Err(McpError::invalid_params(
-                format!("Access denied: {e}"),
-                None,
-            ));
-        }
-        if let Err(e) = self
-            .enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
-            .await
-        {
-            return Err(McpError::invalid_params(
-                format!("Access denied: {e}"),
-                None,
-            ));
-        }
-        {
-            let mut subs = self.subscriptions.write().await;
-            subs.insert(uri.clone());
-        }
-        // Already-ready terminal commands will not emit another Terminal event; chime once.
-        if cmd.status.is_terminal() && cmd.result_ready {
-            let peer = self.peer.read().await;
-            if let Some(peer) = peer.as_ref() {
-                let _ = peer
-                    .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn unsubscribe(
-        &self,
-        request: rmcp::model::UnsubscribeRequestParams,
-        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<(), McpError> {
-        self.capture_peer(&context).await;
-        let mut subs = self.subscriptions.write().await;
-        subs.remove(&request.uri);
-        Ok(())
-    }
-
-    async fn read_resource(
+impl TmuxMcpServer {
+    async fn read_resource_inner(
         &self,
         request: rmcp::model::ReadResourceRequestParams,
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
@@ -5614,6 +5441,512 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         }
     }
 }
+impl TmuxMcpServer {
+    async fn subscribe_inner(
+        &self,
+        request: rmcp::model::SubscribeRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.capture_peer(&context).await;
+        let uri = request.uri;
+        let public_uri = crate::targets::uri(&uri);
+        if let Err(e) = self.check_resource_capability(ResourceCapability::CommandResult) {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
+        let Some(command_id) = uri
+            .strip_prefix("tmux://command/")
+            .and_then(|rest| rest.strip_suffix("/result"))
+        else {
+            return Err(McpError::invalid_params(
+                format!("unsupported resource URI for subscribe: {uri}"),
+                None,
+            ));
+        };
+        if !self.tracker.has_command(command_id).await {
+            return Err(McpError::invalid_params(
+                format!("unknown command resource: {uri}"),
+                None,
+            ));
+        }
+        let Some(cmd) = self.tracker.get_command(command_id).await else {
+            return Err(McpError::invalid_params(
+                format!("unknown command resource: {uri}"),
+                None,
+            ));
+        };
+        if let Err(e) = self.policy.check_socket(cmd.socket.as_deref()) {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
+        if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref())
+            .await
+        {
+            return Err(McpError::invalid_params(
+                format!("Access denied: {e}"),
+                None,
+            ));
+        }
+        {
+            let mut subs = self.subscriptions.write().await;
+            subs.insert(public_uri.clone());
+        }
+        // Already-ready terminal commands will not emit another Terminal event; chime once.
+        if cmd.status.is_terminal() && cmd.result_ready {
+            let peer = self.peer.read().await;
+            if let Some(peer) = peer.as_ref() {
+                let _ = peer
+                    .notify_resource_updated(ResourceUpdatedNotificationParam::new(public_uri))
+                    .await;
+            }
+        }
+        Ok(())
+    }
+}
+impl rmcp::ServerHandler for TmuxMcpServer {
+    fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        let mut tools = self.router.list_all();
+        for tool in &mut tools {
+            if tool.name != "list-targets" {
+                let schema = Arc::make_mut(&mut tool.input_schema);
+                schema
+                    .entry("properties")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(properties) =
+                    schema.get_mut("properties").and_then(|v| v.as_object_mut())
+                {
+                    let targets = crate::targets::load_configured()
+                        .map(|cfg| cfg.targets.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    properties.insert("target".into(), serde_json::json!({"type":"string","enum":targets,"description":"SSH target alias from list-targets"}));
+                }
+                schema
+                    .entry("required")
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .expect("required is an array")
+                    .push(serde_json::json!("target"));
+            }
+        }
+        std::future::ready(Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        }))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        let mut tool = self.router.get(name)?.clone();
+        if name != "list-targets" {
+            let schema = Arc::make_mut(&mut tool.input_schema);
+            schema
+                .entry("properties")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(properties) = schema.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                let targets = crate::targets::load_configured()
+                    .map(|cfg| cfg.targets.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                properties.insert("target".into(), serde_json::json!({"type":"string","enum":targets,"description":"SSH target alias from list-targets"}));
+            }
+            schema
+                .entry("required")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .expect("required is an array")
+                .push(serde_json::json!("target"));
+        }
+        Some(tool)
+    }
+
+    async fn read_resource(
+        &self,
+        mut request: rmcp::model::ReadResourceRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResult, McpError> {
+        let (target, raw) = target_uri(&request.uri)?;
+        request.uri = raw;
+        let targets = crate::targets::load_configured()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        if !targets.targets.contains_key(&target) {
+            return Err(McpError::invalid_params(
+                format!("unknown target: {target}"),
+                None,
+            ));
+        }
+        crate::targets::scope(target, self.read_resource_inner(request, context)).await
+    }
+
+    async fn subscribe(
+        &self,
+        mut request: rmcp::model::SubscribeRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<(), McpError> {
+        let (target, raw) = target_uri(&request.uri)?;
+        request.uri = raw;
+        let targets = crate::targets::load_configured()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        if !targets.targets.contains_key(&target) {
+            return Err(McpError::invalid_params(
+                format!("unknown target: {target}"),
+                None,
+            ));
+        }
+        crate::targets::scope(target, self.subscribe_inner(request, context)).await
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let name = request.name.as_ref();
+        if name == "list-targets" {
+            return self.call_tool_inner(request, context).await;
+        }
+        let target = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("target"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|target| !target.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                if cfg!(test) {
+                    std::env::var("TMUX_MCP_SSH").ok()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                let available = crate::targets::load_configured()
+                    .map(|cfg| cfg.targets.keys().cloned().collect::<Vec<_>>().join(", "))
+                    .unwrap_or_else(|_| "unavailable".into());
+                McpError::invalid_params(
+                    format!("target is required; call list-targets first. Available targets: {available}"),
+                    None,
+                )
+            })?;
+        let targets = crate::targets::load_configured()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        if !targets.targets.contains_key(&target) && !cfg!(test) {
+            return Err(McpError::invalid_params(
+                format!("unknown target: {target}"),
+                None,
+            ));
+        }
+        crate::targets::scope(target, self.call_tool_inner(request, context)).await
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_resources_list_changed()
+            .build();
+        if self.claude_channel {
+            capabilities.experimental = Some(BTreeMap::from([(
+                "claude/channel".to_string(),
+                Default::default(),
+            )]));
+        }
+        ServerInfo::new(capabilities).with_instructions(
+            "Call list-targets first; include target in each target operation. Reuse one known-ready task-owned pane for sequential work; do not type into unfamiliar panes or partial input. Create a window/pane only when a task needs its own terminal; never to bypass busy/error/timeout. On uncertain delivery/completion, stop modifications and report to the user; do not clear input, interrupt, or retry in another window. No automatic session creation. Resource URIs are target-qualified. GPU alerts are status only.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        self.capture_peer(&context).await;
+        let mut resources: Vec<Resource> = Vec::new();
+
+        let socket = tmux::resolve_socket(None);
+        if self.policy.check_socket(socket.as_deref()).is_ok() {
+            resources.push(Annotated::new(
+                RawResource {
+                    uri: "tmux://server/info".into(),
+                    name: "Tmux Server Info".into(),
+                    title: None,
+                    description: Some(
+                        "Default socket and SSH context for routing tool calls without env vars."
+                            .into(),
+                    ),
+                    mime_type: Some("application/json".into()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                },
+                None,
+            ));
+        }
+
+        if let Err(_e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(rmcp::model::ListResourcesResult {
+                resources,
+                next_cursor: None,
+                meta: None,
+            });
+        }
+
+        let can_discover_topology = self
+            .check_resource_capability(ResourceCapability::SessionTree)
+            .is_ok();
+        let can_publish_panes = can_discover_topology
+            && self
+                .check_resource_capability(ResourceCapability::Pane)
+                .is_ok();
+        let can_publish_windows = can_discover_topology;
+        let can_publish_session_trees = can_discover_topology;
+
+        if can_publish_panes || can_publish_windows || can_publish_session_trees {
+            let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
+                McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
+            })?;
+            for session in sessions {
+                if self
+                    .policy
+                    .check_session_identity(&session.id, Some(&session.name))
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut session_has_visible_window = false;
+                let windows = tmux::list_windows(&session.id, socket.as_deref())
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("Error listing tmux windows for session {}: {e}", session.id),
+                            None,
+                        )
+                    })?;
+                for window in windows {
+                    let inspect_panes = can_discover_topology || self.policy.has_pane_allowlist();
+                    let (window_has_allowed_panes, all_window_panes_allowed) = if inspect_panes {
+                        let panes = tmux::list_panes(&window.id, socket.as_deref())
+                            .await
+                            .map_err(|e| {
+                                McpError::internal_error(
+                                    format!(
+                                        "Error listing tmux panes for window {}: {e}",
+                                        window.id
+                                    ),
+                                    None,
+                                )
+                            })?;
+                        let all_allowed = panes
+                            .iter()
+                            .all(|pane| self.policy.check_pane(&pane.id).is_ok());
+                        let mut any_allowed = false;
+                        for pane in panes {
+                            if self.policy.check_pane(&pane.id).is_err() {
+                                continue;
+                            }
+                            any_allowed = true;
+                            if can_publish_panes {
+                                resources.push(Annotated::new(
+                                    RawResource {
+                                        uri: format!("tmux://pane/{}", pane.id),
+                                        name: format!(
+                                            "Pane: {} - {} - {}",
+                                            session.name, pane.id, pane.title
+                                        ),
+                                        title: None,
+                                        description: Some(format!(
+                                            "Pane output for state checks or log monitoring in session {} (pane {}).",
+                                            session.name, pane.id
+                                        )),
+                                        mime_type: Some("text/plain".into()),
+                                        size: None,
+                                        icons: None,
+                                        meta: None,
+                                    },
+                                    None,
+                                ));
+                                resources.push(Annotated::new(
+                                    RawResource {
+                                        uri: format!("tmux://pane/{}/info", pane.id),
+                                        name: format!(
+                                            "Pane Info: {} - {} - {}",
+                                            session.name, pane.id, pane.title
+                                        ),
+                                        title: None,
+                                        description: Some(format!(
+                                            "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
+                                            session.name, pane.id
+                                        )),
+                                        mime_type: Some("application/json".into()),
+                                        size: None,
+                                        icons: None,
+                                        meta: None,
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
+                        (any_allowed, all_allowed)
+                    } else {
+                        // A tmux window always owns at least one pane. Without a pane
+                        // allowlist, no pane IDs need to be discovered to publish its
+                        // independently authorized window-info resource.
+                        (true, true)
+                    };
+
+                    if window_has_allowed_panes && all_window_panes_allowed {
+                        session_has_visible_window = true;
+                    }
+
+                    if can_publish_windows && window_has_allowed_panes && all_window_panes_allowed {
+                        resources.push(Annotated::new(
+                            RawResource {
+                                uri: format!("tmux://window/{}/info", window.id),
+                                name: format!("Window Info: {} - {}", session.name, window.name),
+                                title: None,
+                                description: Some(format!(
+                                    "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
+                                    session.name, window.name
+                                )),
+                                mime_type: Some("application/json".into()),
+                                size: None,
+                                icons: None,
+                                meta: None,
+                            },
+                            None,
+                        ));
+                    }
+                }
+                if can_publish_session_trees && session_has_visible_window {
+                    resources.push(Annotated::new(
+                        RawResource {
+                            uri: format!("tmux://session/{}/tree", session.id),
+                            name: format!("Session Tree: {}", session.name),
+                            title: None,
+                            description: Some(format!(
+                                "Session snapshot to plan multi-pane workflows and choose targets in {}.",
+                                session.name
+                            )),
+                            mime_type: Some("application/json".into()),
+                            size: None,
+                            icons: None,
+                            meta: None,
+                        },
+                        None,
+                    ));
+                }
+            }
+        }
+
+        if self
+            .check_resource_capability(ResourceCapability::Clients)
+            .is_ok()
+        {
+            resources.push(Annotated::new(
+                RawResource {
+                    uri: "tmux://clients".into(),
+                    name: "Tmux Clients".into(),
+                    title: None,
+                    description: Some(
+                        "Clients list to detect observers before detaching or resizing.".into(),
+                    ),
+                    mime_type: Some("application/json".into()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                },
+                None,
+            ));
+        }
+
+        if self
+            .check_resource_capability(ResourceCapability::CommandResult)
+            .is_ok()
+        {
+            for id in self.tracker.get_active_ids().await {
+                let Some(cmd) = self.tracker.get_command(&id).await else {
+                    continue;
+                };
+                if self.policy.check_socket(cmd.socket.as_deref()).is_err() {
+                    continue;
+                }
+                if self.policy.check_pane(&cmd.pane_id).is_err() {
+                    continue;
+                }
+                let check = self.enforce_session_for_pane(&cmd.pane_id, cmd.socket.as_deref());
+                let check = match &cmd.target {
+                    Some(target) => crate::targets::scope(target.clone(), check).await,
+                    None => check.await,
+                };
+                if check.is_err() {
+                    continue;
+                }
+                let truncated_cmd = truncate_command_label(&cmd.command);
+                resources.push(Annotated::new(
+                    RawResource {
+                        uri: cmd.resource_uri(),
+                        name: format!("Command: {truncated_cmd}"),
+                        title: None,
+                        description: Some(format!(
+                            "Tracked command status: {}. Subscribe for updates; read for snapshot.",
+                            cmd.status.as_str()
+                        )),
+                        mime_type: Some("application/json".into()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                ));
+            }
+        }
+
+        Ok(rmcp::model::ListResourcesResult {
+            resources,
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
+        self.capture_peer(&context).await;
+        Ok(rmcp::model::ListResourceTemplatesResult {
+            resource_templates: self.policy_filtered_resource_templates(),
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: rmcp::model::UnsubscribeRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<(), McpError> {
+        self.capture_peer(&context).await;
+        let mut subs = self.subscriptions.write().await;
+        subs.remove(&request.uri);
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -5670,6 +6003,75 @@ mod tests {
             CommandTracker::new(ShellType::Bash),
             SecurityPolicy::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_tools_are_read_only_and_target_is_required() {
+        let server = server_default();
+        for name in ["file-stat", "gpu-snapshot", "create-window"] {
+            let tool = server.get_tool(name).expect("exposed tool");
+            assert!(tool.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("target")));
+        }
+        assert!(server.tool_is_read_only("file-stat"));
+        assert!(server.tool_is_read_only("gpu-snapshot"));
+        let denied = server_with_policy(
+            "[security.tools]\nmode='deny'\nitems=['file-stat','gpu-snapshot']\n",
+        );
+        assert!(denied.get_tool("file-stat").is_none());
+        assert!(denied.get_tool("gpu-snapshot").is_none());
+        let snapshot = denied.gpu_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.is_error,
+            Some(true),
+            "policy denial precedes subprocess dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_timing_persists_to_existing_hub_without_remote_calls() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::new(dir.path());
+        let (url, hub, task) = start_control_hub(paths.clone()).await;
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(ControlClient::new(&url, "local-test", paths.clone()).unwrap()),
+        );
+        let (context, _transport, _running) = context_for_server(&server);
+        // This pure tool hashes a path and never spawns tmux/SSH. Inner routing avoids
+        // depending on the developer's target configuration.
+        let request = rmcp::model::CallToolRequestParams::new("socket-for-path").with_arguments(
+            serde_json::json!({"path":"/test"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let result = crate::targets::scope(
+            "test-intern".into(),
+            server.call_tool_inner(request, context),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let records = hub.full_log().await;
+        let timing = records[0].timing.as_ref().unwrap();
+        assert_eq!(timing.target.as_deref(), Some("test-intern"));
+        assert_eq!(timing.outcome, "ok");
+        assert!(timing.transports.is_empty());
+        let saved: ActionRecord = serde_json::from_str(
+            std::fs::read_to_string(&paths.events)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(saved.timing.is_some());
+        task.abort();
     }
 
     #[tokio::test]
@@ -6046,7 +6448,7 @@ mod tests {
                 .await
                 .expect("bind hub");
         let address = listener.local_addr().expect("hub address");
-        let task = tokio::spawn(async move { axum::serve(listener, app).await });
+        let task = crate::targets::spawn(async move { axum::serve(listener, app).await });
         (format!("http://{address}"), state, task)
     }
 
@@ -6128,7 +6530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_ai_pause_rejects_even_read_only_tools_before_gate() {
+    async fn persisted_ai_pause_blocks_changes_but_allows_inspection() {
         let dir = tempdir().expect("state dir");
         let paths = StatePaths::new(dir.path());
         set_ai_pause(&paths, "%2").expect("pause AI");
@@ -6140,14 +6542,11 @@ mod tests {
             SearchConfig::default(),
             Some(control),
         );
-        let (context, _client_transport, _running) = context_for_server(&server);
+        assert!(server.safety_preflight("capture-pane").await.is_none());
         let result = server
-            .call_tool(
-                rmcp::model::CallToolRequestParams::new("socket-for-path"),
-                context,
-            )
+            .safety_preflight("create-window")
             .await
-            .expect("tool result");
+            .expect("blocked change");
 
         assert_eq!(result.is_error, Some(true));
         assert!(first_text(&result).contains("AI 操作已暂停"));
@@ -6172,7 +6571,7 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap();
-        let call = tokio::spawn({
+        let call = crate::targets::spawn({
             let server = server.clone();
             async move {
                 server
@@ -6261,7 +6660,7 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap();
-        let call = tokio::spawn({
+        let call = crate::targets::spawn({
             let server = server.clone();
             async move {
                 server
@@ -6315,6 +6714,7 @@ mod tests {
         let now = Instant::now();
         tracker
             .insert_test_execution(CommandExecution {
+                target: None,
                 id: "cmd-lagged".into(),
                 pane_id: "%lagged".into(),
                 socket: None,
@@ -6764,6 +7164,7 @@ mod tests {
     async fn capture_pane_denied_by_policy() {
         let server = server_with_policy("[security]\nallowed_panes = []\n");
         let input = Parameters(CapturePaneInput {
+            raw: false,
             pane_id: "%1".into(),
             lines: None,
             colors: None,
@@ -6796,12 +7197,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detach_defaults_false_and_respects_raw_policy() {
+        let mut input: ExecuteCommandInput = serde_json::from_value(serde_json::json!({
+            "paneId": "%1", "command": "test"
+        }))
+        .unwrap();
+        assert!(!input.detach);
+        input.detach = true;
+        let server = server_with_policy("[security]\nallow_raw_mode = false\n");
+        let result = server.execute_command(Parameters(input)).await.unwrap();
+        assert!(first_text(&result).contains("raw mode is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_pane_stays_blocked_after_read_only_inspection() {
+        let server = server_default();
+        server
+            .tracker
+            .insert_test_occupant(CommandExecution {
+                target: None,
+                id: "uncertain-1".into(),
+                pane_id: "%1".into(),
+                socket: None,
+                command: "training".into(),
+                status: CommandStatus::TrackingError,
+                exit_code: None,
+                output: None,
+                output_truncated: true,
+                result_ready: true,
+                reason: Some("connection lost".into()),
+                started_at: Instant::now(),
+                completed_at: Some(Instant::now()),
+                raw_mode: false,
+                tracking_disabled: false,
+            })
+            .await;
+        for tool in [
+            "execute-command",
+            "create-window",
+            "send-keys",
+            "press-special-key",
+        ] {
+            let result = server.safety_preflight(tool).await.expect("blocked");
+            assert!(first_text(&result).contains("report"));
+            assert!(first_text(&result).contains("uncertain-1"));
+        }
+        for tool in ["capture-pane", "get-command-result", "get-tmux-state"] {
+            assert!(server.safety_preflight(tool).await.is_none());
+        }
+        assert!(server.safety_preflight("create-window").await.is_some());
+        assert_eq!(
+            server.tracker.pane_command_id("%1", None).await.as_deref(),
+            Some("uncertain-1")
+        );
+        // Even a matching command id or a cancel key cannot bypass uncertainty.
+        assert!(server
+            .validate_command_input("%1", None, Some("uncertain-1"), true)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn input_delivery_failure_pauses_changes_without_blocking_inspection() {
+        let server = server_default();
+        let error = crate::errors::Error::InvalidArgument {
+            message: "test partial send".into(),
+        };
+        let response = server.input_failure("%7", &error).await;
+        assert!(first_text(&response).contains("report to the user"));
+        assert!(server.safety_preflight("create-window").await.is_some());
+        assert!(server.safety_preflight("capture-pane").await.is_none());
+    }
+
+    #[tokio::test]
     async fn tracked_pane_input_requires_matching_command_id_except_cancel() {
         let server = server_default();
         let now = Instant::now();
         server
             .tracker
             .insert_test_occupant(CommandExecution {
+                target: None,
                 id: "command-1".into(),
                 pane_id: "%1".into(),
                 socket: None,
@@ -6943,6 +7418,7 @@ mod tests {
     async fn get_command_result_missing() {
         let server = server_default();
         let input = Parameters(GetCommandResultInput {
+            verbose: false,
             command_id: "missing-command".into(),
             socket: None,
             wait_ms: None,
@@ -7386,6 +7862,7 @@ mod tests {
 
         let result = server
             .capture_pane(Parameters(CapturePaneInput {
+                raw: false,
                 pane_id: "%1".into(),
                 lines: None,
                 colors: None,
@@ -7411,6 +7888,7 @@ mod tests {
 
         let result = server
             .capture_pane(Parameters(CapturePaneInput {
+                raw: false,
                 pane_id: "%1".into(),
                 lines: None,
                 colors: None,
@@ -7481,6 +7959,7 @@ mod tests {
         let server = server_with_policy("[security]\nallow_capture = false\n");
         let result = server
             .capture_pane(Parameters(CapturePaneInput {
+                raw: false,
                 pane_id: "%1".into(),
                 lines: None,
                 colors: None,
@@ -7502,6 +7981,7 @@ mod tests {
 
         let result = server
             .capture_pane(Parameters(CapturePaneInput {
+                raw: false,
                 pane_id: "%1".into(),
                 lines: None,
                 colors: None,
@@ -7525,6 +8005,7 @@ mod tests {
 
         let result = server
             .capture_pane(Parameters(CapturePaneInput {
+                raw: false,
                 pane_id: "%1".into(),
                 lines: None,
                 colors: None,
@@ -7835,6 +8316,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -7849,6 +8332,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: "cmd".into(),
                 socket: None,
                 wait_ms: None,
@@ -7864,6 +8348,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -7885,6 +8371,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -7907,6 +8395,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -7928,6 +8418,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -7942,6 +8434,7 @@ mod tests {
         let command_id = payload["commandId"].as_str().unwrap();
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: None,
                 wait_ms: Some(5_000),
@@ -7960,6 +8453,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -7975,6 +8470,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: Some("/tmp/override.sock".into()),
                 wait_ms: None,
@@ -7994,6 +8490,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -8009,6 +8507,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: Some("/tmp/other.sock".into()),
                 wait_ms: None,
@@ -8388,6 +8887,8 @@ mod tests {
             server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -8654,6 +9155,8 @@ mod tests {
         let context3 = context.clone();
 
         let execute = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: Some(true),
@@ -8678,6 +9181,8 @@ mod tests {
         assert_eq!(payload["status"], "running");
 
         let execute = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: None,
@@ -8809,6 +9314,7 @@ mod tests {
         let _stub = TmuxStub::new();
         let server = server_default();
         let input = Parameters(CapturePaneInput {
+            raw: false,
             pane_id: "%1".into(),
             lines: Some(50),
             colors: Some(true),
@@ -9193,6 +9699,8 @@ mod tests {
         let _stub = TmuxStub::new();
         let server = server_default();
         let input = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: None,
@@ -9214,6 +9722,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: None,
                 wait_ms: Some(5_000),
@@ -9234,6 +9743,8 @@ mod tests {
         stub.set_var("TMUX_STUB_EXIT_CODE", "7");
         let server = server_default();
         let input = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "false".into(),
             raw_mode: None,
@@ -9252,6 +9763,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: None,
                 wait_ms: Some(5_000),
@@ -9272,6 +9784,8 @@ mod tests {
         let _stub = TmuxStub::new();
         let server = server_default();
         let input = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: Some(true),
@@ -9290,6 +9804,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: None,
                 wait_ms: Some(5_000),
@@ -9309,6 +9824,8 @@ mod tests {
         let (context, _client_transport, _running) = context_for_server(&server);
 
         let execute = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: None,
@@ -9362,6 +9879,8 @@ mod tests {
         let (context, _client_transport, _running) = context_for_server(&server);
 
         let execute = Parameters(ExecuteCommandInput {
+            detach: false,
+            verbose: false,
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: None,
@@ -9469,6 +9988,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id,
                 socket: None,
                 wait_ms: None,
@@ -9497,6 +10017,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id,
                 socket: None,
                 wait_ms: None,
@@ -9519,6 +10040,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
@@ -9539,6 +10062,7 @@ mod tests {
 
         let result = server
             .get_command_result(Parameters(GetCommandResultInput {
+                verbose: false,
                 command_id: command_id.to_string(),
                 socket: None,
                 wait_ms: None,
@@ -9636,6 +10160,8 @@ mod tests {
 
         let result = server
             .execute_command(Parameters(ExecuteCommandInput {
+                detach: false,
+                verbose: false,
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,

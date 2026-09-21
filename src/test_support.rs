@@ -80,6 +80,10 @@ case "$cmd" in
     for arg in "$@"; do
       case "$arg" in
         tmux-mcp-ec-*)
+          if [ "${TMUX_STUB_EXIT_CODE_MISSING:-}" = "1" ]; then
+            echo "buffer not found" 1>&2
+            exit 1
+          fi
           printf '%s' "${TMUX_STUB_EXIT_CODE:-0}"
           exit 0
           ;;

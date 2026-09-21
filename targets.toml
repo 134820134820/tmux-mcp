@@ -1,0 +1,14 @@
+[targets.milab-eight-admin]
+note = "8号机管理员账号"
+
+[targets.milab-eight-intern]
+note = "8号机日常任务账号"
+
+[targets.milab-seven-admin]
+note = "7号机管理员账号，仅在需要 sudo 时使用"
+
+[targets.milab-seven-intern]
+note = "7号机日常训练和普通任务账号"
+
+[targets.milab-ten-admin]
+note = "10号机管理员账号"

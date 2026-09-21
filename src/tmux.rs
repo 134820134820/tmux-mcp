@@ -278,6 +278,9 @@ fn ssh_args_have_connect_timeout(args: &[String]) -> bool {
 
 /// Get SSH arguments for tmux commands.
 fn get_ssh_args() -> Result<Option<Vec<String>>> {
+    if let Some(target) = crate::targets::current() {
+        return Ok(Some(vec![target]));
+    }
     match std::env::var("TMUX_MCP_SSH") {
         Ok(value) => Ok(parse_ssh_args(&value)?.map(|args| {
             // OpenSSH uses the first occurrence of an option. Preserve an
@@ -383,6 +386,36 @@ async fn run_tmux_with_socket(
     socket: Option<&str>,
     stdin: Option<&[u8]>,
 ) -> Result<std::process::Output> {
+    let mut timer =
+        crate::timing::TransportTimer::new(args.first().copied().unwrap_or("tmux"), ssh_enabled()?);
+    let result = run_tmux_with_socket_inner(args, socket, stdin, &mut timer).await;
+    match &result {
+        Ok(output) => timer.finish(
+            if output.status.success() {
+                "ok"
+            } else {
+                "error"
+            },
+            output.stdout.len(),
+        ),
+        Err(error) => timer.finish(
+            if error.to_string().contains("timed out") {
+                "timeout"
+            } else {
+                "error"
+            },
+            0,
+        ),
+    }
+    result
+}
+
+async fn run_tmux_with_socket_inner(
+    args: &[&str],
+    socket: Option<&str>,
+    stdin: Option<&[u8]>,
+    timer: &mut crate::timing::TransportTimer,
+) -> Result<std::process::Output> {
     let _permit = tokio::time::timeout(TMUX_COMMAND_TIMEOUT, TMUX_SEMAPHORE.acquire())
         .await
         .map_err(|_| Error::Tmux {
@@ -395,6 +428,7 @@ async fn run_tmux_with_socket(
             message: format!("tmux semaphore closed: {e}"),
         })?;
 
+    timer.dispatched();
     let mut command = build_tmux_command(args, socket, stdin.is_some())?;
     command.kill_on_drop(true);
 
@@ -502,10 +536,10 @@ async fn execute_tmux_with_socket_to_file(
             message: format!("failed to create temp buffer file: {e}"),
         })?;
 
-    let stdout_task = tokio::spawn(async move {
+    let stdout_task = crate::targets::spawn(async move {
         tokio::io::copy(&mut tokio::io::BufReader::new(stdout), &mut file).await
     });
-    let stderr_task = tokio::spawn(async move {
+    let stderr_task = crate::targets::spawn(async move {
         let mut buf = Vec::new();
         let mut reader = tokio::io::BufReader::new(stderr);
         reader.read_to_end(&mut buf).await?;
@@ -657,14 +691,46 @@ where
 }
 
 async fn execute_command_bounded(
-    mut command: Command,
+    command: Command,
     label: &str,
     max_bytes: usize,
     accepted_exit_codes: &[i32],
 ) -> Result<(Vec<u8>, bool)> {
-    let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
-        message: format!("tmux semaphore closed: {e}"),
-    })?;
+    let ssh = command.as_std().get_program() == "ssh";
+    let mut timer = crate::timing::TransportTimer::new(label, ssh);
+    let result =
+        execute_command_bounded_inner(command, label, max_bytes, accepted_exit_codes, &mut timer)
+            .await;
+    match &result {
+        Ok((output, _)) => timer.finish("ok", output.len()),
+        Err(error) => timer.finish(
+            if error.to_string().contains("timed out") {
+                "timeout"
+            } else {
+                "error"
+            },
+            0,
+        ),
+    }
+    result
+}
+
+async fn execute_command_bounded_inner(
+    mut command: Command,
+    label: &str,
+    max_bytes: usize,
+    accepted_exit_codes: &[i32],
+    timer: &mut crate::timing::TransportTimer,
+) -> Result<(Vec<u8>, bool)> {
+    let _permit = tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, TMUX_SEMAPHORE.acquire())
+        .await
+        .map_err(|_| Error::Tmux {
+            message: format!("{label} request queue timed out after 10 seconds"),
+        })?
+        .map_err(|e| Error::Tmux {
+            message: format!("tmux semaphore closed: {e}"),
+        })?;
+    timer.dispatched();
     command
         .kill_on_drop(true)
         .stdout(Stdio::piped())
@@ -678,8 +744,8 @@ async fn execute_command_bounded(
     let stderr = child.stderr.take().ok_or_else(|| Error::Tmux {
         message: format!("failed to capture {label} stderr"),
     })?;
-    let stdout_task = tokio::spawn(read_stream_bounded(stdout, max_bytes));
-    let stderr_task = tokio::spawn(read_stream_bounded(stderr, GIT_ERROR_MAX_BYTES));
+    let stdout_task = crate::targets::spawn(read_stream_bounded(stdout, max_bytes));
+    let stderr_task = crate::targets::spawn(read_stream_bounded(stderr, GIT_ERROR_MAX_BYTES));
 
     let status = match tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, child.wait()).await {
         Ok(result) => result.map_err(|e| Error::Tmux {
@@ -974,6 +1040,144 @@ fn validate_read_path(path: &str) -> Result<()> {
         });
     }
     Ok(())
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetadata {
+    pub kind: String,
+    pub size_bytes: u64,
+    pub modified_unix_seconds: Option<i64>,
+}
+
+fn parse_file_metadata(output: &[u8]) -> Result<FileMetadata> {
+    let malformed = || Error::Tmux {
+        message: "invalid stat response".into(),
+    };
+    let text = std::str::from_utf8(output).map_err(|_| malformed())?;
+    let fields = text.trim().split('\t').collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err(malformed());
+    }
+    let mode = u32::from_str_radix(fields[0], 16).map_err(|_| malformed())?;
+    Ok(FileMetadata {
+        kind: match mode & 0xf000 {
+            0x8000 => "file",
+            0x4000 => "directory",
+            0xa000 => "symlink",
+            _ => "other",
+        }
+        .into(),
+        size_bytes: fields[1].parse().map_err(|_| malformed())?,
+        modified_unix_seconds: Some(fields[2].parse().map_err(|_| malformed())?),
+    })
+}
+
+/// Fixed GNU stat query on Linux targets. Inspect the link itself, never follow it.
+pub async fn file_stat(cwd: &str, path: &str) -> Result<FileMetadata> {
+    validate_read_path(path)?;
+    if ssh_enabled()? {
+        let (output, truncated) = execute_read_only_program(
+            cwd,
+            "/usr/bin/stat",
+            &["--printf=%f\\t%s\\t%Y", "--", path],
+            4096,
+            &[0],
+        )
+        .await?;
+        if truncated {
+            return Err(Error::Tmux {
+                message: "stat response exceeded 4096 bytes".into(),
+            });
+        }
+        return parse_file_metadata(&output);
+    }
+    let resolved = Path::new(cwd).join(path);
+    let metadata = tokio::fs::symlink_metadata(&resolved)
+        .await
+        .map_err(|e| Error::Tmux {
+            message: format!("unable to stat '{}': {e}", resolved.display()),
+        })?;
+    Ok(FileMetadata {
+        kind: if metadata.is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        }
+        .into(),
+        size_bytes: metadata.len(),
+        modified_unix_seconds: metadata.modified().ok().and_then(|time| {
+            match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => i64::try_from(duration.as_secs()).ok(),
+                Err(error) => i64::try_from(error.duration().as_secs())
+                    .ok()
+                    .and_then(|seconds| {
+                        seconds.checked_add(i64::from(error.duration().subsec_nanos() != 0))
+                    })
+                    .map(|seconds| -seconds),
+            }
+        }),
+    })
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuSnapshot {
+    pub available: bool,
+    /// CSV columns include their headers and units; N/A values remain explicit.
+    pub gpus: String,
+    pub compute_processes: String,
+    pub process_query_error: Option<String>,
+    pub truncated: bool,
+}
+
+/// Snapshot only: no loop, GPU configuration, process signals, or arbitrary arguments.
+pub async fn gpu_snapshot() -> Result<GpuSnapshot> {
+    let (gpus, gpu_truncated) = execute_read_only_program(
+        ".",
+        "nvidia-smi",
+        &[
+            "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total",
+            "--format=csv",
+        ],
+        65_536,
+        &[0],
+    )
+    .await?;
+    let available = String::from_utf8_lossy(&gpus)
+        .lines()
+        .skip(1)
+        .any(|line| !line.trim().is_empty());
+    let (processes, truncated, process_query_error) = if available {
+        match execute_read_only_program(
+            ".",
+            "nvidia-smi",
+            &[
+                "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
+                "--format=csv",
+            ],
+            65_536,
+            &[0],
+        )
+        .await
+        {
+            Ok((processes, truncated)) => (processes, truncated, None),
+            Err(error) => (Vec::new(), false, Some(error.to_string())),
+        }
+    } else {
+        (Vec::new(), false, None)
+    };
+    Ok(GpuSnapshot {
+        available,
+        gpus: String::from_utf8_lossy(&gpus).into_owned(),
+        compute_processes: String::from_utf8_lossy(&processes).into_owned(),
+        process_query_error,
+        truncated: gpu_truncated || truncated,
+    })
 }
 
 /// List a local or remote directory without accepting arbitrary shell flags.
@@ -3723,6 +3927,48 @@ pub async fn move_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_file_stat_parses_metadata_and_rejects_malformed_output() {
+        let metadata = parse_file_metadata(b"81a4\t42\t1700000000").unwrap();
+        assert_eq!(metadata.kind, "file");
+        assert_eq!(metadata.size_bytes, 42);
+        assert_eq!(metadata.modified_unix_seconds, Some(1700000000));
+        assert_eq!(parse_file_metadata(b"a1ff\t4\t-1").unwrap().kind, "symlink");
+        assert!(parse_file_metadata(b"81a4\t42\tbad").is_err());
+        assert!(parse_file_metadata(b"81a4\t42\t1\textra").is_err());
+        assert!(validate_read_path("bad\0path").is_err());
+        let command = build_remote_command(
+            "/usr/bin/stat",
+            &["--printf=%f\\t%s\\t%Y", "--", "file;touch nope"],
+        );
+        assert!(command.ends_with("-- 'file;touch nope'"));
+    }
+
+    #[tokio::test]
+    async fn test_bounded_process_records_success_failure_and_truncation() {
+        // Execute only this local test binary's list/help parser, never tmux or SSH.
+        let (result, timing) = crate::timing::measure(async {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.arg("--list");
+            execute_command_bounded(command, "fixture", 3, &[0]).await
+        })
+        .await;
+        let (bytes, truncated) = result.unwrap();
+        assert_eq!(bytes.len(), 3);
+        assert!(truncated);
+        assert_eq!(timing.transports.len(), 1);
+        assert_eq!(timing.transports[0].outcome, "ok");
+        assert_eq!(timing.transports[0].transport, "local");
+        let (result, timing) = crate::timing::measure(async {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.arg("--invalid-fixture-option");
+            execute_command_bounded(command, "fixture", 64, &[0]).await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(timing.transports[0].outcome, "error");
+    }
     use crate::test_support::TmuxStub;
     use rstest::rstest;
     use std::fs;

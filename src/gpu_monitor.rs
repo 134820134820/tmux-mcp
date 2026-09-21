@@ -255,7 +255,7 @@ impl GpuMonitorManager {
         }
 
         let manager = self.clone();
-        tokio::spawn(async move {
+        crate::targets::spawn(async move {
             manager
                 .supervise(monitor_id, token, input, cancel_rx, done_tx)
                 .await;
@@ -451,7 +451,7 @@ impl GpuMonitorManager {
             .stderr
             .take()
             .ok_or_else(|| "GPU watcher stderr unavailable".to_string())?;
-        let stderr_task = tokio::spawn(read_bounded(stderr, MAX_DIAGNOSTIC_BYTES));
+        let stderr_task = crate::targets::spawn(read_bounded(stderr, MAX_DIAGNOSTIC_BYTES));
         self.update(monitor_id, |snapshot| snapshot.local_ssh_pid = local_pid)
             .await;
 
@@ -952,7 +952,7 @@ mod tests {
 
         assert!(manager.stop("wrong-id").await.is_err());
         let finishing = manager.clone();
-        tokio::spawn(async move {
+        crate::targets::spawn(async move {
             cancel_rx.changed().await.unwrap();
             finishing
                 .finish(

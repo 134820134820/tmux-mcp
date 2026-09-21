@@ -7,11 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-22
+
+### Added
+- Per-tool and foreground subprocess timings in the existing Web action log, plus a PowerShell summary script.
+- Read-only `file-stat` and `gpu-snapshot` tools in the default tool group.
+
 ### Changed
+- Uncertain execution stops agent modifications and asks it to report to the user; read-only inspection remains available and does not unlock the pane.
+- `detach` remains opt-in and disables completion tracking only; it cannot bypass occupied panes or raw-mode policy and retains its pane lease.
+- Long tasks should arrange application logging before launch. MCP does not archive full output or rerun commands to reconstruct lost history.
+- Normal command tool responses omit duplicate command text unless `verbose:true`; command resources retain the full snapshot.
+- MCP now routes calls through explicit SSH targets from `targets.toml`; target-qualified command resources keep per-target state separate.
 - `execute-command` with `waitMs` now includes the current `CommandSnapshot` as `result`.
 - `CommandSnapshot` schema version 2 adds `resultReady` to distinguish capture-in-progress from a finished but truncated capture.
 
 ### Fixed
+- Failed/partial input delivery retains the uncertain command and pane protection instead of treating the pane as free.
+- Pane occupancy and command results distinguish target accounts even when tmux IDs match.
+- Caller wait budgets include recovery/capture time; expiry returns cached state without cancelling the remote command.
+- Reject unspaced background operators while preserving shell redirections and `&&`.
+- Recognize remote POSIX absolute buffer paths correctly when the MCP host is Windows.
+- Bash tracked commands interrupted by Ctrl-C now finalize through a temporary prompt callback if SIGINT skips the normal command tail, preserving existing prompt hooks and INT traps. Sending Ctrl-C alone does not release a still-running command.
 - Terminal waits and resource notifications now become ready only after the final bounded pane capture attempt, before the pane accepts another tracked command.
 - Long-running commands no longer become `tracking_error` merely because the background tracking interval elapsed; caller `waitMs` expiry remains non-terminal and non-error.
 - Command status JSON now emits `tracking_error` consistently while continuing to read the legacy `trackingerror` spelling.
