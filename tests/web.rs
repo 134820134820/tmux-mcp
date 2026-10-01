@@ -997,3 +997,29 @@ async fn agent_authorize_returns_immediate_approval_when_gate_is_off() {
         ActionStatus::Approved
     );
 }
+
+#[tokio::test]
+async fn tracking_resume_requires_token_origin_and_explicit_confirmation() {
+    let dir = tempdir().unwrap();
+    let paths = StatePaths::new(dir.path());
+    let app = build_router(
+        HubState::open(paths.clone()).unwrap(),
+        "a".repeat(64),
+        SecurityPolicy::default(),
+        None,
+        test_tracker(),
+    );
+    for (token, origin, expected) in [
+        ("", "http://127.0.0.1:38473", StatusCode::UNAUTHORIZED),
+        ("a", "https://example.com", StatusCode::FORBIDDEN),
+        ("a", "http://127.0.0.1:38473", StatusCode::BAD_REQUEST),
+    ] {
+        let response = app.clone().oneshot(Request::builder()
+            .method(Method::PUT).uri("/api/ai-pause/resume-tracking")
+            .header(header::HOST, "127.0.0.1:38473").header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json").header("x-tmux-mcp-token", token.repeat(64))
+            .body(Body::from(json!({"target":"seven-intern", "commandId":uuid::Uuid::new_v4().to_string(), "confirmed":false}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert!(!paths.directory.join("tracking-pauses").exists());
+}

@@ -57,6 +57,7 @@ pub fn millis(start: Instant) -> u64 {
 pub struct TransportTimer {
     start: Instant,
     dispatched: bool,
+    discarded: bool,
     sample: TransportTiming,
 }
 
@@ -65,6 +66,7 @@ impl TransportTimer {
         Self {
             start: Instant::now(),
             dispatched: false,
+            discarded: false,
             sample: TransportTiming {
                 operation: operation.to_string(),
                 transport: if ssh { "ssh" } else { "local" }.into(),
@@ -85,10 +87,23 @@ impl TransportTimer {
         self.sample.outcome = outcome.into();
         self.sample.stdout_bytes = stdout_bytes;
     }
+
+    /// `ssh-pool` (reused session) or `ssh-pool-new` (session opened for this request).
+    pub fn set_transport(&mut self, transport: &str) {
+        self.sample.transport = transport.into();
+    }
+
+    /// Drop without recording, when the request is handed to another transport.
+    pub fn discard(mut self) {
+        self.discarded = true;
+    }
 }
 
 impl Drop for TransportTimer {
     fn drop(&mut self) {
+        if self.discarded {
+            return;
+        }
         self.sample.duration_ms = millis(self.start);
         if !self.dispatched {
             self.sample.queue_ms = self.sample.duration_ms;

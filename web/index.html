@@ -18,6 +18,14 @@
         --amber: #b7791f;
         --red: #dc2626;
         --green: #10a37f;
+        --red-soft: #fef2f2;
+        --red-line: #fecaca;
+        --red-ink: #b91c1c;
+        --amber-soft: #fffbeb;
+        --amber-line: #fde68a;
+        --amber-ink: #854d0e;
+        --green-soft: #ecfdf5;
+        --green-ink: #047857;
         --shadow: 0 8px 24px rgb(0 0 0 / 8%);
       }
 
@@ -267,6 +275,8 @@
       }
 
       main {
+        display: flex;
+        flex-direction: column;
         position: relative;
         grid-area: main;
         min-width: 0;
@@ -275,7 +285,8 @@
 
       .view {
         display: none;
-        height: 100%;
+        flex: 1;
+        min-height: 0;
       }
 
       .view.active { display: flex; flex-direction: column; }
@@ -660,29 +671,130 @@
 
       .error-bar.visible { display: block; }
 
-      .ai-pause-banner {
+      button:disabled { cursor: not-allowed; opacity: .55; }
+      .button-primary { border-color: var(--text); color: #ffffff; background: var(--text); }
+      .button-primary:hover { border-color: var(--text); background: #40414f; }
+
+      .safety-notices { flex: none; }
+
+      .safety-panel {
+        margin: 10px 22px 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--panel);
+      }
+
+      .safety-panel[hidden] { display: none; }
+      .safety-panel[data-tone="alert"] { border-color: var(--red-line); }
+      .safety-panel[data-tone="waiting"] { border-color: var(--amber-line); }
+
+      .safety-summary {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        gap: 9px;
+        padding: 9px 13px;
+        border-radius: 9px;
+        list-style: none;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .safety-summary::-webkit-details-marker { display: none; }
+      .safety-panel[open] > .safety-summary { border-radius: 9px 9px 0 0; }
+      .safety-panel[data-tone="alert"] > .safety-summary { color: var(--red-ink); background: var(--red-soft); }
+      .safety-panel[data-tone="waiting"] > .safety-summary { color: var(--amber-ink); background: var(--amber-soft); }
+
+      .safety-dot {
+        flex: none;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+
+      .safety-panel[data-tone="alert"] .safety-dot { background: var(--red); }
+      .safety-panel[data-tone="waiting"] .safety-dot { background: var(--amber); }
+
+      .safety-chevron {
+        width: 7px;
+        height: 7px;
+        margin: 0 3px 0 auto;
+        border-right: 1.5px solid currentColor;
+        border-bottom: 1.5px solid currentColor;
+        transform: rotate(135deg);
+        transition: transform .16s ease;
+      }
+
+      .safety-panel[open] .safety-chevron { margin-bottom: 3px; transform: rotate(45deg); }
+      @media (prefers-reduced-motion: reduce) {
+        .safety-chevron { transition: none; }
+      }
+
+      .safety-body {
+        max-height: min(360px, 40vh);
+        overflow: auto;
+        padding: 0 13px;
+      }
+
+      #tracking-errors[hidden] { display: none; }
+
+      .safety-item {
+        display: flex;
+        align-items: flex-start;
         gap: 16px;
-        padding: 12px 14px;
-        border: 1px solid #f0b8b8;
-        border-radius: 14px;
-        color: #991b1b;
-        background: #fff7f7;
-        white-space: pre-line;
+        padding: 11px 0;
+        border-top: 1px solid var(--line);
       }
 
       .ai-pause-banner[hidden] { display: none; }
 
-      .ai-pause-banner button {
-        flex: none;
-        border: 0;
+      .safety-item-main { flex: 1; min-width: 0; }
+
+      .safety-item-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 9px;
+      }
+
+      .safety-chip {
+        padding: 1px 7px;
         border-radius: 999px;
-        padding: 8px 14px;
-        color: white;
-        background: #b91c1c;
+        color: var(--muted);
+        background: var(--panel-2);
+        font-size: 11px;
+        font-weight: 700;
+      }
+
+      .safety-item[data-tone="alert"] .safety-chip { color: var(--red-ink); background: var(--red-soft); }
+      .safety-item[data-tone="waiting"] .safety-chip { color: var(--amber-ink); background: var(--amber-soft); }
+      .safety-item[data-tone="done"] .safety-chip { color: var(--green-ink); background: var(--green-soft); }
+
+      .safety-reason { margin: 5px 0 0; overflow-wrap: anywhere; }
+      .safety-item[data-tone="done"] .safety-reason,
+      .safety-item[data-tone="quiet"] .safety-reason { color: var(--muted); }
+
+      .safety-command {
+        display: block;
+        margin-top: 3px;
+        color: var(--muted);
+        font: 11px ui-monospace, "Cascadia Mono", monospace;
+        overflow-wrap: anywhere;
+      }
+
+      .safety-hint { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+      .safety-item[data-confirming] .safety-hint { color: var(--text); font-weight: 600; }
+
+      .safety-actions { display: flex; flex: none; gap: 7px; }
+      .safety-actions button { padding: 6px 11px; font-size: 12px; }
+
+      .safety-archive { border-top: 1px solid var(--line); }
+      .safety-archive > summary {
+        padding: 9px 0;
+        color: var(--muted);
+        font-size: 12px;
         cursor: pointer;
+        user-select: none;
       }
     </style>
   </head>
@@ -726,6 +838,31 @@
 
       <main>
         <div id="error-bar" class="error-bar"></div>
+        <div class="safety-notices">
+          <details id="safety-panel" class="safety-panel" hidden>
+            <summary class="safety-summary">
+              <span class="safety-dot" aria-hidden="true"></span>
+              <strong id="safety-title" role="status"></strong>
+              <span id="safety-meta" class="subtle"></span>
+              <span class="safety-chevron" aria-hidden="true"></span>
+            </summary>
+            <div class="safety-body">
+              <section id="ai-pause-banner" class="ai-pause-banner safety-item" data-tone="alert" hidden>
+                <div class="safety-item-main">
+                  <div class="safety-item-head">
+                    <span class="safety-chip">暂停中</span>
+                    <strong>全部 AI 操作</strong>
+                  </div>
+                  <p id="ai-pause-text" class="safety-reason"></p>
+                </div>
+                <div class="safety-actions">
+                  <button id="ai-pause-clear" class="button-primary" type="button">恢复 AI 操作</button>
+                </div>
+              </section>
+              <div id="tracking-errors" hidden></div>
+            </div>
+          </details>
+        </div>
 
         <section id="messages-view" class="view active">
           <div class="view-heading">
@@ -739,10 +876,6 @@
             <code id="messages-cwd-path"></code>
           </div>
           <div class="composer-stack">
-            <section id="ai-pause-banner" class="ai-pause-banner" role="alert" hidden>
-              <span id="ai-pause-text"></span>
-              <button id="ai-pause-clear" type="button">恢复 AI 操作</button>
-            </section>
             <section
               id="approval-dialog"
               class="approval-popover"
@@ -826,6 +959,10 @@
         aiPauseBanner: byId("ai-pause-banner"),
         aiPauseText: byId("ai-pause-text"),
         aiPauseClear: byId("ai-pause-clear"),
+        trackingErrors: byId("tracking-errors"),
+        safetyPanel: byId("safety-panel"),
+        safetyTitle: byId("safety-title"),
+        safetyMeta: byId("safety-meta"),
         gateModes: byId("gate-modes"),
         gateButtons: [...document.querySelectorAll("[data-gate-mode]")],
         connectionDot: byId("connection-dot"),
@@ -867,6 +1004,12 @@
       let approvalCooldown = false;
       const decidedApprovalIds = new Set();
       let keyQueue = Promise.resolve();
+      let currentAiPause = null;
+      let trackingNotices = [];
+      let confirmingPauseId = "";
+      let focusPauseId = "";
+      let resolvedPausesOpen = false;
+      let surfacedPauses = new Set();
       const expandedContent = new Set();
       const LONG_CONTENT_CHARS = 1200;
       const LONG_CONTENT_LINES = 12;
@@ -928,6 +1071,13 @@
           selectedPane = "";
           localStorage.setItem("tmux-mcp-target", selectedTarget);
         }
+        const options = [...elements.targetSelect.options];
+        if (options.length === entries.length && entries.every(([name, config], index) =>
+          options[index].value === name && options[index].textContent === name + (config.note ? " · " + config.note : "")
+        )) {
+          if (elements.targetSelect.value !== selectedTarget) elements.targetSelect.value = selectedTarget;
+          return;
+        }
         clear(elements.targetSelect);
         for (const [name, config] of entries) {
           const option = node("option", "", `${name}${config.note ? ` · ${config.note}` : ""}`);
@@ -948,10 +1098,170 @@
       }
 
       function renderAiPause(pause) {
+        currentAiPause = pause || null;
         elements.aiPauseBanner.hidden = !pause;
-        elements.aiPauseText.textContent = pause
-          ? `AI 操作已暂停\n原因：无法确认 pane ${pause.paneId} 的状态`
-          : "";
+        elements.aiPauseText.textContent = pause ? `无法确认 pane ${pause.paneId} 的状态` : "";
+        updateSafetyPanel();
+      }
+
+      // Pauses that still block AI come first; handled ones fold away so they never read as alarms.
+      function renderTrackingErrors(errors = []) {
+        const banner = elements.trackingErrors;
+        trackingNotices = errors;
+        const open = errors.filter((error) => !["resumed", "legacy"].includes(error.recovery));
+        const handled = errors.filter((error) => !open.includes(error));
+        const nestHandled = Boolean(open.length || currentAiPause);
+        const signature = JSON.stringify([errors, confirmingPauseId, nestHandled]);
+        if (banner.dataset.state !== signature) {
+          banner.dataset.state = signature;
+          banner.hidden = !errors.length;
+          clear(banner);
+          let focusTarget = null;
+          for (const error of open) {
+            const item = pauseItem(error);
+            focusTarget = item.focusTarget || focusTarget;
+            banner.appendChild(item);
+          }
+          if (nestHandled && handled.length) {
+            const archive = node("details", "safety-archive");
+            archive.open = resolvedPausesOpen;
+            archive.appendChild(node("summary", "", `已处理 ${handled.length} 条`));
+            archive.addEventListener("toggle", () => { resolvedPausesOpen = archive.open; });
+            for (const error of handled) archive.appendChild(pauseItem(error));
+            banner.appendChild(archive);
+          } else {
+            for (const error of handled) banner.appendChild(pauseItem(error));
+          }
+          focusPauseId = "";
+          focusTarget?.focus();
+        }
+        updateSafetyPanel();
+      }
+
+      const pauseStates = {
+        paused: {
+          chip: "暂停中",
+          tone: "alert",
+          hint: "检查终端后可恢复；恢复不会中断、重跑命令或补发输入。"
+        },
+        requested: {
+          chip: "等待客户端确认",
+          tone: "waiting",
+          hint: "恢复申请待确认，AI 暂停尚未解除。客户端离线或已重启时无法确认；只读检查仍可使用。"
+        },
+        resumed: {
+          chip: "已解除",
+          tone: "done",
+          hint: "本条暂停已解除（客户端已确认）；命令结果仍未知。"
+        },
+        legacy: {
+          chip: "旧会话",
+          tone: "quiet",
+          hint: "来自升级前的 MCP，不能通过网页热恢复。在对应客户端重新连接 tmux MCP 即可；这条记录不代表当前仍暂停。"
+        },
+        error: {
+          chip: "读取失败",
+          tone: "alert",
+          hint: "无法读取暂停状态，请检查控制服务。"
+        }
+      };
+
+      function actionButton(label, className, onClick) {
+        const button = node("button", className, label);
+        button.type = "button";
+        button.addEventListener("click", onClick);
+        return button;
+      }
+
+      function pauseItem(error) {
+        const state = pauseStates[error.recovery] || pauseStates.error;
+        const confirming = error.recovery === "paused" && confirmingPauseId === error.commandId;
+        const item = node("article", "safety-item");
+        item.dataset.tone = state.tone;
+        if (confirming) item.dataset.confirming = "";
+
+        const main = node("div", "safety-item-main");
+        const head = node("div", "safety-item-head");
+        head.appendChild(node("span", "safety-chip", state.chip));
+        head.appendChild(node("strong", "", `pane ${error.paneId}`));
+        head.appendChild(node("span", "subtle", error.source));
+        if (error.updatedAtMs) {
+          head.appendChild(node("span", "subtle", new Date(error.updatedAtMs).toLocaleString()));
+        }
+        main.appendChild(head);
+        main.appendChild(node("p", "safety-reason", error.reason));
+        if (error.commandId) main.appendChild(node("code", "safety-command", `命令 ${error.commandId}`));
+        main.appendChild(node("p", "safety-hint", confirming
+          ? `确认已检查 ${error.target} 的 pane ${error.paneId}，允许 AI 继续操作？这不会中断或重跑原命令，也不会把未知结果标成成功。`
+          : state.hint));
+        item.appendChild(main);
+
+        const actions = node("div", "safety-actions");
+        if (confirming) {
+          actions.appendChild(actionButton("取消", "", () => {
+            confirmingPauseId = "";
+            focusPauseId = error.commandId;
+            renderTrackingErrors(trackingNotices);
+          }));
+          const resume = actionButton("确认后恢复 AI 操作", "button-primary", async () => {
+            if (selectedTarget !== error.target) return;
+            resume.disabled = true;
+            try {
+              await api("/api/ai-pause/resume-tracking", { method: "PUT", body: {
+                target: error.target, commandId: error.commandId, confirmed: true
+              }});
+              confirmingPauseId = "";
+              await refreshState();
+            } catch (failure) {
+              showError(failure.message);
+              resume.disabled = false;
+            }
+          });
+          actions.appendChild(resume);
+          if (focusPauseId === error.commandId) item.focusTarget = resume;
+        } else {
+          if (error.recovery !== "error") {
+            actions.appendChild(actionButton("查看终端", "", () => {
+              if (selectedTarget !== error.target) return;
+              selectPane(error.paneId);
+              setMode("interactive");
+            }));
+          }
+          if (error.recovery === "paused") {
+            const resume = actionButton("恢复 AI 操作", "button-primary", () => {
+              confirmingPauseId = error.commandId;
+              focusPauseId = error.commandId;
+              renderTrackingErrors(trackingNotices);
+            });
+            actions.appendChild(resume);
+            if (focusPauseId === error.commandId) item.focusTarget = resume;
+          }
+        }
+        item.appendChild(actions);
+        return item;
+      }
+
+      // Re-open the panel only when a pause appears that the user has not seen yet.
+      function updateSafetyPanel() {
+        const panel = elements.safetyPanel;
+        const attention = trackingNotices.filter((error) => ["paused", "error"].includes(error.recovery));
+        const waiting = trackingNotices.filter((error) => error.recovery === "requested").length;
+        const handled = trackingNotices.length - attention.length - waiting;
+        const active = attention.length + (currentAiPause ? 1 : 0);
+        panel.hidden = !active && !trackingNotices.length;
+        panel.dataset.tone = active ? "alert" : waiting ? "waiting" : "quiet";
+        elements.safetyTitle.textContent = active
+          ? "AI 操作已暂停"
+          : waiting ? "等待客户端确认恢复" : "暂停记录";
+        const meta = [];
+        if (active) meta.push(`${active} 项需要处理`);
+        if (waiting) meta.push(`${waiting} 项等待客户端确认`);
+        if (handled) meta.push(`${handled} 项已处理`);
+        elements.safetyMeta.textContent = meta.join("，");
+        const keys = attention.map((error) => error.commandId || error.reason);
+        if (currentAiPause) keys.push(`global:${currentAiPause.paneId}`);
+        if (keys.some((key) => !surfacedPauses.has(key))) panel.open = true;
+        surfacedPauses = new Set(keys);
       }
 
       function flattenPanes(topology) {
@@ -1124,6 +1434,10 @@
           }
           return `read ${args.path || ""}`;
         }
+        if (record.tool === "write-file") {
+          const flags = `${args.overwrite ? " --overwrite" : ""}${args.createParents ? " --parents" : ""}`;
+          return `write${flags} ${args.path || ""}\n${args.content ?? ""}`;
+        }
         if (record.tool === "find-files") {
           const name = args.namePattern ? ` --name ${args.namePattern}` : "";
           return `find-files ${args.path || "."}${name}`;
@@ -1179,6 +1493,9 @@
       function genericResult(record) {
         if (record.result === undefined || record.result === null) return "";
         const structured = record.result?.structuredContent;
+        if (record.tool === "write-file" && typeof structured?.bytesWritten === "number") {
+          return `${structured.created ? "已创建" : "已覆盖"} ${structured.path}（${structured.bytesWritten} 字节）`;
+        }
         if (record.tool === "list-directory" && Array.isArray(structured?.entries)) {
           const output = structured.entries.join("\n") || "（空目录）";
           return structured.truncated ? `${output}\n…（结果已截断）` : output;
@@ -1288,7 +1605,8 @@
         const body = node("div", "card-body");
         if (record.kind === "command") {
           const snapshot = record.commandSnapshot || {};
-          const command = snapshot.command || record.arguments?.command || "";
+          // A script runs as `bash <file>`; show what it runs, not the launcher line.
+          const command = record.arguments?.script || snapshot.command || record.arguments?.command || "";
           const running = ["requested", "approved", "running"].includes(record.status);
           const commandLine = node("div", "command-line");
           const prompt = node("span", "command-prompt", "$");
@@ -1442,12 +1760,14 @@
         }
         stateBusy = true;
         const requestedPane = selectedPane;
+        const requestedTarget = selectedTarget;
         try {
           const params = new URLSearchParams();
           if (requestedPane) params.set("paneId", requestedPane);
-          if (selectedTarget) params.set("target", selectedTarget);
+          if (requestedTarget) params.set("target", requestedTarget);
           const query = params.toString() ? `?${params}` : "";
           const state = await api(`/api/state${query}`);
+          if (requestedTarget !== selectedTarget) return;
           latestState = state;
           renderTargets(state.targets, state.target);
           for (const id of decidedApprovalIds) {
@@ -1460,6 +1780,7 @@
           updateActivity(state.activity);
           renderTopology(state.topology);
           renderAiPause(state.aiPause);
+          renderTrackingErrors(state.trackingErrors);
           renderGateMode(state.gateMode || (state.gateEnabled ? "approval" : "off"));
           renderOperations();
           renderApproval(state.pending);
@@ -1472,6 +1793,7 @@
             setTimeout(() => void refreshState(), 0);
           }
         } catch (error) {
+          if (requestedTarget !== selectedTarget) return;
           setConnection(false, "控制中心断线");
           showError(error.message);
         } finally {
@@ -1486,15 +1808,16 @@
       async function refreshCapture() {
         if (mode !== "interactive" || !selectedPane || captureBusy) return;
         const paneId = selectedPane;
+        const requestedTarget = selectedTarget;
         captureBusy = true;
         try {
-          const result = await api(`/api/panes/${encodeURIComponent(paneId)}/capture?target=${encodeURIComponent(selectedTarget)}`);
-          if (mode === "interactive" && selectedPane === paneId) {
+          const result = await api(`/api/panes/${encodeURIComponent(paneId)}/capture?target=${encodeURIComponent(requestedTarget)}`);
+          if (mode === "interactive" && selectedPane === paneId && selectedTarget === requestedTarget) {
             elements.terminal.textContent = result.text || "";
             elements.terminal.scrollTop = elements.terminal.scrollHeight;
           }
         } catch (error) {
-          if (mode === "interactive" && selectedPane === paneId) showError(error.message);
+          if (mode === "interactive" && selectedPane === paneId && selectedTarget === requestedTarget) showError(error.message);
         } finally {
           captureBusy = false;
         }
@@ -1503,11 +1826,12 @@
       function sendKey(key, literal) {
         if (!selectedPane) return;
         const paneId = selectedPane;
+        const target = selectedTarget;
         keyQueue = keyQueue
           .then(() =>
             api(`/api/panes/${encodeURIComponent(paneId)}/keys`, {
               method: "POST",
-              body: { key, literal, target: selectedTarget }
+              body: { key, literal, target }
             })
           )
           .catch((error) => showError(error.message));
@@ -1533,7 +1857,19 @@
       elements.targetSelect.addEventListener("change", () => {
         selectedTarget = elements.targetSelect.value;
         selectedPane = "";
+        latestState = null;
+        previousActivity = {};
+        activityInitialized = false;
+        unseenPanes.clear();
+        confirmingPauseId = "";
         localStorage.setItem("tmux-mcp-target", selectedTarget);
+        localStorage.removeItem("tmux-mcp-pane");
+        elements.terminal.textContent = "";
+        renderTopology(null);
+        renderTrackingErrors([]);
+        renderMessages([], true);
+        renderApproval([]);
+        updateComposer();
         void refreshState();
       });
 

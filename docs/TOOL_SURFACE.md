@@ -8,6 +8,7 @@
 
 - tmux 状态：`list-targets`、`get-tmux-state`、`capture-pane`
 - 文件只读：`list-directory`、`file-stat`、`read-file`、`find-files`、`search-text`
+- 文件写入（下一版）：`write-file`（分组 `@file-write`；受 `allow_execute_command` 和 Gate 约束）
 - Git 只读：`git-status`、`git-diff`、`git-log`、`git-show`
 - 命令：`execute-command`、`get-command-result`
 - 创建：`create-session`、`create-window`、`split-pane`
@@ -15,7 +16,7 @@
 - GPU（仅加 `--claude-channel`）：`watch-gpu-idle`、`get-gpu-watch`、`stop-gpu-watch`
 - GPU 只读快照（不需要 Channel）：`gpu-snapshot`
 
-默认共 21 个工具；启用 Claude Channel 后为 24 个。
+v0.6.1 默认共 21 个工具，启用 Claude Channel 后为 24 个；下一版加入 `write-file` 后分别为 22 个和 25 个。
 
 ## 默认隐藏工具
 
@@ -60,7 +61,7 @@ mode = "allow"
 items = ["@agent-core", "@move"]
 ```
 
-可用分组包括 `@agent-core`、`@read`、`@file-read`、`@git-read`、`@buffer-read`、`@buffer-write`、`@list`、`@capture`、`@create`、`@split`、`@kill`、`@execute`、`@gpu-monitor`、`@rename`、`@move`、`@interactive`、`@special-keys`、`@raw-input`、`@socket` 和 `@all`。
+可用分组包括 `@agent-core`、`@read`、`@file-read`、`@file-write`、`@git-read`、`@buffer-read`、`@buffer-write`、`@list`、`@capture`、`@create`、`@split`、`@kill`、`@execute`、`@gpu-monitor`、`@rename`、`@move`、`@interactive`、`@special-keys`、`@raw-input`、`@socket` 和 `@all`。
 
 `TMUX_MCP_TOOLS`/`[security.tools]` 只能进一步缩小 `--full-tools` 的工具面，不能绕过其他安全策略。
 

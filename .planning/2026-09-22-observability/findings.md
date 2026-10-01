@@ -1,0 +1,14 @@
+# Findings
+- Latest assessment: retained events.jsonl has 1,103 legacy records and zero timing-bearing calls, so no measured SSH speedup can be claimed. Local executable is Windows OpenSSH 9.5.5.1; official project scope lists ControlMaster unsupported (page edited 2023): https://github.com/PowerShell/Win32-OpenSSH/wiki/Project-Scope . Native reuse semantics: https://man.openbsd.org/ssh_config . tmux persistence: https://man.openbsd.org/tmux . No remote calls made.
+- Pane safety gap confirmed: safety_preflight in server.rs releases TrackingError ownership through commands.rs acknowledge_uncertain merely on successful capture. Screen capture cannot establish completion or an empty input buffer. Keep this assessment separate from implementation; user requested thinking through a small solution first.
+- Prior nine-item list lives in root task_plan.md; its deployment labels predate the September 13 binary replacement.
+- Existing ActionRecord/Hub log provides bounded centralized persistence, but subprocess timing needs inspection.
+- Current schema advertises target but omits it from required.
+- Background detector incorrectly permits an unspaced standalone ampersand.
+- wait_for performs recovery before starting its timer and capture after expiry.
+- Existing detached mode bypasses tracking, not terminal ownership or process supervision.
+- Measurements reuse ActionRecord/events.jsonl rather than introducing another logger. Subprocess metadata excludes shell text; foreground timing excludes detached background watcher lifetime. Persistence still requires the existing Web hub.
+- Recovered completion formerly awaited remote cleanup before releasing its pane; bounded wait cancellation required committing readiness and pane release together before cleanup.
+- Existing read-only program runner accepts fixed arguments, bounds stdout, and applies process timeouts; reuse it for stat/GPU rather than adding general SSH access.
+- Found an actual multi-target defect: occupancy was keyed only by socket/pane. Added recorded target identity, target-qualified occupancy, guarded queries/purges, and target-stable command resource URIs. Pure regression proves same-numbered panes are independent.
+- Snapshot queries and tool security are implemented. GPU inventory failure remains an error, never an idle-GPU claim; no generic SSH execution surface is introduced.

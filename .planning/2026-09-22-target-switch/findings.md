@@ -1,0 +1,1 @@
+Old state responses overwrite selectedTarget via renderTargets; polling recreates select options. Capture and queued key requests use insufficient target scoping. Backend api_state resolves the requested target correctly. UI is embedded in the binary. Existing tracked source is clean.

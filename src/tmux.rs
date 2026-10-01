@@ -45,6 +45,10 @@ const READ_ONLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// own intentionally unbounded path and do not go through this wrapper.
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const SSH_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+/// Added to one-shot `ssh` request budgets: measured handshakes take 3.5–8 s.
+const SSH_SETUP_ALLOWANCE: Duration = Duration::from_secs(20);
+/// Pooled tmux output is buffered whole; this only guards against runaway output.
+const POOLED_TMUX_STDOUT_CAP: usize = 64 * 1024 * 1024;
 const GIT_ERROR_MAX_BYTES: usize = 65_536;
 const GIT_ROOT_MAX_BYTES: usize = 16_384;
 const GIT_ARGUMENT_MAX_BYTES: usize = 16_384;
@@ -330,6 +334,45 @@ pub(crate) fn quote_remote_arg(arg: &str) -> String {
     quoted
 }
 
+/// Start an external `ssh`/`tmux` process. Test builds run the stub scripts through
+/// `sh` because Windows cannot execute extensionless shebang scripts directly.
+pub(crate) fn external(program: &str) -> Command {
+    #[cfg(test)]
+    if let Some(dir) = std::env::var_os("TMUX_STUB_DIR") {
+        let script = Path::new(&dir).join(program);
+        if script.is_file() {
+            let mut command = Command::new("sh");
+            command.arg(script);
+            return command;
+        }
+    }
+    if program == "ssh" {
+        return Command::new(ssh_program());
+    }
+    Command::new(program)
+}
+
+/// The ssh client: `TMUX_MCP_SSH_PROGRAM` when set; on Windows the system OpenSSH when
+/// present, because Git for Windows' MSYS ssh hangs under this process when it comes first
+/// on PATH; otherwise `ssh` from PATH.
+fn ssh_program() -> &'static std::ffi::OsStr {
+    static PROGRAM: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        if let Some(program) = std::env::var_os("TMUX_MCP_SSH_PROGRAM").filter(|p| !p.is_empty()) {
+            return program;
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+            let system = Path::new(&root).join(r"System32\OpenSSH\ssh.exe");
+            if system.is_file() {
+                return system.into_os_string();
+            }
+        }
+        "ssh".into()
+    })
+}
+
 /// Build one foreground SSH process for a fixed remote command.
 pub(crate) fn build_ssh_remote_process(remote_command: String) -> Result<Command> {
     let mut ssh_args = get_ssh_args()?.ok_or_else(|| Error::InvalidArgument {
@@ -338,7 +381,7 @@ pub(crate) fn build_ssh_remote_process(remote_command: String) -> Result<Command
     ssh_args.insert(0, "-T".to_string());
     ssh_args.insert(0, "-n".to_string());
     ssh_args.push(remote_command);
-    let mut command = Command::new("ssh");
+    let mut command = external("ssh");
     command.args(ssh_args);
     Ok(command)
 }
@@ -368,13 +411,13 @@ fn build_tmux_command(args: &[&str], socket: Option<&str>, pipe_stdin: bool) -> 
             ssh_args.insert(0, "-n".to_string());
         }
         ssh_args.push(build_remote_tmux_command(&socket_args, args));
-        let mut cmd = Command::new("ssh");
+        let mut cmd = external("ssh");
         cmd.args(&ssh_args);
         Ok(cmd)
     } else {
         let mut tmux_args = socket_args;
         tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        let mut cmd = Command::new("tmux");
+        let mut cmd = external("tmux");
         cmd.args(&tmux_args);
         Ok(cmd)
     }
@@ -429,8 +472,38 @@ async fn run_tmux_with_socket_inner(
         })?;
 
     timer.dispatched();
+    if let Some(ssh_args) = get_ssh_args()?.filter(|_| crate::ssh_pool::enabled()) {
+        let remote = build_remote_tmux_command(&get_socket_args(socket), args);
+        let request = crate::ssh_pool::Request {
+            command: &remote,
+            stdin,
+            stdout_cap: POOLED_TMUX_STDOUT_CAP,
+            timeout: TMUX_COMMAND_TIMEOUT,
+            idempotent: tmux_request_is_read_only(args),
+        };
+        match crate::ssh_pool::run(&ssh_args, request).await {
+            Ok(crate::ssh_pool::Outcome::Done { output, reused }) => {
+                timer.set_transport(if reused { "ssh-pool" } else { "ssh-pool-new" });
+                return Ok(std::process::Output {
+                    status: exit_status(output.code),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
+            Ok(crate::ssh_pool::Outcome::Unsupported) => {}
+            Err(failure) => {
+                return Err(pool_failure(failure, || {
+                    format!(
+                        "tmux command timed out after {} seconds",
+                        TMUX_COMMAND_TIMEOUT.as_secs()
+                    )
+                }))
+            }
+        }
+    }
     let mut command = build_tmux_command(args, socket, stdin.is_some())?;
     command.kill_on_drop(true);
+    let timeout = one_shot_timeout(TMUX_COMMAND_TIMEOUT)?;
 
     let operation = async move {
         if let Some(input) = stdin {
@@ -464,16 +537,66 @@ async fn run_tmux_with_socket_inner(
                 })
         }
     };
-    let output = tokio::time::timeout(TMUX_COMMAND_TIMEOUT, operation)
+    let output = tokio::time::timeout(timeout, operation)
         .await
         .map_err(|_| Error::Tmux {
-            message: format!(
-                "tmux command timed out after {} seconds",
-                TMUX_COMMAND_TIMEOUT.as_secs()
-            ),
+            message: format!("tmux command timed out after {} seconds", timeout.as_secs()),
         })??;
 
     Ok(output)
+}
+
+/// tmux subcommands that only read state, so a request lost with its session may be resent.
+fn tmux_request_is_read_only(args: &[&str]) -> bool {
+    matches!(
+        args.first().copied(),
+        Some(
+            "capture-pane"
+                | "display-message"
+                | "list-sessions"
+                | "list-windows"
+                | "list-panes"
+                | "list-clients"
+                | "list-buffers"
+                | "show-buffer"
+                | "show-options"
+                | "has-session"
+                | "-V"
+        )
+    )
+}
+
+/// One-shot `ssh` pays the handshake inside the request budget; allow for it so the
+/// budget still measures remote work, as it does for pooled sessions.
+fn one_shot_timeout(work: Duration) -> Result<Duration> {
+    Ok(if ssh_enabled()? {
+        work + SSH_SETUP_ALLOWANCE
+    } else {
+        work
+    })
+}
+
+fn pool_failure(failure: crate::ssh_pool::Failure, timeout: impl FnOnce() -> String) -> Error {
+    Error::Tmux {
+        message: match failure {
+            crate::ssh_pool::Failure::Timeout => timeout(),
+            crate::ssh_pool::Failure::Lost(message)
+            | crate::ssh_pool::Failure::Connect(message) => message,
+        },
+    }
+}
+
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw((code & 0xff) << 8)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
 }
 
 /// Collect successful tmux stdout bytes; fall back to stderr when stdout is empty.
@@ -595,13 +718,19 @@ async fn execute_read_only_program(
     accepted_exit_codes: &[i32],
 ) -> Result<(Vec<u8>, bool)> {
     let command = if let Some(mut ssh_args) = get_ssh_args()? {
-        ssh_args.insert(0, "-n".to_string());
-        ssh_args.push(format!(
+        let remote = format!(
             "cd -- {} && {}",
             quote_remote_arg(cwd),
             build_remote_command(program, args)
-        ));
-        let mut command = Command::new("ssh");
+        );
+        if let Some(result) =
+            execute_pooled_bounded(&remote, program, max_bytes, accepted_exit_codes).await
+        {
+            return result;
+        }
+        ssh_args.insert(0, "-n".to_string());
+        ssh_args.push(remote);
+        let mut command = external("ssh");
         command.args(ssh_args);
         command
     } else {
@@ -633,29 +762,32 @@ fn hardened_git_args(repo_path: &str) -> Vec<String> {
     .collect()
 }
 
+fn remote_git_command(cwd: &str, args: &[String]) -> String {
+    let mut environment = Vec::new();
+    for name in GIT_ENV_REMOVE {
+        environment.push("-u".to_string());
+        environment.push((*name).to_string());
+    }
+    environment.extend(
+        GIT_ENV
+            .iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    environment.push("git".to_string());
+    environment.extend(args.iter().cloned());
+    let environment = environment.iter().map(String::as_str).collect::<Vec<_>>();
+    format!(
+        "cd -- {} && {}",
+        quote_remote_arg(cwd),
+        build_remote_command("/usr/bin/env", &environment)
+    )
+}
+
 fn build_git_command(cwd: &str, args: &[String]) -> Result<Command> {
-    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     if let Some(mut ssh_args) = get_ssh_args()? {
         ssh_args.insert(0, "-n".to_string());
-        let mut environment = Vec::new();
-        for name in GIT_ENV_REMOVE {
-            environment.push("-u".to_string());
-            environment.push((*name).to_string());
-        }
-        environment.extend(
-            GIT_ENV
-                .iter()
-                .map(|(name, value)| format!("{name}={value}")),
-        );
-        environment.push("git".to_string());
-        environment.extend(args.iter().map(|arg| (*arg).to_string()));
-        let environment = environment.iter().map(String::as_str).collect::<Vec<_>>();
-        ssh_args.push(format!(
-            "cd -- {} && {}",
-            quote_remote_arg(cwd),
-            build_remote_command("/usr/bin/env", &environment)
-        ));
-        let mut command = Command::new("ssh");
+        ssh_args.push(remote_git_command(cwd, args));
+        let mut command = external("ssh");
         command.args(ssh_args);
         Ok(command)
     } else {
@@ -696,7 +828,7 @@ async fn execute_command_bounded(
     max_bytes: usize,
     accepted_exit_codes: &[i32],
 ) -> Result<(Vec<u8>, bool)> {
-    let ssh = command.as_std().get_program() == "ssh";
+    let ssh = ssh_enabled().unwrap_or(false);
     let mut timer = crate::timing::TransportTimer::new(label, ssh);
     let result =
         execute_command_bounded_inner(command, label, max_bytes, accepted_exit_codes, &mut timer)
@@ -713,6 +845,83 @@ async fn execute_command_bounded(
         ),
     }
     result
+}
+
+/// Run a bounded read-only remote command on a pooled SSH session.
+/// `None` means sessions are disabled or unsupported here: use one-shot `ssh`.
+async fn execute_pooled_bounded(
+    remote: &str,
+    label: &str,
+    max_bytes: usize,
+    accepted_exit_codes: &[i32],
+) -> Option<Result<(Vec<u8>, bool)>> {
+    let ssh_args = get_ssh_args().ok().flatten()?;
+    if !crate::ssh_pool::enabled() {
+        return None;
+    }
+    let mut timer = crate::timing::TransportTimer::new(label, true);
+    let permit = tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, TMUX_SEMAPHORE.acquire()).await;
+    let _permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(e)) => {
+            return Some(Err(Error::Tmux {
+                message: format!("tmux semaphore closed: {e}"),
+            }))
+        }
+        Err(_) => {
+            timer.finish("timeout", 0);
+            return Some(Err(Error::Tmux {
+                message: format!("{label} request queue timed out after 10 seconds"),
+            }));
+        }
+    };
+    timer.dispatched();
+    let request = crate::ssh_pool::Request {
+        command: remote,
+        stdin: None,
+        stdout_cap: max_bytes,
+        timeout: READ_ONLY_COMMAND_TIMEOUT,
+        idempotent: true,
+    };
+    let result = match crate::ssh_pool::run(&ssh_args, request).await {
+        Ok(crate::ssh_pool::Outcome::Unsupported) => {
+            timer.discard();
+            return None;
+        }
+        Ok(crate::ssh_pool::Outcome::Done { output, reused }) => {
+            timer.set_transport(if reused { "ssh-pool" } else { "ssh-pool-new" });
+            if accepted_exit_codes.contains(&output.code) {
+                Ok((output.stdout, output.stdout_truncated))
+            } else {
+                let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(Error::Tmux {
+                    message: if message.is_empty() {
+                        format!("{label} exited with exit status: {}", output.code)
+                    } else {
+                        message
+                    },
+                })
+            }
+        }
+        Err(failure) => Err(pool_failure(failure, || {
+            format!(
+                "{label} timed out after {} seconds",
+                READ_ONLY_COMMAND_TIMEOUT.as_secs()
+            )
+        })),
+    };
+    match &result {
+        Ok((output, _)) => timer.finish("ok", output.len()),
+        Err(error) => timer.finish(
+            if error.to_string().contains("timed out") {
+                "timeout"
+            } else {
+                "error"
+            },
+            0,
+        ),
+    }
+    Some(result)
 }
 
 async fn execute_command_bounded_inner(
@@ -747,7 +956,8 @@ async fn execute_command_bounded_inner(
     let stdout_task = crate::targets::spawn(read_stream_bounded(stdout, max_bytes));
     let stderr_task = crate::targets::spawn(read_stream_bounded(stderr, GIT_ERROR_MAX_BYTES));
 
-    let status = match tokio::time::timeout(READ_ONLY_COMMAND_TIMEOUT, child.wait()).await {
+    let timeout = one_shot_timeout(READ_ONLY_COMMAND_TIMEOUT)?;
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result.map_err(|e| Error::Tmux {
             message: format!("failed to wait for {label}: {e}"),
         })?,
@@ -757,7 +967,7 @@ async fn execute_command_bounded_inner(
             stdout_task.abort();
             stderr_task.abort();
             return Err(Error::Tmux {
-                message: format!("{label} timed out after 10 seconds"),
+                message: format!("{label} timed out after {} seconds", timeout.as_secs()),
             });
         }
     };
@@ -799,6 +1009,12 @@ async fn execute_git_bounded(
     args: &[String],
     max_bytes: usize,
 ) -> Result<(Vec<u8>, bool)> {
+    if ssh_enabled()? {
+        let remote = remote_git_command(cwd, args);
+        if let Some(result) = execute_pooled_bounded(&remote, "git", max_bytes, &[0]).await {
+            return result;
+        }
+    }
     execute_command_bounded(build_git_command(cwd, args)?, "git", max_bytes, &[0]).await
 }
 
@@ -1026,6 +1242,326 @@ pub async fn git_show(
         bytes_read,
         truncated,
     })
+}
+
+/// Exit status and output of a fixed remote shell snippet.
+pub struct ShellRun {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Run a fixed POSIX sh snippet in `cwd` with positional `args` and `stdin`.
+///
+/// Used by modifying operations: the request is never resent after a lost session, and
+/// callers pass data only through `args`/`stdin`, never by splicing it into `script`.
+pub(crate) async fn run_shell_snippet(
+    cwd: &str,
+    script: &str,
+    args: &[&str],
+    stdin: &[u8],
+    label: &str,
+    timeout: Duration,
+) -> Result<ShellRun> {
+    let mut timer = crate::timing::TransportTimer::new(label, ssh_enabled()?);
+    let _permit = tokio::time::timeout(timeout, TMUX_SEMAPHORE.acquire())
+        .await
+        .map_err(|_| Error::Tmux {
+            message: format!("{label} request queue timed out"),
+        })?
+        .map_err(|e| Error::Tmux {
+            message: format!("tmux semaphore closed: {e}"),
+        })?;
+    timer.dispatched();
+    let result =
+        run_shell_snippet_inner(cwd, script, args, stdin, label, timeout, &mut timer).await;
+    match &result {
+        Ok(run) => timer.finish(if run.code == 0 { "ok" } else { "error" }, run.stdout.len()),
+        Err(error) => timer.finish(
+            if error.to_string().contains("timed out") {
+                "timeout"
+            } else {
+                "error"
+            },
+            0,
+        ),
+    }
+    result
+}
+
+async fn run_shell_snippet_inner(
+    cwd: &str,
+    script: &str,
+    args: &[&str],
+    stdin: &[u8],
+    label: &str,
+    timeout: Duration,
+    timer: &mut crate::timing::TransportTimer,
+) -> Result<ShellRun> {
+    let timed_out = || Error::Tmux {
+        message: format!("{label} timed out after {} seconds", timeout.as_secs()),
+    };
+    let mut argv = vec!["sh", "-c", script, label];
+    argv.extend_from_slice(args);
+    let Some(mut ssh_args) = get_ssh_args()? else {
+        let mut command = Command::new("sh");
+        command.current_dir(cwd).args(&argv[1..]);
+        return spawn_with_stdin(command, stdin, timeout, label)
+            .await?
+            .ok_or_else(timed_out);
+    };
+    let remote = format!(
+        "cd -- {} && {}",
+        quote_remote_arg(cwd),
+        build_remote_command("sh", &argv[1..])
+    );
+    if crate::ssh_pool::enabled() {
+        let request = crate::ssh_pool::Request {
+            command: &remote,
+            stdin: Some(stdin),
+            stdout_cap: 65_536,
+            timeout,
+            idempotent: false,
+        };
+        match crate::ssh_pool::run(&ssh_args, request).await {
+            Ok(crate::ssh_pool::Outcome::Done { output, reused }) => {
+                timer.set_transport(if reused { "ssh-pool" } else { "ssh-pool-new" });
+                return Ok(ShellRun {
+                    code: output.code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
+            Ok(crate::ssh_pool::Outcome::Unsupported) => {}
+            Err(failure) => return Err(pool_failure(failure, || timed_out().to_string())),
+        }
+    }
+    ssh_args.push(remote);
+    let mut command = external("ssh");
+    command.args(ssh_args);
+    spawn_with_stdin(command, stdin, timeout + SSH_SETUP_ALLOWANCE, label)
+        .await?
+        .ok_or_else(timed_out)
+}
+
+/// `Ok(None)` when the process outlived `timeout` (it is killed).
+async fn spawn_with_stdin(
+    mut command: Command,
+    stdin: &[u8],
+    timeout: Duration,
+    label: &str,
+) -> Result<Option<ShellRun>> {
+    command
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| Error::Tmux {
+        message: format!("failed to spawn {label}: {e}"),
+    })?;
+    let input = stdin.to_vec();
+    let mut child_stdin = child.stdin.take();
+    let run = async move {
+        if let Some(pipe) = child_stdin.as_mut() {
+            pipe.write_all(&input).await.map_err(|e| Error::Tmux {
+                message: format!("failed to write {label} stdin: {e}"),
+            })?;
+        }
+        drop(child_stdin);
+        child.wait_with_output().await.map_err(|e| Error::Tmux {
+            message: format!("failed to wait for {label}: {e}"),
+        })
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Err(_) => Ok(None),
+        Ok(output) => {
+            let output = output?;
+            Ok(Some(ShellRun {
+                code: output.status.code().unwrap_or(-1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }))
+        }
+    }
+}
+
+/// Atomic write: temp file in the target directory, then `ln` (create, never clobbers)
+/// or `mv -f` (overwrite, keeping the old mode). Refuses symlinks and non-regular files.
+/// Relative paths get a `./` prefix so a name starting with `-` is never parsed as an option.
+const WRITE_FILE_SCRIPT: &str = r#"p=$1; mode=$2; parents=$3; expected=$4
+case $p in /*) ;; *) p=./$p ;; esac
+case $p in */*) dir=${p%/*}; [ -n "$dir" ] || dir=/ ;; *) dir=. ;; esac
+if [ ! -d "$dir" ]; then
+  if [ "$parents" = 1 ]; then mkdir -p -- "$dir" || exit 3
+  else echo "parent directory does not exist: $dir (set createParents to create it)" >&2; exit 2; fi
+fi
+if [ -L "$p" ]; then echo "refusing to write through a symlink: $p" >&2; exit 4; fi
+if [ -e "$p" ] && [ ! -f "$p" ]; then echo "not a regular file: $p" >&2; exit 5; fi
+exists=0; [ -e "$p" ] && exists=1
+if [ "$mode" = create ] && [ "$exists" = 1 ]; then echo "file already exists: $p (set overwrite to replace it)" >&2; exit 6; fi
+tmp=$(mktemp "$dir/.tmux-mcp-write.XXXXXX") || exit 7
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp" || exit 8
+# A dropped one-shot connection can end stdin early; never install a truncated file.
+size=$(( $(wc -c < "$tmp") ))
+if [ "$size" != "$expected" ]; then echo "incomplete transfer: received $size of $expected bytes; nothing was written" >&2; exit 11; fi
+if [ "$mode" = create ]; then
+  chmod "$(printf '%o' $(( 0666 & ~0$(umask) )))" "$tmp" 2>/dev/null
+  if ln -- "$tmp" "$p" 2>/dev/null; then :
+  elif [ -e "$p" ]; then echo "file already exists: $p (set overwrite to replace it)" >&2; exit 6
+  elif mv -n -- "$tmp" "$p" && [ ! -e "$tmp" ]; then :
+  else echo "could not create $p" >&2; exit 9; fi
+else
+  [ "$exists" = 1 ] && chmod --reference="$p" "$tmp" 2>/dev/null
+  mv -f -- "$tmp" "$p" || exit 9
+fi
+if [ "$exists" = 1 ]; then echo replaced; else echo created; fi"#;
+
+pub const WRITE_FILE_MAX_BYTES: usize = 512 * 1024;
+const WRITE_FILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Write `content` to `path` (relative to `cwd`). Returns true when the file was created.
+pub async fn write_file(
+    cwd: &str,
+    path: &str,
+    content: &[u8],
+    overwrite: bool,
+    create_parents: bool,
+) -> Result<bool> {
+    validate_read_path(path)?;
+    if path.ends_with('/') {
+        return Err(Error::InvalidArgument {
+            message: "path must name a file, not a directory".to_string(),
+        });
+    }
+    if content.len() > WRITE_FILE_MAX_BYTES {
+        return Err(Error::InvalidArgument {
+            message: format!("content exceeds {WRITE_FILE_MAX_BYTES} bytes"),
+        });
+    }
+    let expected = content.len().to_string();
+    let not_written = |detail: String| Error::Tmux {
+        message: format!("File not written: {detail}"),
+    };
+    // The remote rename may already have happened when the reply is lost or garbled.
+    let uncertain = |detail: String| Error::Tmux {
+        message: format!(
+            "Write result uncertain ({detail}): {path} may or may not have been written. \
+             Check it with file-stat or read-file before retrying."
+        ),
+    };
+    let run = match run_shell_snippet(
+        cwd,
+        WRITE_FILE_SCRIPT,
+        &[
+            path,
+            if overwrite { "overwrite" } else { "create" },
+            if create_parents { "1" } else { "0" },
+            &expected,
+        ],
+        content,
+        "write-file",
+        WRITE_FILE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(run) => run,
+        // Still queued locally: nothing was sent.
+        Err(error) if error.to_string().contains("request queue timed out") => {
+            return Err(not_written(error.to_string()))
+        }
+        Err(Error::Tmux { message }) => return Err(uncertain(message)),
+        Err(error) => return Err(not_written(error.to_string())),
+    };
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+    let detail = |code: i32| {
+        if stderr.is_empty() {
+            format!("write-file exited with status {code}")
+        } else {
+            stderr.clone()
+        }
+    };
+    match (run.code, stdout.trim()) {
+        (0, "created") => Ok(true),
+        (0, "replaced") => Ok(false),
+        // WRITE_FILE_SCRIPT exits 2–11 only before the target is touched.
+        (code @ 2..=11, "") => Err(not_written(detail(code))),
+        // Anything else (e.g. ssh's 255 after a dropped connection) cannot prove either way.
+        (code, _) => Err(uncertain(detail(code))),
+    }
+}
+
+/// Store a script in the remote user's private cache and syntax-check it with `bash -n`.
+/// Files are never modified after creation (bash reads scripts incrementally); files
+/// older than 7 days are pruned so recent scripts stay available for inspection.
+const UPLOAD_SCRIPT: &str = r#"case $HOME in /?*) ;; *) echo "HOME is not an absolute path" >&2; exit 3 ;; esac
+d="$HOME/.cache/tmux-mcp/scripts"
+umask 077
+mkdir -p -- "$d" || exit 3
+# Pruning deletes files, so it runs only in a real directory owned by this account and only
+# on this account's own uuid-named scripts; anything else is left alone.
+if [ -L "$d" ] || [ "$(stat -c %u -- "$d" 2>/dev/null)" != "$(id -u)" ]; then
+  echo "script directory is not a private directory owned by this account: $d" >&2; exit 3
+fi
+find "$d" -maxdepth 1 -type f -user "$(id -u)" -name '????????-????-????-????-????????????.sh' -mtime +7 -exec rm -f -- {} + 2>/dev/null
+f="$d/$1.sh"
+cat > "$f.part" || { rm -f -- "$f.part"; exit 4; }
+# A truncated script can still pass `bash -n` (e.g. a path cut short); never keep one.
+size=$(( $(wc -c < "$f.part") ))
+if [ "$size" != "$2" ]; then rm -f -- "$f.part"; echo "incomplete transfer: received $size of $2 bytes" >&2; exit 5; fi
+mv -f -- "$f.part" "$f" || exit 4
+if ! bash -n "$f" 2> "$f.err"; then cat "$f.err" >&2; rm -f -- "$f" "$f.err"; exit 2; fi
+rm -f -- "$f.err"
+printf '%s\n' "$f""#;
+
+pub const SCRIPT_MAX_BYTES: usize = 64 * 1024;
+const UPLOAD_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upload a validated script for `script_id` (hex/uuid) and return its absolute path.
+pub async fn upload_script(script_id: &str, content: &[u8]) -> Result<String> {
+    if script_id.is_empty()
+        || !script_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(Error::InvalidArgument {
+            message: "invalid script id".to_string(),
+        });
+    }
+    let expected = content.len().to_string();
+    let run = run_shell_snippet(
+        "/",
+        UPLOAD_SCRIPT,
+        &[script_id, &expected],
+        content,
+        "upload-script",
+        UPLOAD_SCRIPT_TIMEOUT,
+    )
+    .await?;
+    let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+    match run.code {
+        0 => {
+            let path = String::from_utf8_lossy(&run.stdout).trim().to_string();
+            if path.starts_with('/') && path.ends_with(&format!("/{script_id}.sh")) {
+                Ok(path)
+            } else {
+                Err(Error::Tmux {
+                    message: format!("script upload returned an unexpected path: {path:?}"),
+                })
+            }
+        }
+        2 => Err(Error::InvalidArgument {
+            message: format!("script syntax check (bash -n) failed: {stderr}"),
+        }),
+        code => Err(Error::Tmux {
+            message: if stderr.is_empty() {
+                format!("script upload exited with status {code}")
+            } else {
+                stderr
+            },
+        }),
+    }
 }
 
 fn validate_read_path(path: &str) -> Result<()> {
@@ -1525,7 +2061,7 @@ pub async fn canonicalize_remote_path(path: &str) -> Result<String> {
     ssh_args.insert(0, "-n".to_string());
     ssh_args.push(build_remote_command("realpath", &["--", path]));
 
-    let output = Command::new("ssh")
+    let output = external("ssh")
         .args(&ssh_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1552,7 +2088,7 @@ pub async fn remote_path_is_symlink(path: &str) -> Result<bool> {
     ssh_args.insert(0, "-n".to_string());
     ssh_args.push(build_remote_command("test", &["-L", path]));
 
-    let output = Command::new("ssh")
+    let output = external("ssh")
         .args(&ssh_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1573,7 +2109,7 @@ pub async fn create_remote_dir(path: &str) -> Result<()> {
     ssh_args.insert(0, "-n".to_string());
     ssh_args.push(build_remote_command("mkdir", &["-p", "--", path]));
 
-    let output = Command::new("ssh")
+    let output = external("ssh")
         .args(&ssh_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3543,6 +4079,48 @@ pub async fn wait_for_signal(channel: &str, socket: Option<&str>) -> Result<()> 
     }
 }
 
+/// True when an error came from the SSH/network transport or a local request budget,
+/// not from tmux itself. Such failures say nothing about the remote command's state.
+pub fn is_transport_error(error: &Error) -> bool {
+    let Error::Tmux { message } = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    [
+        "ssh:",
+        "connection reset",
+        "connection closed",
+        "connection timed out",
+        "connection refused",
+        "broken pipe",
+        "client_loop",
+        "kex_exchange_identification",
+        "timed out after",
+        "request queue timed out",
+        "failed to spawn",
+        "failed to wait for",
+        "network is unreachable",
+        "no route to host",
+        "ssh session",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// True when tmux answered but the pane or its server no longer exists.
+pub fn is_missing_tmux_target(error: &Error) -> bool {
+    let Error::Tmux { message } = error else {
+        return false;
+    };
+    [
+        "can't find pane",
+        "no server running",
+        "error connecting to",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 /// Read a private exit-code buffer written by a tracked command wrapper.
 pub async fn read_exit_code_buffer(secret: &str, socket: Option<&str>) -> Result<i32> {
     let name = exit_code_buffer_name(secret);
@@ -3699,6 +4277,26 @@ fn chunk_literal_payload(keys: &str) -> Vec<String> {
 pub async fn paste_text(pane_id: &str, content: &str, socket: Option<&str>) -> Result<()> {
     let buffer_name = format!("__tmux_mcp_paste_{}", Uuid::new_v4());
     set_buffer(&buffer_name, content, socket).await?;
+    // A dropped connection can leave a truncated upload in the buffer. Pasting a cut heredoc
+    // or command line into a shell can run the wrong command, so paste only exact bytes.
+    if !content.is_empty() {
+        let staged = show_buffer_bytes(Some(&buffer_name), socket).await;
+        if staged.as_deref().ok() != Some(content.as_bytes()) {
+            let _ = delete_buffer(&buffer_name, socket).await;
+            return Err(Error::Tmux {
+                message: match staged {
+                    Ok(staged) => format!(
+                        "paste aborted before anything was typed: staged buffer has {} of {} bytes",
+                        staged.len(),
+                        content.len()
+                    ),
+                    Err(error) => {
+                        format!("paste aborted before anything was typed: {error}")
+                    }
+                },
+            });
+        }
+    }
     let result = execute_tmux_with_socket(
         &[
             "paste-buffer",
@@ -4722,6 +5320,342 @@ mod tests {
         assert_eq!(output, socket);
     }
 
+    #[tokio::test]
+    async fn pooled_ssh_reuses_one_connection_and_keeps_args_intact() {
+        let mut stub = TmuxStub::new();
+        let ssh_log = tempfile::NamedTempFile::new().expect("ssh log");
+        stub.set_var("TMUX_MCP_SSH", "pool-user@pool-host");
+        stub.set_var("TMUX_MCP_SSH_POOL", "1");
+        stub.set_var("TMUX_STUB_SSH_LOG", ssh_log.path());
+        let socket = "/tmp/tmux sock 'quoted'; echo bad";
+
+        for _ in 0..3 {
+            let output = execute_tmux_with_socket(&["socket-test"], Some(socket))
+                .await
+                .expect("socket test over pooled ssh");
+            assert_eq!(output, socket);
+        }
+        // Formats with braces and commas reach the remote shell quoted, never re-split.
+        let info = execute_tmux_with_socket(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "%1",
+                "#{?pane_active,1,0}|#{pane_current_path}",
+            ],
+            None,
+        )
+        .await
+        .expect("display-message over pooled ssh");
+        assert!(
+            info.contains("pane-one"),
+            "stub matched the intact format: {info}"
+        );
+        let temp_dir = tempdir().expect("tempdir");
+        fs::write(temp_dir.path().join("a.txt"), "pooled read").expect("fixture");
+        let (content, truncated) = execute_read_only_program(
+            &temp_dir.path().to_string_lossy(),
+            "cat",
+            &["a.txt"],
+            64,
+            &[0],
+        )
+        .await
+        .expect("read over pooled ssh");
+        assert_eq!(content, b"pooled read");
+        assert!(!truncated);
+
+        let (sessions, one_shot) = ssh_spawns(ssh_log.path());
+        assert_eq!(
+            (sessions, one_shot),
+            (1, 0),
+            "one ssh process for all requests"
+        );
+    }
+
+    /// (pooled session starts, one-shot ssh requests) recorded by the ssh stub log.
+    /// The session bootstrap spans several lines; count only each spawn's first line.
+    fn ssh_spawns(log: &Path) -> (usize, usize) {
+        let log = fs::read_to_string(log).expect("read ssh log");
+        let sessions = log
+            .lines()
+            .filter(|l| l.starts_with("exec bash -c"))
+            .count();
+        let one_shot = log
+            .lines()
+            .filter(|l| l.starts_with("tmux ") || l.starts_with("cd -- "))
+            .count();
+        (sessions, one_shot)
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_atomically_and_never_clobbers_by_default() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SSH");
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let target = dir.path().join("notes.txt");
+
+        assert!(write_file(&cwd, "notes.txt", b"first\n", false, false)
+            .await
+            .expect("create"));
+        assert_eq!(fs::read(&target).unwrap(), b"first\n");
+
+        let clobber = write_file(&cwd, "notes.txt", b"second\n", false, false)
+            .await
+            .expect_err("existing file must not be replaced without overwrite");
+        assert!(clobber.to_string().contains("already exists"), "{clobber}");
+        assert_eq!(fs::read(&target).unwrap(), b"first\n");
+
+        assert!(!write_file(&cwd, "notes.txt", b"second\n", true, false)
+            .await
+            .expect("overwrite"));
+        assert_eq!(fs::read(&target).unwrap(), b"second\n");
+
+        let missing = write_file(&cwd, "a/b/c.txt", b"x", false, false)
+            .await
+            .expect_err("missing parent");
+        assert!(missing.to_string().contains("createParents"), "{missing}");
+        assert!(write_file(&cwd, "a/b/c.txt", b"", false, true)
+            .await
+            .expect("create parents"));
+        assert_eq!(fs::read(dir.path().join("a/b/c.txt")).unwrap(), b"");
+
+        let not_file = write_file(&cwd, "a", b"x", true, false)
+            .await
+            .expect_err("directory target");
+        assert!(
+            not_file.to_string().contains("not a regular file"),
+            "{not_file}"
+        );
+        assert!(write_file(&cwd, "a/", b"x", true, false).await.is_err());
+
+        // Names starting with `-` are files, never options (`-tother` is not `ln -t other`).
+        fs::create_dir(dir.path().join("other")).unwrap();
+        assert!(write_file(&cwd, "-tother", b"dash\n", false, false)
+            .await
+            .expect("dash name"));
+        assert_eq!(fs::read(dir.path().join("-tother")).unwrap(), b"dash\n");
+        assert_eq!(fs::read_dir(dir.path().join("other")).unwrap().count(), 0);
+        assert!(write_file(&cwd, "-d/-f", b"x", false, true)
+            .await
+            .expect("dash directory"));
+        assert_eq!(fs::read(dir.path().join("-d/-f")).unwrap(), b"x");
+
+        // No temp files are left behind after success or refusal.
+        let leftovers = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".tmux-mcp-write")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_transfers_never_paste_write_or_keep_a_script() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SSH");
+        let paste_log = tempfile::NamedTempFile::new().unwrap();
+        stub.set_var("TMUX_STUB_PASTE_BUFFER_LOG", paste_log.path());
+
+        paste_text("%1", "echo whole line\n", None)
+            .await
+            .expect("exact paste");
+        assert_eq!(
+            fs::read_to_string(paste_log.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        stub.set_var("TMUX_STUB_LOAD_TRUNCATE", "3");
+        let error = paste_text("%1", "rm -rf /data/project/tmp/run\n", None)
+            .await
+            .expect_err("truncated buffer must not be pasted");
+        assert!(error.to_string().contains("paste aborted"), "{error}");
+        assert_eq!(
+            fs::read_to_string(paste_log.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "nothing pasted after a short upload"
+        );
+        stub.remove_var("TMUX_STUB_LOAD_TRUNCATE");
+
+        // write-file and script upload compare the received size with what was sent.
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        fs::write(dir.path().join("keep.txt"), "original\n").unwrap();
+        let run = run_shell_snippet(
+            &cwd,
+            WRITE_FILE_SCRIPT,
+            &["keep.txt", "overwrite", "0", "99"],
+            b"cut",
+            "write-file",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("snippet ran");
+        assert_eq!(run.code, 11);
+        assert!(String::from_utf8_lossy(&run.stderr).contains("incomplete transfer"));
+        assert_eq!(
+            fs::read(dir.path().join("keep.txt")).unwrap(),
+            b"original\n"
+        );
+
+        let home = tempdir().expect("home");
+        stub.set_var("HOME", home.path());
+        let run = run_shell_snippet(
+            "/",
+            UPLOAD_SCRIPT,
+            &["aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "99"],
+            b"rm -rf /data/hjk/",
+            "upload-script",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("snippet ran");
+        assert_eq!(run.code, 5);
+        let left = fs::read_dir(home.path().join(".cache/tmux-mcp/scripts"))
+            .unwrap()
+            .count();
+        assert_eq!(left, 0, "no truncated script is kept");
+    }
+
+    #[tokio::test]
+    async fn script_cache_pruning_only_removes_own_old_uuid_scripts() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SSH");
+        let home = tempdir().expect("home");
+        stub.set_var("HOME", home.path());
+        let dir = home.path().join(".cache/tmux-mcp/scripts");
+        fs::create_dir_all(&dir).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(10 * 24 * 3600);
+        let age = |name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, "echo old\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            path
+        };
+        let own_old = age("0f0e0d0c-0b0a-4908-8706-050403020100.sh");
+        let foreign_name = age("deploy.sh");
+        let recent = dir.join("11111111-2222-4333-8444-555555555555.sh");
+        fs::write(&recent, "echo recent\n").unwrap();
+
+        let path = upload_script("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", b"echo new\n")
+            .await
+            .expect("upload");
+        assert!(path.ends_with("/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.sh"));
+        assert!(!own_old.exists(), "own expired script is pruned");
+        assert!(
+            foreign_name.exists(),
+            "files not named by this tool are never deleted"
+        );
+        assert!(recent.exists(), "recent scripts are kept");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_cache_refuses_a_symlinked_directory() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SSH");
+        let home = tempdir().expect("home");
+        let elsewhere = tempdir().expect("shared dir");
+        stub.set_var("HOME", home.path());
+        fs::create_dir_all(home.path().join(".cache/tmux-mcp")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path(),
+            home.path().join(".cache/tmux-mcp/scripts"),
+        )
+        .unwrap();
+        let error = upload_script("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", b"echo new\n")
+            .await
+            .expect_err("symlinked cache must be refused");
+        assert!(error.to_string().contains("private directory"), "{error}");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_file_reports_a_lost_reply_as_uncertain_not_unwritten() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SSH", "drop-host");
+        stub.set_var("TMUX_STUB_SSH_DROP_REPLY", "1");
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        let error = write_file(&cwd, "out.txt", b"landed\n", false, false)
+            .await
+            .expect_err("reply was lost");
+        let message = error.to_string();
+        assert!(message.contains("Write result uncertain"), "{message}");
+        assert!(!message.contains("not written"), "{message}");
+        assert_eq!(fs::read(dir.path().join("out.txt")).unwrap(), b"landed\n");
+
+        // A refusal the script reported itself still proves the file is untouched.
+        stub.remove_var("TMUX_STUB_SSH_DROP_REPLY");
+        let refused = write_file(&cwd, "out.txt", b"again\n", false, false)
+            .await
+            .expect_err("exists");
+        assert!(
+            refused
+                .to_string()
+                .contains("File not written: file already exists"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_over_pooled_ssh_keeps_bytes_exact() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SSH", "write-host");
+        stub.set_var("TMUX_MCP_SSH_POOL", "1");
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        let content = "第一行 'quotes' \"double\" $HOME `tick`\n\ttab\r\nend";
+        assert!(
+            write_file(&cwd, "script.sh", content.as_bytes(), false, false)
+                .await
+                .expect("pooled write")
+        );
+        assert_eq!(
+            fs::read(dir.path().join("script.sh")).unwrap(),
+            content.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_pool_host_falls_back_to_one_shot_ssh() {
+        let mut stub = TmuxStub::new();
+        let ssh_log = tempfile::NamedTempFile::new().expect("ssh log");
+        stub.set_var("TMUX_MCP_SSH", "user@fallback-host");
+        stub.set_var("TMUX_MCP_SSH_POOL", "1");
+        stub.set_var("TMUX_STUB_SSH_LOG", ssh_log.path());
+        stub.set_var("TMPDIR", "/nonexistent/tmux-mcp-pool-test");
+        for _ in 0..2 {
+            let output = execute_tmux_with_socket(&["socket-test"], Some("/tmp/s"))
+                .await
+                .expect("fallback socket test");
+            assert_eq!(output, "/tmp/s");
+        }
+        // One failed session attempt, then one-shot per request; no repeated attempts.
+        assert_eq!(ssh_spawns(ssh_log.path()), (1, 2));
+    }
+
+    // Compares the remote `realpath` with a local path; Windows path forms differ.
+    #[cfg(unix)]
     #[tokio::test]
     async fn canonicalize_remote_path_uses_ssh_host() {
         let mut stub = TmuxStub::new();

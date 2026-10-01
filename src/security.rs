@@ -111,6 +111,10 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
         groups: &["file-read", "read", "agent-core"],
     },
     ToolManifestEntry {
+        name: "write-file",
+        groups: &["file-write", "agent-core"],
+    },
+    ToolManifestEntry {
         name: "gpu-snapshot",
         groups: &["gpu-monitor", "read", "agent-core"],
     },
@@ -712,7 +716,10 @@ impl SecurityPolicy {
         }
 
         let allowed = match tool_name {
-            "execute-command" | "get-command-result" => self.config.allow_execute_command,
+            // Writing arbitrary files is as powerful as running commands.
+            "execute-command" | "get-command-result" | "write-file" => {
+                self.config.allow_execute_command
+            }
             "send-keys" | "send-hex" | "paste-text" | "press-special-key" | "send-cancel"
             | "send-eof" | "send-escape" | "send-enter" | "send-tab" | "send-backspace"
             | "send-up" | "send-down" | "send-left" | "send-right" | "send-page-up"

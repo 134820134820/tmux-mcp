@@ -453,6 +453,132 @@ impl ControlClient {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingPause {
+    pub command_id: String,
+    pub pane_id: String,
+    pub target: String,
+    pub source: String,
+    pub reason: String,
+    pub updated_at_ms: u64,
+}
+
+impl TrackingPause {
+    fn directory(&self, paths: &StatePaths) -> io::Result<PathBuf> {
+        let id = Uuid::parse_str(&self.command_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(paths.directory.join("tracking-pauses").join(id.to_string()))
+    }
+
+    pub fn save(&self, paths: &StatePaths) -> io::Result<()> {
+        let directory = self.directory(paths)?;
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("pause.json");
+        if path.exists() {
+            return Ok(());
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+        serde_json::to_writer(&mut file, self)?;
+        match file.persist_noclobber(path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error.error),
+        }
+    }
+
+    pub fn recovery(&self, paths: &StatePaths) -> io::Result<&'static str> {
+        let directory = self.directory(paths)?;
+        match fs::read(directory.join("pause.json")) {
+            Ok(bytes) => {
+                let stored: Self = serde_json::from_slice(&bytes)?;
+                if stored.target != self.target || stored.pane_id != self.pane_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pause target mismatch",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        for (file, state) in [
+            ("resumed", "resumed"),
+            ("requested", "requested"),
+            ("pause.json", "paused"),
+        ] {
+            if directory.join(file).try_exists()? {
+                return Ok(state);
+            }
+        }
+        Ok("legacy")
+    }
+
+    pub fn request_resume(&self, paths: &StatePaths) -> io::Result<()> {
+        self.save(paths)?;
+        fs::write(self.directory(paths)?.join("requested"), b"")
+    }
+
+    fn confirm_resume(&self, paths: &StatePaths) -> io::Result<()> {
+        fs::write(self.directory(paths)?.join("resumed"), b"")
+    }
+}
+
+pub fn tracking_pauses(paths: &StatePaths) -> io::Result<Vec<TrackingPause>> {
+    let entries = match fs::read_dir(paths.directory.join("tracking-pauses")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut pauses = Vec::new();
+    for entry in entries {
+        let path = entry?.path().join("pause.json");
+        match fs::read(path) {
+            Ok(bytes) => pauses.push(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(pauses)
+}
+
+impl ControlClient {
+    /// Both the background loop and preflight use the same human recovery handshake.
+    pub async fn sync_tracking_pauses(&self, tracker: &CommandTracker) -> io::Result<()> {
+        sync_tracking_pauses(&self.paths, tracker, &self.source).await
+    }
+}
+
+pub async fn sync_tracking_pauses(
+    paths: &StatePaths,
+    tracker: &CommandTracker,
+    source: &str,
+) -> io::Result<()> {
+    for execution in tracker.tracking_failures().await {
+        let Some(target) = execution.target.clone() else {
+            continue;
+        };
+        let pause = TrackingPause {
+            command_id: execution.id.clone(),
+            pane_id: execution.pane_id.clone(),
+            target: target.clone(),
+            source: source.to_owned(),
+            reason: execution
+                .reason
+                .clone()
+                .unwrap_or_else(|| "无法确认命令是否完成".into()),
+            updated_at_ms: unix_time_ms(),
+        };
+        pause.save(paths)?;
+        if pause.recovery(paths)? == "requested"
+            && crate::targets::scope(target, tracker.acknowledge_uncertain(&execution.id)).await
+        {
+            pause.confirm_resume(paths)?;
+        }
+    }
+    Ok(())
+}
+
 impl StatePaths {
     pub fn new(directory: impl AsRef<Path>) -> Self {
         let directory = directory.as_ref().to_path_buf();

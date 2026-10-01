@@ -96,9 +96,21 @@ claude --dangerously-load-development-channels server:tmux
 
 **v0.6.1：** 根目录程序默认返回 21 个工具，包含 `list-targets`、`file-stat`、`gpu-snapshot`，目标操作的 schema 要求填写 `target`。
 
+**2026-10-02 版本：** 默认 22 个工具（启用 Claude Channel 后 25 个）。
+
+- **常驻 SSH 连接：** 每个 target 复用已建立的 SSH 连接，同一台机器上第二次起的读取和截屏从 4–11 秒降到 1 秒以内。远端需要 bash、base64、mktemp（Ubuntu 默认具备），不满足时自动回退为每次新建连接。设置 `TMUX_MCP_SSH_POOL=0` 可关闭。
+- **`write-file`：** 原子写入单个文本文件，默认不覆盖；`overwrite` 时只要目录可写就替换，并保留原权限；拒绝写穿符号链接。网络在写入完成前后断开时报告"结果不确定"，提示先检查再重试。它属于修改操作，受 Gate 审批约束。
+- **`execute-command` 的 `script`：** 多行 bash 脚本先上传到 `~/.cache/tmux-mcp/scripts/` 并用 `bash -n` 检查语法，再作为一条受追踪的 `bash <文件>` 执行。脚本在子 shell 中运行，`cd`/`export` 不会保留到 pane。脚本文件保留 7 天。
+- **`notify: true`：** 需要 `--claude-channel`，命令结束时通过 Channel 通知，替代反复轮询 `get-command-result`。
+- **网络中断不再暂停 AI：** 等待命令完成的 SSH 连接断开后，改为退避轮询远端退出码（输出很长、开始标记已滚出屏幕时同样能结束），只有 pane 或 tmux 服务确实消失时才报告状态不确定。
+- **未提交输入保护：** `paste-text`、不带回车的 `send-keys` 或方向键/Tab 等在空闲 pane 留下输入后，该 pane 的 `execute-command` 和下一次 `paste-text` 会被拒绝，直到按回车（`send-enter`）执行或 Ctrl-C（`send-cancel`）丢弃，避免两段内容拼成一条命令。只记录本 MCP 进程发出的输入。
+- **资源列表：** 只列出能读取的带 target 地址（每个 target 的 server/info、clients 和已追踪命令）；pane、window、session 通过 `tmux://{target}/…` 模板或 `get-tmux-state` 获取，列表时不再逐台连接。
+
+Windows 上自动使用系统自带的 OpenSSH（`C:\Windows\System32\OpenSSH\ssh.exe`）；Git 自带的 `ssh` 在这里会卡到超时，即使它在 PATH 中排在前面也不会被使用。需要指定其他 ssh 时设置 `TMUX_MCP_SSH_PROGRAM`。
+
 一个任务复用自己已确认可用的 pane；不接管陌生窗口或在残留输入后追加命令。发送失败、执行状态不确定时，停止修改并向用户报告，不自动清理、打断或换窗口重跑。只读查看不会解除保护。`detach` 默认关闭；开启仅取消完成追踪，仍保留窗口占用保护。
 
-长任务应事先安排程序日志，再使用 `read-file` 分段查看。MCP 不保存完整任务日志，也不会为补齐截断输出而重跑命令。
+长任务应事先安排程序日志，再使用 `read-file` 分段查看。MCP 不保存完整任务日志，也不会为补齐截断输出而重跑命令。写脚本或配置文件用 `write-file`，多行命令用 `execute-command` 的 `script`，不要用 `paste-text` 粘贴 heredoc。
 
 默认只暴露核心工具；需要 buffer、布局、重命名、删除等高级工具时，可增加 `--full-tools` 并重新连接。工具分类见 [docs/TOOL_SURFACE.md](docs/TOOL_SURFACE.md)。
 

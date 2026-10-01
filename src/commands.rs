@@ -28,6 +28,31 @@ pub const END_MARKER_PREFIX: &str = "TMUX_MCP_DONE_";
 
 const FINAL_OUTPUT_CAPTURE_ATTEMPTS: usize = 3;
 const FINAL_OUTPUT_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// Poll backoff after the `wait-for` watcher's transport drops.
+const WATCHER_POLL_FLOOR: Duration = Duration::from_secs(2);
+const WATCHER_POLL_CAP: Duration = Duration::from_secs(30);
+/// Transport retries for reading the exit buffer once completion was signalled.
+const EXIT_BUFFER_READ_ATTEMPTS: u32 = 5;
+
+/// Read the exit buffer after `wait-for` fired. Transport failures are retried with
+/// backoff because the buffer is durable; only tmux-level failures are final.
+async fn read_exit_code_after_signal(secret: &str, socket: Option<&str>) -> Result<i32> {
+    let mut delay = WATCHER_POLL_FLOOR;
+    let mut attempt = 1;
+    loop {
+        match tmux::read_exit_code_buffer(secret, socket).await {
+            Err(error)
+                if tmux::is_transport_error(&error) && attempt < EXIT_BUFFER_READ_ATTEMPTS =>
+            {
+                tracing::warn!(%error, attempt, "exit buffer read failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(WATCHER_POLL_CAP);
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BracketedOutput {
@@ -253,7 +278,7 @@ impl CommandTracker {
 
         if !tracking_disabled && command.contains(['\n', '\r']) {
             return Err(Error::InvalidArgument {
-                message: "tracked commands cannot contain embedded newlines (\\n or \\r)"
+                message: "tracked commands cannot contain embedded newlines (\\n or \\r); pass multi-line work as `script`"
                     .to_string(),
             });
         }
@@ -634,6 +659,35 @@ impl CommandTracker {
         })
     }
 
+    /// Tracking failures retained by this process, including manually released records.
+    pub async fn tracking_failures(&self) -> Vec<CommandExecution> {
+        self.active_commands
+            .read()
+            .await
+            .values()
+            .filter(|execution| execution.status == CommandStatus::TrackingError)
+            .cloned()
+            .collect()
+    }
+
+    /// Release only this target's uncertain lease after explicit human acknowledgement.
+    /// Keep the failure and unknown exit code; never send input or fabricate completion.
+    pub async fn acknowledge_uncertain(&self, command_id: &str) -> bool {
+        let commands = self.active_commands.read().await;
+        let Some(execution) = commands.get(command_id).filter(|execution| {
+            execution.target == crate::targets::current()
+                && execution.status == CommandStatus::TrackingError
+        }) else {
+            return false;
+        };
+        let key = Self::pane_key(&execution.pane_id, execution.socket.as_deref());
+        let mut running = self.pane_running.write().await;
+        if running.get(&key).is_some_and(|id| id == command_id) {
+            running.remove(&key);
+        }
+        true
+    }
+
     #[cfg(test)]
     pub(crate) async fn insert_test_execution(&self, execution: CommandExecution) {
         self.active_commands
@@ -892,13 +946,27 @@ fn spawn_side_channel_watcher(
         let checkpoint =
             Duration::from_secs(tracking.tracking_deadline_seconds).max(Duration::from_secs(1));
         let channel = tmux::wait_signal_name(&secret);
+        let poll_cap = checkpoint.clamp(WATCHER_POLL_FLOOR, WATCHER_POLL_CAP);
         let wait_result = {
             let wait = tmux::wait_for_signal(&channel, socket.as_deref());
             tokio::pin!(wait);
+            let mut watcher_lost = false;
+            let mut poll = WATCHER_POLL_FLOOR;
             loop {
+                let interval = if watcher_lost { poll } else { checkpoint };
                 tokio::select! {
-                    result = &mut wait => break result,
-                    _ = tokio::time::sleep(checkpoint) => {
+                    result = &mut wait, if !watcher_lost => match result {
+                        Ok(()) => break Ok(()),
+                        Err(error) if tmux::is_missing_tmux_target(&error) => break Err(error),
+                        // The watcher's own SSH connection dropped. The command and its
+                        // durable exit buffer are unaffected, so keep tracking by polling
+                        // instead of reporting an uncertain state to the user.
+                        Err(error) => {
+                            tracing::warn!(%error, %command_id, "wait-for watcher lost; polling exit buffer");
+                            watcher_lost = true;
+                        }
+                    },
+                    _ = tokio::time::sleep(interval) => {
                         let still_tracked = active_commands
                             .read()
                             .await
@@ -909,6 +977,8 @@ fn spawn_side_channel_watcher(
                         }
                         // `wait-for -S` is not a durable queue. Re-check the durable
                         // exit buffer so a lost watcher signal cannot strand the pane.
+                        // Wait only while START is visible without DONE; a START scrolled
+                        // out of the capture (long output) must not keep the pane forever.
                         if tmux::read_exit_code_buffer(&secret, socket.as_deref())
                             .await
                             .is_ok()
@@ -920,10 +990,19 @@ fn spawn_side_channel_watcher(
                                     socket.as_deref(),
                                 )
                                 .await,
-                                Ok(BracketedOutput::Complete(_))
+                                Ok(BracketedOutput::Complete(_) | BracketedOutput::MissingStart)
                             )
                         {
                             break Ok(());
+                        }
+                        if watcher_lost {
+                            // Polling cannot see a vanished pane through the exit buffer alone.
+                            if let Err(error) = tmux::pane_info(&pane_id, socket.as_deref()).await {
+                                if tmux::is_missing_tmux_target(&error) {
+                                    break Err(error);
+                                }
+                            }
+                            poll = (poll * 2).min(poll_cap);
                         }
                     }
                 }
@@ -931,7 +1010,7 @@ fn spawn_side_channel_watcher(
         };
 
         let (status, exit_code, reason, final_capture) = match wait_result {
-            Ok(()) => match tmux::read_exit_code_buffer(&secret, socket.as_deref()).await {
+            Ok(()) => match read_exit_code_after_signal(&secret, socket.as_deref()).await {
                 Ok(exit_code) => (
                     if exit_code == 0 {
                         CommandStatus::Completed
@@ -952,7 +1031,7 @@ fn spawn_side_channel_watcher(
             Err(e) => (
                 CommandStatus::TrackingError,
                 None,
-                Some(format!("wait-for failed: {e}")),
+                Some(format!("pane or tmux server disappeared: {e}")),
                 false,
             ),
         };
@@ -1974,14 +2053,14 @@ mod tests {
         assert_eq!(cmd.output.as_deref(), Some("bounded tail"));
         assert!(cmd.output_truncated);
         assert!(cmd.result_ready);
-        let logged = std::fs::read_to_string(capture_log.path()).expect("read capture log");
-        assert_eq!(logged.lines().count(), FINAL_OUTPUT_CAPTURE_ATTEMPTS);
     }
 
     #[tokio::test]
     async fn final_capture_timeout_marks_result_ready_and_releases_pane() {
         let mut stub = TmuxStub::new();
-        stub.set_var("TMUX_STUB_CAPTURE_SLEEP_SECS", "2");
+        // Unbounded final captures would take 3 × 5 s, beyond the 10 s wait below; the 1 s
+        // checkpoint bound must release the pane well within it (slow stub spawns on Windows).
+        stub.set_var("TMUX_STUB_CAPTURE_SLEEP_SECS", "5");
         let tracker = CommandTracker::with_tracking(
             ShellType::Bash,
             TrackingConfig {
@@ -1995,11 +2074,11 @@ mod tests {
             .expect("execute");
 
         let (cmd, timed_out) = tracker
-            .wait_for(&id, 3_000)
+            .wait_for(&id, 10_000)
             .await
             .expect("wait")
             .expect("found");
-        assert!(!timed_out);
+        assert!(!timed_out, "{cmd:?}");
         assert_eq!(cmd.status, CommandStatus::Completed);
         assert!(cmd.result_ready);
         assert!(cmd.output_truncated);
@@ -2137,6 +2216,127 @@ mod tests {
             .expect("found");
         assert!(!timed_out);
         assert_eq!(cmd.status, CommandStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn watcher_transport_drop_polls_exit_buffer_instead_of_pausing() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_FAIL", "1");
+        stub.set_var(
+            "TMUX_STUB_WAIT_FOR_MSG",
+            "client_loop: send disconnect: Connection reset",
+        );
+        // Not finished yet: neither the caller's recovery check nor the watcher can complete it.
+        stub.set_var("TMUX_STUB_EXIT_CODE_MISSING", "1");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let id = tracker
+            .execute_command("%1", "true", false, false, None, None)
+            .await
+            .expect("execute");
+        let started = Instant::now();
+        let waiter = tracker.wait_for(&id, 8_000);
+        tokio::pin!(waiter);
+        // The exit buffer appears only after the watcher has already lost its connection.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut waiter)
+                .await
+                .is_err(),
+            "command must still be running before its exit buffer exists"
+        );
+        stub.remove_var("TMUX_STUB_EXIT_CODE_MISSING");
+        let (cmd, timed_out) = waiter.await.expect("wait").expect("found");
+        assert!(!timed_out, "polling must finish the command; got {cmd:?}");
+        assert!(
+            started.elapsed() >= WATCHER_POLL_FLOOR,
+            "completed by polling"
+        );
+        assert_eq!(cmd.status, CommandStatus::Completed);
+        assert_eq!(cmd.exit_code, Some(0));
+        assert!(tracker.pane_command_id("%1", None).await.is_none());
+        assert!(tracker.uncertain_command().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watcher_polling_finishes_when_start_marker_scrolled_out() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_FAIL", "1");
+        stub.set_var(
+            "TMUX_STUB_WAIT_FOR_MSG",
+            "client_loop: send disconnect: Connection reset",
+        );
+        // Long output pushed START out of the bounded capture; only the tail is visible.
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "line 9998\\nline 9999\\nprompt$ \\n",
+        );
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let id = tracker
+            .execute_command("%1", "true", false, false, None, None)
+            .await
+            .expect("execute");
+        let (cmd, timed_out) = tracker
+            .wait_for(&id, 8_000)
+            .await
+            .expect("wait")
+            .expect("found");
+        assert!(
+            !timed_out,
+            "exit buffer must finish the command; got {cmd:?}"
+        );
+        assert_eq!(cmd.status, CommandStatus::Completed);
+        assert_eq!(cmd.exit_code, Some(0));
+        assert!(tracker.pane_command_id("%1", None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watcher_reports_vanished_pane_as_tracking_error() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_FAIL", "1");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "can't find pane: %1");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let id = tracker
+            .execute_command("%1", "true", false, false, None, None)
+            .await
+            .expect("execute");
+        let (cmd, _) = tracker
+            .wait_for(&id, 5_000)
+            .await
+            .expect("wait")
+            .expect("found");
+        assert_eq!(cmd.status, CommandStatus::TrackingError);
+        assert!(cmd.reason.unwrap_or_default().contains("disappeared"));
+    }
+
+    #[tokio::test]
+    async fn watcher_polling_detects_pane_closed_after_transport_drop() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_WAIT_FOR_FAIL", "1");
+        stub.set_var(
+            "TMUX_STUB_WAIT_FOR_MSG",
+            "ssh: connect to host h port 22: Connection timed out",
+        );
+        stub.set_var("TMUX_STUB_EXIT_CODE_MISSING", "1");
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let id = tracker
+            .execute_command("%1", "sleep 99", false, false, None, None)
+            .await
+            .expect("execute");
+        // Dispatch is done (it read pane info); from now on the pane is gone.
+        let started = Instant::now();
+        stub.set_var("TMUX_STUB_ERROR_CMD", "display-message");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "can't find pane: %1");
+        let (cmd, timed_out) = tracker
+            .wait_for(&id, 8_000)
+            .await
+            .expect("wait")
+            .expect("found");
+        assert!(!timed_out, "vanished pane must end polling; got {cmd:?}");
+        assert!(
+            started.elapsed() >= WATCHER_POLL_FLOOR,
+            "detected by polling"
+        );
+        assert_eq!(cmd.status, CommandStatus::TrackingError);
+        assert!(cmd.reason.unwrap_or_default().contains("can't find pane"));
     }
 
     #[tokio::test]

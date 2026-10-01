@@ -75,7 +75,32 @@ case "$cmd" in
   list-buffers)
     printf '%b' "${TMUX_STUB_LIST_BUFFERS:-buffer0\t10\t1700000000}"
     ;;
+  load-buffer)
+    # load-buffer -b NAME - : keep the bytes so show-buffer can return them.
+    name=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-b" ]; then name="$2"; shift; fi
+      shift
+    done
+    if [ -n "$name" ] && [ -n "${TMUX_STUB_DIR:-}" ]; then
+      cat > "$TMUX_STUB_DIR/buffer-$name"
+      if [ -n "${TMUX_STUB_LOAD_TRUNCATE:-}" ]; then
+        head -c "$TMUX_STUB_LOAD_TRUNCATE" "$TMUX_STUB_DIR/buffer-$name" > "$TMUX_STUB_DIR/buffer-$name.cut"
+        mv "$TMUX_STUB_DIR/buffer-$name.cut" "$TMUX_STUB_DIR/buffer-$name"
+      fi
+    else
+      cat > /dev/null
+    fi
+    ;;
   show-buffer)
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "-b" ] && [ -n "${TMUX_STUB_DIR:-}" ] && [ -f "$TMUX_STUB_DIR/buffer-$arg" ]; then
+        cat "$TMUX_STUB_DIR/buffer-$arg"
+        exit 0
+      fi
+      prev="$arg"
+    done
     # Side-channel exit buffers use -b tmux-mcp-ec-<secret>
     for arg in "$@"; do
       case "$arg" in
@@ -96,7 +121,7 @@ case "$cmd" in
       sleep "${TMUX_STUB_WAIT_FOR_SLEEP_SECS}"
     fi
     if [ "${TMUX_STUB_WAIT_FOR_FAIL:-}" = "1" ]; then
-      echo "${TMUX_STUB_ERROR_MSG:-wait-for failed}" 1>&2
+      echo "${TMUX_STUB_WAIT_FOR_MSG:-${TMUX_STUB_ERROR_MSG:-wait-for failed}}" 1>&2
       exit 1
     fi
     ;;
@@ -150,7 +175,8 @@ case "$cmd" in
       *#{window_layout}*)
         printf '%b' "${TMUX_STUB_WINDOW_INFO_OUTPUT:-@1\tfirst\t%1\t1\tlayout\t2\t80\t24\t0\t%1}"
         ;;
-      *#{pane_current_path}*)
+      # pane_info escapes its fields (`#{s,...:pane_current_path}`), so match the name only.
+      *pane_current_path*)
         printf '%b' "${TMUX_STUB_PANE_INFO_OUTPUT:-%1\t@1\t%1\t1\tpane-one\t/tmp\tbash\t80\t24\t1234\t0}"
         ;;
       *)
@@ -197,7 +223,7 @@ case "$cmd" in
       printf '%s\n' "delete-buffer $*" >> "$TMUX_STUB_DELETE_BUFFER_LOG"
     fi
     ;;
-  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|set-buffer|load-buffer|delete-buffer)
+  kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|set-buffer|delete-buffer)
     ;;
   *)
     echo "unknown command: $cmd" 1>&2
@@ -218,6 +244,12 @@ done
 export TMUX_STUB_SSH_SEEN=1
 if [ -n "${TMUX_STUB_SSH_LOG:-}" ]; then
   printf '%s\n' "$remote_command" >> "$TMUX_STUB_SSH_LOG"
+fi
+# Simulate a connection that drops after the remote command finished: the reply is lost.
+if [ -n "${TMUX_STUB_SSH_DROP_REPLY:-}" ]; then
+  sh -c "$remote_command" >/dev/null 2>&1
+  echo "client_loop: send disconnect: Connection reset" 1>&2
+  exit 255
 fi
 exec sh -c "$remote_command"
 "#;
@@ -245,13 +277,19 @@ impl TmuxStub {
             original_vars: Vec::new(),
         };
 
-        let mut path = OsString::new();
-        path.push(stub._dir.path());
-        path.push(OsStr::new(":"));
+        let mut paths = vec![stub._dir.path().to_path_buf()];
         if let Some(existing) = env::var_os("PATH") {
-            path.push(existing);
+            paths.extend(env::split_paths(&existing));
         }
+        let path = env::join_paths(paths).expect("join PATH");
         stub.set_var("PATH", path);
+        // `tmux::external` runs these scripts through `sh` (required on Windows).
+        let stub_dir = stub._dir.path().to_path_buf();
+        stub.set_var("TMUX_STUB_DIR", stub_dir);
+        // Pooled sessions capture the stub env at connect time and belong to one test
+        // runtime; tests opt in explicitly and never inherit another test's sessions.
+        stub.set_var("TMUX_MCP_SSH_POOL", "0");
+        crate::ssh_pool::clear();
         let command_id_file = stub._dir.path().join("command-id");
         stub.set_var("TMUX_STUB_COMMAND_ID_FILE", command_id_file);
 
@@ -280,6 +318,7 @@ impl TmuxStub {
 
 impl Drop for TmuxStub {
     fn drop(&mut self) {
+        crate::ssh_pool::clear();
         for (key, value) in self.original_vars.drain(..) {
             if let Some(value) = value {
                 env::set_var(key, value);

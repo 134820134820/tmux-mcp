@@ -1,0 +1,22 @@
+# Progress
+- Release complete: commit ed8ba3c pushed to origin/main (normal fast-forward, includes pre-existing d7b6709). Verified HEAD/origin parity, installed v0.6.1, and local Web HTTP 200. No tracked product changes remain. Planning files and executable backup remain local. No GitHub release tag/registry publication requested or performed.
+- Installed v0.6.1 via rename-and-place without stopping any MCP child. Backup: target/deployment-backups/tmux-mcp-before-0.6.1-20260922-025317.exe. Installed SHA256: 0FDBDF621A62CA70B659AE50F14F16941F884C0F068211C1A25908E756FE9D67. All three isolated stdio probe scenarios also passed against the installed path. Old clients retain state and require reconnection to adopt the binary.
+- Port 38473 was unused. Started the installed local Web log hub hidden (PID 38712), with SSH-related environment cleared; GET / returned HTTP 200. No API topology/remote requests issued. Updated product docs for installed version and new boundaries.
+- Release follow-up: user excluded complete-output storage from MCP scope; added logging/truncation guidance only. SSH reuse remains deferred. Implemented anomaly stop/report without auto-recovery, retained input failures and pane leases, kept detach false by default with occupancy/raw-policy checks and immediate untracked snapshots.
+- Native verification: clippy all-targets clean; 107 selected unit checks plus 55 CLI/control/client/UI checks pass, new safety/pause/detach regressions pass, timing script passes. Broad selection exposed POSIX absolute buffer paths misclassified on Windows: corrected platform handling and made one filesystem test self-contained. WSL unavailable; no remote test used.
+- Built v0.6.1. Isolated stdio probe with native fake ssh/tmux binaries passed ambiguous delivery blocking, read-only inspection, detached occupancy/no pointless wait, tracked completion and pane reuse, verbose behavior, and 21-tool required-target schemas. Production SSH could not be reached because probe PATH contains only fakes. uv cache access denied initially; workspace-local UV_CACHE_DIR resolved it.
+- Origin fetch succeeded: local HEAD has one pre-existing unpushed commit, origin is not ahead. Local path-validated inventory found three root executable MCP children and no Web process.
+- Follow-up: recorded item 2 confirmation and items 3/5/7/8 feedback; assessed SSH payoff/platform limits and traced the capture-based release gap. Documentation only in this follow-up; no connection reuse, pane safety behavior, detach change, deployment, or remote action.
+- Restored previous conversation and planning records, verified installed tool schemas with a local-only process, and read repository/skill instructions.
+- September 22: recorded user choices; tracing existing logging and read-only subprocess execution before selecting changes.
+- Added per-request transport measurements to existing action records and subprocess entry points; library compiles offline.
+- Corrected standalone ampersand detection and made wait timeout return cached state without extra capture. Both focused regression tests passed locally.
+- Added concise reuse guidance to server and create/split tool descriptions, retaining explicit session creation.
+- Added file-stat and gpu-snapshot using the existing bounded fixed-argument runner; target is now schema-required.
+- Fixed multi-target occupancy/query/purge isolation and resource URIs; local isolation test passed.
+- Fixed pre-existing server test construction fields (raw/verbose/detach) so cargo check --tests succeeds.
+- Passed timing-scope, subprocess success/error/truncation, metadata parsing, tool-policy/schema, local Hub persistence, and PowerShell summary regression checks.
+- cargo clippy --offline --all-targets -- -D warnings passed after resolving match formatting, implementation placement, and documenting library-only refresh APIs.
+- Passed all 55 tests in cli/control/control_client/web_ui. New focused regressions and the timing-summary script also pass.
+- Local-only MCP probe (empty PATH, SSH-related environment removed) confirmed 21 tools, required target fields, read-only snapshot annotations, and missing-target rejection before execution.
+- Verified the installed executable hash is unchanged. No remote measurements or connections occurred. Documented visibility/verbosity/detach behavior and the opt-in saved-output proposal in docs/IMPROVEMENTS.md.

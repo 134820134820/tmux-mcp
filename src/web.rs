@@ -21,9 +21,9 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::commands::{CommandEventKind, CommandTracker};
 use crate::control::{
-    clear_ai_pause, set_gate_mode, ActionKind, ActionRecord, ActionStatus, AiPause,
-    AuthorizationResponse, GateDecision, GateMode, StatePaths, ACTION_SCHEMA_VERSION,
-    AGENT_RECORD_MAX_BYTES,
+    clear_ai_pause, set_gate_mode, sync_tracking_pauses, tracking_pauses, ActionKind, ActionRecord,
+    ActionStatus, AiPause, AuthorizationResponse, GateDecision, GateMode, StatePaths,
+    TrackingPause, ACTION_SCHEMA_VERSION, AGENT_RECORD_MAX_BYTES,
 };
 use crate::security::SecurityPolicy;
 use crate::tmux;
@@ -102,6 +102,7 @@ struct StateResponse {
     target: String,
     targets: BTreeMap<String, crate::targets::TargetConfig>,
     ai_pause: Option<AiPause>,
+    tracking_errors: Vec<TrackingErrorNotice>,
     gate_enabled: bool,
     gate_mode: GateMode,
     pending: Vec<ActionRecord>,
@@ -112,6 +113,26 @@ struct StateResponse {
     topology_error: Option<String>,
     pane_info: Option<PaneInfo>,
     activity: HashMap<String, u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackingErrorNotice {
+    command_id: String,
+    pane_id: String,
+    target: String,
+    source: String,
+    reason: String,
+    updated_at_ms: u64,
+    recovery: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResumeTrackingInput {
+    target: String,
+    command_id: String,
+    confirmed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,8 +260,18 @@ pub fn build_router(
     let event_tracker = Arc::clone(&tracker);
     let event_hub = hub.clone();
     crate::targets::spawn(async move {
+        let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
         loop {
-            match events.recv().await {
+            let event = tokio::select! {
+                event = events.recv() => event,
+                _ = recovery_tick.tick() => {
+                    if let Err(error) = sync_tracking_pauses(event_hub.paths(), &event_tracker, "Web").await {
+                        tracing::warn!(%error, "unable to synchronize Web tracking pause recovery");
+                    }
+                    continue;
+                }
+            };
+            match event {
                 Ok(event) if event.kind == CommandEventKind::Terminal => {
                     if let Some(execution) = event_tracker.get_command(&event.command_id).await {
                         let recorded = event_hub
@@ -278,6 +309,7 @@ pub fn build_router(
         .route("/api/state", get(api_state))
         .route("/api/gate", put(api_gate))
         .route("/api/ai-pause/clear", put(api_clear_ai_pause))
+        .route("/api/ai-pause/resume-tracking", put(api_resume_tracking))
         .route("/api/approvals/:id", put(api_approval))
         .route("/api/agent/authorize", post(agent_authorize))
         .route("/api/agent/record", post(agent_record))
@@ -412,8 +444,9 @@ async fn api_state_for_target(
         }
         _ => None,
     };
+    let records = context.hub.all_records().await;
     let mut activity = HashMap::new();
-    for record in context.hub.all_records().await {
+    for record in &records {
         for pane_id in &record.target.pane_ids {
             activity
                 .entry(pane_id.clone())
@@ -426,6 +459,17 @@ async fn api_state_for_target(
     Json(StateResponse {
         target: target.clone(),
         targets: context.targets.targets.clone(),
+        tracking_errors: tracking_notices(context.hub.paths(), &target).unwrap_or_else(|error| {
+            vec![TrackingErrorNotice {
+                command_id: String::new(),
+                pane_id: "未知".into(),
+                target: target.clone(),
+                source: "控制服务".into(),
+                reason: format!("无法读取暂停状态：{error}"),
+                updated_at_ms: 0,
+                recovery: "error".into(),
+            }]
+        }),
         ai_pause: context.hub.paths().ai_pause().unwrap_or_else(|_| {
             Some(AiPause {
                 pane_id: "未知".into(),
@@ -460,6 +504,76 @@ async fn api_state_for_target(
         pane_info,
         activity,
     })
+}
+
+// Historical command failures are not live pauses. Only show persisted pause state.
+// A resume request is not a successful recovery until the owning tracker acknowledges it.
+// ponytail: no client heartbeat; saved pauses are last known state, not process liveness.
+fn tracking_notices(paths: &StatePaths, target: &str) -> io::Result<Vec<TrackingErrorNotice>> {
+    let mut notices = Vec::new();
+    for pause in tracking_pauses(paths)?
+        .into_iter()
+        .filter(|pause| pause.target == target)
+    {
+        notices.push(TrackingErrorNotice {
+            recovery: pause.recovery(paths)?.into(),
+            command_id: pause.command_id,
+            pane_id: pause.pane_id,
+            target: pause.target,
+            source: pause.source,
+            reason: pause.reason,
+            updated_at_ms: pause.updated_at_ms,
+        });
+    }
+    notices.sort_by_key(|notice| std::cmp::Reverse(notice.updated_at_ms));
+    Ok(notices)
+}
+
+async fn api_resume_tracking(
+    State(context): State<AppContext>,
+    Json(input): Json<ResumeTrackingInput>,
+) -> Response {
+    if !input.confirmed || uuid::Uuid::parse_str(&input.command_id).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "explicit confirmation and valid commandId required",
+        )
+            .into_response();
+    }
+    if let Err(error) = resolve_target(&context, Some(&input.target)) {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let notices = match tracking_notices(context.hub.paths(), &input.target) {
+        Ok(notices) => notices,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let Some(notice) = notices
+        .into_iter()
+        .find(|notice| notice.command_id == input.command_id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            "no matching pause for this target and command",
+        )
+            .into_response();
+    };
+    if notice.recovery == "legacy" {
+        return (StatusCode::CONFLICT, "此暂停来自旧版 MCP，无法热恢复。请在对应客户端重新连接 tmux MCP 以加载恢复功能；这条历史记录不会被标成恢复成功。").into_response();
+    }
+    let pause = TrackingPause {
+        command_id: notice.command_id,
+        pane_id: notice.pane_id,
+        target: notice.target,
+        source: notice.source,
+        reason: notice.reason,
+        updated_at_ms: notice.updated_at_ms,
+    };
+    match pause.request_resume(context.hub.paths()) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"ok": true, "recovery": pause.recovery(context.hub.paths()).unwrap_or("requested")}))).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 fn record_matches_target(record: &ActionRecord, target: &str) -> bool {
@@ -883,6 +997,173 @@ mod tests {
     use super::*;
     use crate::types::{CommandExecution, CommandStatus, ShellType};
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn human_resume_releases_only_the_owning_target_and_waits_for_client_ack() {
+        use crate::control::ControlClient;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(dir.path());
+        let hub = HubState::open(paths.clone()).unwrap();
+        let tracker = CommandTracker::new(ShellType::Bash);
+        let client =
+            ControlClient::new("http://127.0.0.1:9", "Claude Code", paths.clone()).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let execution = CommandExecution {
+            target: Some("seven-intern".into()),
+            id: id.clone(),
+            pane_id: "%5".into(),
+            socket: None,
+            command: "training".into(),
+            status: CommandStatus::TrackingError,
+            exit_code: None,
+            output: None,
+            output_truncated: true,
+            result_ready: true,
+            reason: Some("missing exit buffer".into()),
+            started_at: Instant::now(),
+            completed_at: Some(Instant::now()),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+        crate::targets::scope(
+            "seven-intern".into(),
+            tracker.insert_test_occupant(execution.clone()),
+        )
+        .await;
+        let mut other = execution.clone();
+        other.id = uuid::Uuid::new_v4().to_string();
+        other.target = Some("eight-intern".into());
+        crate::targets::scope(
+            "eight-intern".into(),
+            tracker.insert_test_occupant(other.clone()),
+        )
+        .await;
+        client.sync_tracking_pauses(&tracker).await.unwrap();
+        assert_eq!(
+            tracking_notices(&paths, "seven-intern").unwrap()[0].recovery,
+            "paused"
+        );
+        assert!(
+            !crate::targets::scope("eight-intern".into(), tracker.acknowledge_uncertain(&id)).await
+        );
+        let context = AppContext {
+            hub,
+            token: Arc::from("a".repeat(64)),
+            policy: Arc::new(SecurityPolicy::default()),
+            socket: None,
+            tracker: Arc::new(CommandTracker::new(ShellType::Bash)),
+            topology_cache: Arc::new(Mutex::new(TopologyCache::default())),
+            pane_info_cache: Arc::new(Mutex::new(None)),
+            targets: Arc::new(
+                crate::targets::TargetsFile::parse(
+                    "[targets.seven-intern]\n[targets.eight-intern]",
+                )
+                .unwrap(),
+            ),
+            default_target: "seven-intern".into(),
+        };
+        for (target, command, confirmed, expected) in [
+            ("seven-intern", id.as_str(), false, StatusCode::BAD_REQUEST),
+            ("eight-intern", id.as_str(), true, StatusCode::NOT_FOUND),
+            ("unknown", id.as_str(), true, StatusCode::BAD_REQUEST),
+            ("seven-intern", "../escape", true, StatusCode::BAD_REQUEST),
+            ("seven-intern", id.as_str(), true, StatusCode::ACCEPTED),
+        ] {
+            let response = api_resume_tracking(
+                State(context.clone()),
+                Json(ResumeTrackingInput {
+                    target: target.into(),
+                    command_id: command.into(),
+                    confirmed,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+        }
+        // HTTP acceptance is only a request, not proof that the owning client resumed.
+        assert_eq!(
+            tracking_notices(&paths, "seven-intern").unwrap()[0].recovery,
+            "requested"
+        );
+        assert!(
+            crate::targets::scope("seven-intern".into(), tracker.uncertain_command())
+                .await
+                .is_some()
+        );
+        client.sync_tracking_pauses(&tracker).await.unwrap();
+        assert!(
+            crate::targets::scope("seven-intern".into(), tracker.uncertain_command())
+                .await
+                .is_none()
+        );
+        assert!(
+            crate::targets::scope("eight-intern".into(), tracker.uncertain_command())
+                .await
+                .is_some()
+        );
+        let result = tracker.get_command(&id).await.unwrap();
+        assert_eq!(result.status, CommandStatus::TrackingError);
+        assert_eq!(result.exit_code, None);
+        assert_eq!(
+            tracking_notices(&paths, "seven-intern").unwrap()[0].recovery,
+            "resumed"
+        );
+        // Replayed requests must not release a new occupant of the same pane.
+        let mut newer = execution;
+        newer.id = uuid::Uuid::new_v4().to_string();
+        crate::targets::scope(
+            "seven-intern".into(),
+            tracker.insert_test_occupant(newer.clone()),
+        )
+        .await;
+        client.sync_tracking_pauses(&tracker).await.unwrap();
+        assert_eq!(
+            crate::targets::scope("seven-intern".into(), tracker.pane_command_id("%5", None)).await,
+            Some(newer.id)
+        );
+        let reopened = HubState::open(paths.clone()).unwrap();
+        assert!(tracking_notices(reopened.paths(), "seven-intern")
+            .unwrap()
+            .iter()
+            .any(|notice| notice.command_id == id && notice.recovery == "resumed"));
+        let mut legacy_record = ActionRecord::new(
+            "old client",
+            "get-command-result",
+            json!({"target":"seven-intern"}),
+        );
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        legacy_record.result = Some(
+            json!({"structuredContent": {"commandId":legacy_id,"paneId":"%9","status":"tracking_error"}}),
+        );
+        context.hub.upsert(legacy_record).await.unwrap();
+        let legacy_response = api_resume_tracking(
+            State(context.clone()),
+            Json(ResumeTrackingInput {
+                target: "seven-intern".into(),
+                command_id: legacy_id,
+                confirmed: true,
+            }),
+        )
+        .await;
+        assert_eq!(legacy_response.status(), StatusCode::NOT_FOUND);
+        // Old records survive reload as history but cannot recreate a pause banner.
+        let reopened = HubState::open(paths.clone()).unwrap();
+        let notices = tracking_notices(reopened.paths(), "seven-intern").unwrap();
+        assert_eq!(notices.len(), 2); // only the two persisted pauses, not the legacy record
+        assert!(notices.iter().all(|notice| notice.source != "old client"));
+        // Lost-owner requests stay pending, never green.
+        let legacy = TrackingPause {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: "%9".into(),
+            target: "seven-intern".into(),
+            source: "old client".into(),
+            reason: "lost state".into(),
+            updated_at_ms: 0,
+        };
+        legacy.request_resume(&paths).unwrap();
+        client.sync_tracking_pauses(&tracker).await.unwrap();
+        assert_eq!(legacy.recovery(&paths).unwrap(), "requested");
+    }
 
     #[test]
     fn topology_cache_reuses_fresh_errors_and_expires_stale_data() {

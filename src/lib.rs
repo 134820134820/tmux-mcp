@@ -14,6 +14,8 @@ pub mod errors;
 pub mod gpu_monitor;
 /// Security policy: tool surface, allowlists, command filters, buffer path sandbox.
 pub mod security;
+/// Persistent SSH sessions so remote requests skip the per-call handshake.
+pub mod ssh_pool;
 pub mod targets;
 pub mod timing;
 /// Local/SSH tmux process adapter, parsers, and buffer search.

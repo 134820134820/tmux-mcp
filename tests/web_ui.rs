@@ -66,6 +66,22 @@ fn safe_read_tools_render_as_clean_pane_messages() {
 }
 
 #[test]
+fn file_writes_and_scripts_render_their_content() {
+    for marker in [
+        r#"record.tool === "write-file""#,
+        "args.content",
+        "structured.bytesWritten",
+        // A script card shows the script, not its `bash <file>` launcher line.
+        "record.arguments?.script || snapshot.command",
+    ] {
+        assert!(
+            PAGE.contains(marker),
+            "missing write/script message marker: {marker}"
+        );
+    }
+}
+
+#[test]
 fn safe_git_tools_render_as_clean_pane_messages() {
     for marker in [
         r#"record.tool === "git-status""#,
@@ -422,7 +438,7 @@ fn page_uses_the_light_theme_contract() {
 }
 
 #[test]
-fn ai_pause_is_an_inline_composer_banner_with_a_clear_action() {
+fn safety_banners_are_visible_outside_both_pane_modes() {
     for marker in [
         r#"id="ai-pause-banner""#,
         "AI 操作已暂停",
@@ -431,7 +447,16 @@ fn ai_pause_is_an_inline_composer_banner_with_a_clear_action() {
         r#"api("/api/ai-pause/clear""#,
         "renderAiPause(state.aiPause)",
         ".ai-pause-banner[hidden] { display: none; }",
+        r#"id="tracking-errors""#,
+        "renderTrackingErrors(state.trackingErrors)",
+        "确认后恢复 AI 操作",
+        "恢复申请待确认",
+        "本条暂停已解除（客户端已确认）",
     ] {
         assert!(PAGE.contains(marker), "missing AI pause marker: {marker}");
     }
+    let main = PAGE.split_once("<main>").unwrap().1;
+    let view = main.find(r#"id="messages-view""#).unwrap();
+    assert!(main.find(r#"id="ai-pause-banner""#).unwrap() < view);
+    assert!(main.find(r#"id="tracking-errors""#).unwrap() < view);
 }

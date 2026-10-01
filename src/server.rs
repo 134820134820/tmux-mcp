@@ -4,7 +4,7 @@
 //! into rmcp tools. Policy removes disallowed routes at construction and is
 //! re-checked per call for sockets, sessions, panes, commands, and buffer paths.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,8 +117,8 @@ use crate::gpu_monitor::{
 use crate::security::{tool_in_group, SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
-    command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandSnapshot,
-    CommandStatus, Pane, PaneInfo, SearchMode, Session, Window,
+    command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandExecution,
+    CommandSnapshot, CommandStatus, Pane, PaneInfo, SearchMode, Session, Window,
 };
 
 const DEFAULT_DIRECTORY_ENTRIES: u32 = 200;
@@ -156,6 +156,11 @@ pub struct TmuxMcpServer {
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
     /// Resource URIs currently subscribed by the client.
     subscriptions: Arc<RwLock<HashSet<String>>>,
+    /// Commands whose completion is announced on the Claude channel (`notify: true`).
+    notify_commands: Arc<RwLock<HashSet<String>>>,
+    /// Idle panes whose shell command line may hold input this process typed without Enter
+    /// (key: target, socket, pane; value: what left it). Typing more would append to it.
+    unsubmitted_input: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Tool capabilities required to expose each MCP resource family.
@@ -285,6 +290,9 @@ pub struct ExecuteCommandOutput {
     /// Present when `waitMs` produced a current result snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<CommandSnapshot>,
+    /// Remote file holding a `script` (kept 7 days for inspection).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script_path: Option<String>,
 }
 
 /// `list-sessions` structured payload.
@@ -353,6 +361,33 @@ pub struct FileStatInput {
     pub pane_id: String,
     pub path: String,
     pub socket: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteFileInput {
+    /// Existing pane whose cwd resolves a relative path; no new window is needed.
+    pub pane_id: String,
+    pub path: String,
+    /// Full UTF-8 file content (at most 512 KiB). Written atomically.
+    pub content: String,
+    /// Replace an existing regular file (keeps its permissions). Default: fail if it exists.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Create missing parent directories. Default: fail if the directory is missing.
+    #[serde(default)]
+    pub create_parents: bool,
+    pub socket: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteFileOutput {
+    pub cwd: String,
+    pub path: String,
+    pub bytes_written: usize,
+    /// False when an existing file was replaced.
+    pub created: bool,
 }
 
 /// `read-file` structured payload.
@@ -693,8 +728,19 @@ pub struct ExecuteCommandInput {
     /// Pane target id (`%N`).
     #[serde(rename = "paneId")]
     pub pane_id: String,
-    /// Shell text to inject. Tracked mode forbids unquoted `#`, `&`, and newlines.
+    /// One shell line to inject. Tracked mode forbids unquoted `#`, `&`, and newlines.
+    /// Give exactly one of `command` or `script`.
+    #[serde(default)]
     pub command: String,
+    /// Multi-line bash script (≤ 64 KiB). It is uploaded privately, syntax-checked with
+    /// `bash -n`, and run as one tracked `bash <file>` line in a child shell: `cd`/`export`
+    /// inside it do not persist in the pane; comments, `&`, heredocs and loops are fine.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Announce completion on the Claude channel (needs `--claude-channel`). Use for long
+    /// jobs instead of repeated get-command-result polling.
+    #[serde(default)]
+    pub notify: bool,
     /// Internal compatibility field; MCP clients always use tracked mode.
     #[schemars(skip)]
     #[serde(default, skip_deserializing)]
@@ -738,6 +784,94 @@ pub struct GetCommandResultInput {
     pub verbose: bool,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
+}
+
+fn command_channel_content(execution: &CommandExecution) -> String {
+    let elapsed = execution
+        .completed_at
+        .map(|done| {
+            done.saturating_duration_since(execution.started_at)
+                .as_secs()
+        })
+        .unwrap_or(0);
+    let place = format!(
+        "pane {} on {}",
+        execution.pane_id,
+        execution.target.as_deref().unwrap_or("local tmux")
+    );
+    match execution.status {
+        CommandStatus::Completed => format!(
+            "tmux command {} in {place} completed (exit 0) after {elapsed}s. Use get-command-result for its output.",
+            execution.id
+        ),
+        CommandStatus::Failed => format!(
+            "tmux command {} in {place} failed with exit code {} after {elapsed}s. Use get-command-result for its output.",
+            execution.id,
+            execution.exit_code.map_or_else(|| "unknown".into(), |code| code.to_string())
+        ),
+        CommandStatus::TrackingError => format!(
+            "tmux command {} in {place} has an uncertain execution state: {}. Stop modifying this target and report to the user.",
+            execution.id,
+            execution.reason.as_deref().unwrap_or("completion was not confirmed")
+        ),
+        status => format!("tmux command {} in {place} is {}.", execution.id, status.as_str()),
+    }
+}
+
+async fn announce_command(peer: &RwLock<Option<Peer<RoleServer>>>, execution: &CommandExecution) {
+    let params = serde_json::json!({
+        "content": command_channel_content(execution),
+        "meta": {
+            "command_id": execution.id,
+            "pane_id": execution.pane_id,
+            "status": execution.status.as_str(),
+        }
+    });
+    if let Some(peer) = peer.read().await.as_ref() {
+        let _ = peer
+            .send_notification(ServerNotification::CustomNotification(
+                CustomNotification::new("notifications/claude/channel", Some(params)),
+            ))
+            .await;
+    }
+}
+
+/// Validate `command`/`script` exclusivity and normalize a script (CRLF → LF).
+fn prepare_script(
+    script: Option<&str>,
+    command: &str,
+    detach: bool,
+    delay_ms: Option<u64>,
+) -> Result<Option<String>, String> {
+    let script = match (script, command.trim().is_empty()) {
+        (None, true) => return Err("give either command or script".into()),
+        (None, false) => return Ok(None),
+        (Some(_), false) => return Err("give either command or script, not both".into()),
+        (Some(script), true) => script,
+    };
+    if detach {
+        return Err("script cannot be combined with detach".into());
+    }
+    if delay_ms.is_some_and(|delay| delay > 0) {
+        return Err("script cannot be combined with delayMs".into());
+    }
+    if script.contains('\0') {
+        return Err("script must not contain NUL".into());
+    }
+    let script = script.replace("\r\n", "\n");
+    if script.contains('\r') {
+        return Err("script contains a carriage return outside CRLF line endings".into());
+    }
+    if script.trim().is_empty() {
+        return Err("script is empty".into());
+    }
+    if script.len() > tmux::SCRIPT_MAX_BYTES {
+        return Err(format!(
+            "script exceeds {} bytes; write it with write-file and run it with command",
+            tmux::SCRIPT_MAX_BYTES
+        ));
+    }
+    Ok(Some(script))
 }
 
 fn gpu_channel_content(snapshot: &GpuWatchSnapshot) -> String {
@@ -1180,19 +1314,69 @@ pub struct SpecialKeyInput {
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum SpecialKey {
+    // Aliases accept the spellings agents commonly reach for; the schema lists canonical names.
+    #[serde(
+        alias = "ctrl-c",
+        alias = "ctrl+c",
+        alias = "c-c",
+        alias = "C-c",
+        alias = "Ctrl-C",
+        alias = "Ctrl+C",
+        alias = "CTRL-C",
+        alias = "^c",
+        alias = "^C",
+        alias = "interrupt"
+    )]
     Cancel,
+    #[serde(
+        alias = "ctrl-d",
+        alias = "ctrl+d",
+        alias = "c-d",
+        alias = "C-d",
+        alias = "Ctrl-D",
+        alias = "Ctrl+D",
+        alias = "CTRL-D",
+        alias = "^d",
+        alias = "^D"
+    )]
     Eof,
+    #[serde(alias = "esc", alias = "Esc", alias = "ESC", alias = "Escape")]
     Escape,
+    #[serde(alias = "return", alias = "Return", alias = "Enter", alias = "ENTER")]
     Enter,
+    #[serde(alias = "Tab", alias = "TAB")]
     Tab,
+    #[serde(alias = "bspace", alias = "BSpace", alias = "Backspace")]
     Backspace,
+    #[serde(alias = "Up", alias = "arrow-up")]
     Up,
+    #[serde(alias = "Down", alias = "arrow-down")]
     Down,
+    #[serde(alias = "Left", alias = "arrow-left")]
     Left,
+    #[serde(alias = "Right", alias = "arrow-right")]
     Right,
+    #[serde(
+        alias = "pageup",
+        alias = "page_up",
+        alias = "PageUp",
+        alias = "pgup",
+        alias = "PgUp",
+        alias = "PPage"
+    )]
     PageUp,
+    #[serde(
+        alias = "pagedown",
+        alias = "page_down",
+        alias = "PageDown",
+        alias = "pgdn",
+        alias = "PgDn",
+        alias = "NPage"
+    )]
     PageDown,
+    #[serde(alias = "Home")]
     Home,
+    #[serde(alias = "End")]
     End,
 }
 
@@ -1332,7 +1516,53 @@ impl TmuxMcpServer {
         let tracker = Arc::new(tracker);
         let peer: Arc<RwLock<Option<Peer<RoleServer>>>> = Arc::new(RwLock::new(None));
         let subscriptions: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let notify_commands: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
         let gpu_monitor = GpuMonitorManager::new();
+
+        if claude_channel {
+            let mut events = tracker.subscribe_events();
+            let tracker = Arc::clone(&tracker);
+            let peer = Arc::clone(&peer);
+            let notify_commands = Arc::clone(&notify_commands);
+            crate::targets::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) if event.kind == CommandEventKind::Terminal => {
+                            if !notify_commands.write().await.remove(&event.command_id) {
+                                continue;
+                            }
+                            if let Some(execution) = tracker.get_command(&event.command_id).await {
+                                announce_command(&peer, &execution).await;
+                            }
+                        }
+                        Ok(event) if event.kind == CommandEventKind::Evicted => {
+                            notify_commands.write().await.remove(&event.command_id);
+                        }
+                        Ok(_) => {}
+                        // Missed events: announce any watched command that already finished.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let watched = notify_commands.read().await.clone();
+                            for id in watched {
+                                match tracker.get_command(&id).await {
+                                    Some(execution)
+                                        if execution.status.is_terminal()
+                                            && execution.result_ready =>
+                                    {
+                                        notify_commands.write().await.remove(&id);
+                                        announce_command(&peer, &execution).await;
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        notify_commands.write().await.remove(&id);
+                                    }
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
 
         {
             let mut events = tracker.subscribe_events();
@@ -1384,8 +1614,18 @@ impl TmuxMcpServer {
             let mut events = tracker.subscribe_events();
             let tracker = Arc::clone(&tracker);
             crate::targets::spawn(async move {
+                let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
                 loop {
-                    match events.recv().await {
+                    let event = tokio::select! {
+                        event = events.recv() => event,
+                        _ = recovery_tick.tick() => {
+                            if let Err(error) = control.sync_tracking_pauses(&tracker).await {
+                                tracing::warn!(%error, "unable to synchronize tracking pause recovery");
+                            }
+                            continue;
+                        }
+                    };
+                    match event {
                         Ok(event) if event.kind == CommandEventKind::Terminal => {
                             if let Some(execution) = tracker.get_command(&event.command_id).await {
                                 let snapshot = CommandSnapshot::from_execution(&execution, None);
@@ -1467,7 +1707,63 @@ impl TmuxMcpServer {
             ai_pause: Arc::new(RwLock::new(None)),
             peer,
             subscriptions,
+            notify_commands,
+            unsubmitted_input: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn input_line_key(pane_id: &str, socket: Option<&str>) -> String {
+        format!(
+            "{}\u{1f}{}\u{1f}{pane_id}",
+            crate::targets::current().unwrap_or_default(),
+            socket.unwrap_or_default()
+        )
+    }
+
+    /// Track the shell command line of an idle pane after input succeeded. Input sent to a
+    /// running tracked command belongs to that program, not to the shell's next command.
+    #[cfg(any(feature = "interactive", feature = "special-keys"))]
+    async fn note_input_line(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+        submitted: bool,
+        what: &str,
+    ) {
+        if self
+            .tracker
+            .pane_command_id(pane_id, socket)
+            .await
+            .is_some()
+        {
+            return;
+        }
+        let key = Self::input_line_key(pane_id, socket);
+        let mut lines = self.unsubmitted_input.write().await;
+        if submitted {
+            lines.remove(&key);
+        } else {
+            lines.insert(key, what.to_string());
+        }
+    }
+
+    /// Refuse to type onto a command line that may still hold earlier unsubmitted input:
+    /// the two would be joined into one command nobody wrote.
+    async fn refuse_unsubmitted_input(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+        tool: &str,
+    ) -> Option<CallToolResult> {
+        let key = Self::input_line_key(pane_id, socket);
+        let what = self.unsubmitted_input.read().await.get(&key).cloned()?;
+        Some(CallToolResult::error(vec![Content::text(format!(
+            "{tool} was not sent: pane {pane_id} may still have unsubmitted input on its command line \
+             (left by {what}), and new text would be appended to it. Inspect the pane with capture-pane, \
+             then press Enter (send-enter) to run that input or Ctrl-C (send-cancel) to discard it; \
+             both are harmless if the line is already empty. Then retry. For files and multi-line \
+             commands prefer write-file or execute-command with script."
+        ))]))
     }
 
     pub fn gpu_monitor(&self) -> GpuMonitorManager {
@@ -1531,6 +1827,13 @@ impl TmuxMcpServer {
         // Inspection must remain possible, but it never acknowledges or clears an anomaly.
         if self.tool_is_read_only(tool_name) {
             return None;
+        }
+        if let Some(control) = &self.control {
+            if let Err(error) = control.sync_tracking_pauses(&self.tracker).await {
+                return Some(CallToolResult::error(vec![Content::text(format!(
+                    "AI 操作已暂停\n原因：无法同步暂停恢复状态：{error}"
+                ))]));
+            }
         }
         match self.current_ai_pause().await {
             Ok(Some(pause)) => {
@@ -1742,7 +2045,7 @@ impl TmuxMcpServer {
             .is_ok()
         {
             templates.push(Self::resource_template(
-                "tmux://clients",
+                "tmux://{target}/clients",
                 "Tmux Clients",
                 "List of tmux clients to detect observers before detaching or resizing.",
                 "application/json",
@@ -2362,6 +2665,64 @@ impl TmuxMcpServer {
             })),
             Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "File metadata unavailable: {error}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "write-file",
+        description = "Create or replace one text file atomically (temp file + rename) without typing into a pane. Prefer this over paste-text heredocs. Fails if the file exists unless overwrite=true (keeps its permissions); refuses symlinks and non-regular files; createParents makes missing directories. Relative paths use an existing pane cwd. Content ≤ 512 KiB. Modifies the target: subject to Gate approval.",
+        annotations(destructive_hint = true, idempotent_hint = false),
+        output_schema = rmcp::handler::server::common::schema_for_type::<WriteFileOutput>()
+    )]
+    async fn write_file(
+        &self,
+        input: Parameters<WriteFileInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let input = input.0;
+        if let Err(error) = self.policy.check_tool("write-file") {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let socket = tmux::resolve_socket(input.socket.as_deref());
+        if let Err(error) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(
+                error.to_string(),
+            )]));
+        }
+        let pane = match self
+            .checked_pane_info(&input.pane_id, socket.as_deref())
+            .await
+        {
+            Ok(pane) => pane,
+            Err(error) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    error.to_string(),
+                )]))
+            }
+        };
+        match tmux::write_file(
+            &pane.current_path,
+            &input.path,
+            input.content.as_bytes(),
+            input.overwrite,
+            input.create_parents,
+        )
+        .await
+        {
+            Ok(created) => Ok(structured_output(&WriteFileOutput {
+                cwd: pane.current_path,
+                path: input.path,
+                bytes_written: input.content.len(),
+                created,
+            })),
+            // tmux::write_file already says whether the file is untouched or uncertain.
+            Err(crate::errors::Error::Tmux { message }) => {
+                Ok(CallToolResult::error(vec![Content::text(message)]))
+            }
+            Err(error) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "File not written: {error}"
             ))])),
         }
     }
@@ -3458,7 +3819,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "execute-command",
-        description = "Run one shell command in a task-owned pane, tracked by default. With waitMs, return a result snapshot after final bounded capture or timeout; otherwise use get-command-result. Busy panes reject new commands, including detach:true. For long/verbose tasks, arrange application logging before launch and use read-file to inspect it; MCP does not archive full output. Never rerun a task just to recover missing output. For interactive programs use send-keys.",
+        description = "Run one shell command in a task-owned pane, tracked by default. For multi-line work pass `script` instead of `command` (uploaded, bash -n checked, run as one tracked child bash; cd/export do not persist) rather than pasting heredocs. With waitMs, return a result snapshot after final bounded capture or timeout; otherwise use get-command-result. Busy panes reject new commands, including detach:true. For long/verbose tasks, arrange application logging before launch and use read-file to inspect it; MCP does not archive full output. Never rerun a task just to recover missing output. For interactive programs use send-keys.",
         annotations(open_world_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<ExecuteCommandOutput>()
     )]
@@ -3488,14 +3849,81 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        if let Err(e) = self.policy.check_command(&input.0.command) {
+        if input.0.notify && !self.claude_channel {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "notify requires the Claude channel (--claude-channel); run without notify and use get-command-result with waitMs",
+            )]));
+        }
+        if input.0.notify && input.0.detach {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "notify needs completion tracking and cannot be combined with detach",
+            )]));
+        }
+        let script = match prepare_script(
+            input.0.script.as_deref(),
+            &input.0.command,
+            input.0.detach,
+            input.0.delay_ms,
+        ) {
+            Ok(script) => script,
+            Err(message) => return Ok(CallToolResult::error(vec![Content::text(message)])),
+        };
+        // A script is checked statement by statement like a command; any configured
+        // filter rejects syntax it cannot analyse, so scripts never bypass it.
+        if let Err(e) = self
+            .policy
+            .check_command(script.as_deref().unwrap_or(&input.0.command))
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Some(refused) = self
+            .refuse_unsubmitted_input(&input.0.pane_id, socket.as_deref(), "execute-command")
+            .await
+        {
+            return Ok(refused);
+        }
+        let mut script_path = None;
+        let launch_command = match &script {
+            None => input.0.command.clone(),
+            Some(script) => {
+                // Reject a busy pane before uploading anything.
+                if let Some(active) = self
+                    .tracker
+                    .pane_command_id(&input.0.pane_id, socket.as_deref())
+                    .await
+                {
+                    let _ = self.tracker.status_snapshot(&active).await;
+                }
+                if let Some(active) = self
+                    .tracker
+                    .pane_command_id(&input.0.pane_id, socket.as_deref())
+                    .await
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Error executing command: pane {} is busy with command {active}; do not retry in another window. If its state is uncertain, stop and report to the user",
+                        input.0.pane_id
+                    ))]));
+                }
+                let script_id = uuid::Uuid::new_v4().to_string();
+                match tmux::upload_script(&script_id, script.as_bytes()).await {
+                    Ok(path) => {
+                        let launcher = format!("bash {}", tmux::shell_single_quote(&path));
+                        script_path = Some(path);
+                        launcher
+                    }
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Script not started (nothing was sent to the pane): {e}"
+                        ))]))
+                    }
+                }
+            }
+        };
         match self
             .tracker
             .execute_command(
                 &input.0.pane_id,
-                &input.0.command,
+                &launch_command,
                 input.0.detach,
                 false,
                 input.0.delay_ms,
@@ -3528,6 +3956,22 @@ impl TmuxMcpServer {
                 } else {
                     None
                 };
+                // A result already returned here needs no announcement. Register after the
+                // wait, then re-check: `remove` decides who announces a just-finished command.
+                if input.0.notify && !result.as_ref().is_some_and(|result| result.result_ready) {
+                    self.notify_commands
+                        .write()
+                        .await
+                        .insert(command_id.clone());
+                    if let Some(execution) = self.tracker.get_command(&command_id).await {
+                        if execution.status.is_terminal()
+                            && execution.result_ready
+                            && self.notify_commands.write().await.remove(&command_id)
+                        {
+                            announce_command(&self.peer, &execution).await;
+                        }
+                    }
+                }
                 let status = if let Some(result) = &result {
                     result.status.as_str().to_string()
                 } else {
@@ -3551,6 +3995,7 @@ impl TmuxMcpServer {
                     status,
                     message: message.into(),
                     result,
+                    script_path,
                 };
                 Ok(structured_output(&response))
             }
@@ -4510,6 +4955,14 @@ impl TmuxMcpServer {
                 }
             }
         }
+        let submitted = enter
+            || (!literal
+                && matches!(
+                    input.0.keys.trim(),
+                    "Enter" | "C-m" | "C-j" | "KPEnter" | "C-c"
+                ));
+        self.note_input_line(&input.0.pane_id, socket.as_deref(), submitted, "send-keys")
+            .await;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Keys sent to pane {}",
             input.0.pane_id
@@ -4572,17 +5025,22 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::send_keys_hex(&input.0.pane_id, &input.0.hex, socket.as_deref()).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Hex bytes sent to pane {}",
-                input.0.pane_id
-            ))])),
+            Ok(()) => {
+                let submitted = matches!(decoded.last(), Some(0x0d | 0x0a | 0x03));
+                self.note_input_line(&input.0.pane_id, socket.as_deref(), submitted, "send-hex")
+                    .await;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Hex bytes sent to pane {}",
+                    input.0.pane_id
+                ))]))
+            }
             Err(e) => Ok(self.input_failure(&input.0.pane_id, &e).await),
         }
     }
 
     #[tool(
         name = "paste-text",
-        description = "Paste UTF-8 text into a pane via tmux bracketed paste.",
+        description = "Paste UTF-8 text into a pane via tmux bracketed paste. The text can wait on the command line until Enter; until Enter (send-enter) or Ctrl-C (send-cancel), execute-command and another paste on that pane are refused so commands are never joined. For files prefer write-file; for multi-line commands execute-command with script.",
         annotations(open_world_hint = true)
     )]
     async fn paste_text(
@@ -4619,11 +5077,27 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.content) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Every logged paste was one complete command; a second paste onto unsubmitted
+        // text would silently join two of them.
+        if input.0.for_command_id.is_none() {
+            if let Some(refused) = self
+                .refuse_unsubmitted_input(&input.0.pane_id, socket.as_deref(), "paste-text")
+                .await
+            {
+                return Ok(refused);
+            }
+        }
         match tmux::paste_text(&input.0.pane_id, &input.0.content, socket.as_deref()).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Pasted text into pane {}",
-                input.0.pane_id
-            ))])),
+            Ok(()) => {
+                // Shells with bracketed paste keep even a trailing newline unsubmitted.
+                self.note_input_line(&input.0.pane_id, socket.as_deref(), false, "paste-text")
+                    .await;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Pasted text into pane {}. It may be waiting on the command line: press Enter \
+                     (send-enter) to run it before execute-command or another paste.",
+                    input.0.pane_id
+                ))]))
+            }
             Err(e) => Ok(self.input_failure(&input.0.pane_id, &e).await),
         }
     }
@@ -4886,10 +5360,21 @@ impl TmuxMcpServer {
             return Ok(result);
         }
         match tmux::send_keys(&input.pane_id, key, false, socket.as_deref()).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "{key} sent to pane {}",
-                input.pane_id
-            ))])),
+            Ok(()) => {
+                // Enter submits the line and Ctrl-C discards it; any other key (history recall,
+                // Tab completion, editing) can leave text on it.
+                self.note_input_line(
+                    &input.pane_id,
+                    socket.as_deref(),
+                    matches!(key, "Enter" | "C-c"),
+                    tool_name,
+                )
+                .await;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{key} sent to pane {}",
+                    input.pane_id
+                ))]))
+            }
             Err(e) => Ok(self.input_failure(&input.pane_id, &e).await),
         }
     }
@@ -5614,6 +6099,9 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Channel notifications (notify, GPU watches) need the peer even when the client
+        // never touches resources.
+        self.capture_peer(&context).await;
         let name = request.name.as_ref();
         if name == "list-targets" {
             return self.call_tool_inner(request, context).await;
@@ -5626,8 +6114,10 @@ impl rmcp::ServerHandler for TmuxMcpServer {
             .filter(|target| !target.trim().is_empty())
             .map(str::to_owned)
             .or_else(|| {
+                // Tests without an explicit target must not depend on TMUX_MCP_SSH being
+                // set by whichever stub-using test happens to run concurrently.
                 if cfg!(test) {
-                    std::env::var("TMUX_MCP_SSH").ok()
+                    Some(std::env::var("TMUX_MCP_SSH").unwrap_or_else(|_| "test-target".into()))
                 } else {
                     None
                 }
@@ -5678,170 +6168,41 @@ impl rmcp::ServerHandler for TmuxMcpServer {
         self.capture_peer(&context).await;
         let mut resources: Vec<Resource> = Vec::new();
 
+        // Every listed URI must be readable, so each carries its target. Panes, windows and
+        // session trees are not enumerated: that would open an SSH connection to every target.
+        // Read them through the `tmux://{target}/…` templates or get-tmux-state.
         let socket = tmux::resolve_socket(None);
         if self.policy.check_socket(socket.as_deref()).is_ok() {
-            resources.push(Annotated::new(
-                RawResource {
-                    uri: "tmux://server/info".into(),
-                    name: "Tmux Server Info".into(),
-                    title: None,
-                    description: Some(
-                        "Default socket and SSH context for routing tool calls without env vars."
-                            .into(),
-                    ),
-                    mime_type: Some("application/json".into()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                None,
-            ));
-        }
-
-        if let Err(_e) = self.policy.check_socket(socket.as_deref()) {
-            return Ok(rmcp::model::ListResourcesResult {
-                resources,
-                next_cursor: None,
-                meta: None,
-            });
-        }
-
-        let can_discover_topology = self
-            .check_resource_capability(ResourceCapability::SessionTree)
-            .is_ok();
-        let can_publish_panes = can_discover_topology
-            && self
-                .check_resource_capability(ResourceCapability::Pane)
+            let targets = crate::targets::load_configured()
+                .map(|config| config.targets.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let clients = self
+                .check_resource_capability(ResourceCapability::Clients)
                 .is_ok();
-        let can_publish_windows = can_discover_topology;
-        let can_publish_session_trees = can_discover_topology;
-
-        if can_publish_panes || can_publish_windows || can_publish_session_trees {
-            let sessions = tmux::list_sessions(socket.as_deref()).await.map_err(|e| {
-                McpError::internal_error(format!("Error listing tmux sessions: {e}"), None)
-            })?;
-            for session in sessions {
-                if self
-                    .policy
-                    .check_session_identity(&session.id, Some(&session.name))
-                    .is_err()
-                {
-                    continue;
-                }
-                let mut session_has_visible_window = false;
-                let windows = tmux::list_windows(&session.id, socket.as_deref())
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(
-                            format!("Error listing tmux windows for session {}: {e}", session.id),
-                            None,
-                        )
-                    })?;
-                for window in windows {
-                    let inspect_panes = can_discover_topology || self.policy.has_pane_allowlist();
-                    let (window_has_allowed_panes, all_window_panes_allowed) = if inspect_panes {
-                        let panes = tmux::list_panes(&window.id, socket.as_deref())
-                            .await
-                            .map_err(|e| {
-                                McpError::internal_error(
-                                    format!(
-                                        "Error listing tmux panes for window {}: {e}",
-                                        window.id
-                                    ),
-                                    None,
-                                )
-                            })?;
-                        let all_allowed = panes
-                            .iter()
-                            .all(|pane| self.policy.check_pane(&pane.id).is_ok());
-                        let mut any_allowed = false;
-                        for pane in panes {
-                            if self.policy.check_pane(&pane.id).is_err() {
-                                continue;
-                            }
-                            any_allowed = true;
-                            if can_publish_panes {
-                                resources.push(Annotated::new(
-                                    RawResource {
-                                        uri: format!("tmux://pane/{}", pane.id),
-                                        name: format!(
-                                            "Pane: {} - {} - {}",
-                                            session.name, pane.id, pane.title
-                                        ),
-                                        title: None,
-                                        description: Some(format!(
-                                            "Pane output for state checks or log monitoring in session {} (pane {}).",
-                                            session.name, pane.id
-                                        )),
-                                        mime_type: Some("text/plain".into()),
-                                        size: None,
-                                        icons: None,
-                                        meta: None,
-                                    },
-                                    None,
-                                ));
-                                resources.push(Annotated::new(
-                                    RawResource {
-                                        uri: format!("tmux://pane/{}/info", pane.id),
-                                        name: format!(
-                                            "Pane Info: {} - {} - {}",
-                                            session.name, pane.id, pane.title
-                                        ),
-                                        title: None,
-                                        description: Some(format!(
-                                            "Pane metadata (cwd, command, size) to pick execution targets or layout changes in session {} (pane {}).",
-                                            session.name, pane.id
-                                        )),
-                                        mime_type: Some("application/json".into()),
-                                        size: None,
-                                        icons: None,
-                                        meta: None,
-                                    },
-                                    None,
-                                ));
-                            }
-                        }
-                        (any_allowed, all_allowed)
-                    } else {
-                        // A tmux window always owns at least one pane. Without a pane
-                        // allowlist, no pane IDs need to be discovered to publish its
-                        // independently authorized window-info resource.
-                        (true, true)
-                    };
-
-                    if window_has_allowed_panes && all_window_panes_allowed {
-                        session_has_visible_window = true;
-                    }
-
-                    if can_publish_windows && window_has_allowed_panes && all_window_panes_allowed {
-                        resources.push(Annotated::new(
-                            RawResource {
-                                uri: format!("tmux://window/{}/info", window.id),
-                                name: format!("Window Info: {} - {}", session.name, window.name),
-                                title: None,
-                                description: Some(format!(
-                                    "Window metadata (layout, active pane, size) to decide focus or normalize layout in session {} (window {}).",
-                                    session.name, window.name
-                                )),
-                                mime_type: Some("application/json".into()),
-                                size: None,
-                                icons: None,
-                                meta: None,
-                            },
-                            None,
-                        ));
-                    }
-                }
-                if can_publish_session_trees && session_has_visible_window {
+            for target in targets {
+                resources.push(Annotated::new(
+                    RawResource {
+                        uri: format!("tmux://{target}/server/info"),
+                        name: format!("Tmux Server Info: {target}"),
+                        title: None,
+                        description: Some("Default socket and SSH context for this target.".into()),
+                        mime_type: Some("application/json".into()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                ));
+                if clients {
                     resources.push(Annotated::new(
                         RawResource {
-                            uri: format!("tmux://session/{}/tree", session.id),
-                            name: format!("Session Tree: {}", session.name),
+                            uri: format!("tmux://{target}/clients"),
+                            name: format!("Tmux Clients: {target}"),
                             title: None,
-                            description: Some(format!(
-                                "Session snapshot to plan multi-pane workflows and choose targets in {}.",
-                                session.name
-                            )),
+                            description: Some(
+                                "Clients list to detect observers before detaching or resizing."
+                                    .into(),
+                            ),
                             mime_type: Some("application/json".into()),
                             size: None,
                             icons: None,
@@ -5851,27 +6212,6 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     ));
                 }
             }
-        }
-
-        if self
-            .check_resource_capability(ResourceCapability::Clients)
-            .is_ok()
-        {
-            resources.push(Annotated::new(
-                RawResource {
-                    uri: "tmux://clients".into(),
-                    name: "Tmux Clients".into(),
-                    title: None,
-                    description: Some(
-                        "Clients list to detect observers before detaching or resizing.".into(),
-                    ),
-                    mime_type: Some("application/json".into()),
-                    size: None,
-                    icons: None,
-                    meta: None,
-                },
-                None,
-            ));
         }
 
         if self
@@ -6006,6 +6346,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notify_requires_channel_and_watched_commands_are_released_on_completion() {
+        let input = || -> ExecuteCommandInput {
+            serde_json::from_value(serde_json::json!({
+                "paneId": "%1", "command": "true", "notify": true
+            }))
+            .unwrap()
+        };
+        let without_channel = server_default();
+        let result = without_channel
+            .execute_command(Parameters(input()))
+            .await
+            .unwrap();
+        assert!(
+            first_text(&result).contains("--claude-channel"),
+            "{}",
+            first_text(&result)
+        );
+
+        let _stub = TmuxStub::new();
+        let server = TmuxMcpServer::new_with_control_and_channel(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            None,
+            true,
+        );
+        let result = server.execute_command(Parameters(input())).await.unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", first_text(&result));
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_id = payload["commandId"].as_str().unwrap().to_string();
+        server.tracker.wait_for(&command_id, 5_000).await.unwrap();
+        // The channel task consumes the registration exactly once when the command ends.
+        for _ in 0..100 {
+            if !server.notify_commands.read().await.contains(&command_id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("completed command still registered for notification");
+    }
+
+    #[test]
+    fn command_channel_tracking_error_tells_the_agent_to_stop_and_report() {
+        let execution = CommandExecution {
+            target: Some("milab-seven-intern".into()),
+            id: "c1".into(),
+            pane_id: "%5".into(),
+            socket: None,
+            command: "train".into(),
+            status: CommandStatus::TrackingError,
+            exit_code: None,
+            output: None,
+            output_truncated: true,
+            result_ready: true,
+            reason: Some("pane disappeared".into()),
+            started_at: std::time::Instant::now(),
+            completed_at: Some(std::time::Instant::now()),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+        let text = command_channel_content(&execution);
+        assert!(
+            text.contains("uncertain") && text.contains("report to the user"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn prepare_script_requires_exactly_one_input_and_normalizes_line_endings() {
+        assert!(prepare_script(None, "  ", false, None).is_err());
+        assert_eq!(prepare_script(None, "ls", false, None), Ok(None));
+        assert!(prepare_script(Some("echo"), "ls", false, None).is_err());
+        assert!(prepare_script(Some("echo"), "", true, None)
+            .unwrap_err()
+            .contains("detach"));
+        assert!(prepare_script(Some("echo"), "", false, Some(5))
+            .unwrap_err()
+            .contains("delayMs"));
+        assert!(prepare_script(Some("a\0b"), "", false, None).is_err());
+        assert!(prepare_script(Some("a\rb"), "", false, None).is_err());
+        assert!(prepare_script(Some(" \n "), "", false, None).is_err());
+        assert_eq!(
+            prepare_script(Some("a\r\nb\r\n"), "", false, Some(0)),
+            Ok(Some("a\nb\n".to_string()))
+        );
+        let large = "x".repeat(tmux::SCRIPT_MAX_BYTES + 1);
+        assert!(prepare_script(Some(&large), "", false, None)
+            .unwrap_err()
+            .contains("write-file"));
+    }
+
+    fn uploaded_scripts(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(home.join(".cache/tmux-mcp/scripts"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|e| e.path()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn execute_command_script_is_uploaded_checked_and_typed_as_one_line() {
+        let mut stub = TmuxStub::new();
+        let home = tempfile::tempdir().unwrap();
+        stub.set_var("HOME", home.path());
+        stub.remove_var("TMUX_MCP_SSH");
+        let typed_log = tempfile::NamedTempFile::new().unwrap();
+        stub.set_var("TMUX_STUB_SEND_KEYS_LOG", typed_log.path());
+        let server = server_default();
+        let script = "set -e\r\ncd /tmp # comments are fine\r\nfor i in 1 2; do echo \"$i\" & done\r\nwait\r\n";
+        let input: ExecuteCommandInput =
+            serde_json::from_value(serde_json::json!({"paneId": "%1", "script": script})).unwrap();
+        let result = server.execute_command(Parameters(input)).await.unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", first_text(&result));
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let script_path = payload["scriptPath"].as_str().expect("scriptPath");
+
+        let files = uploaded_scripts(home.path());
+        assert_eq!(
+            files.len(),
+            1,
+            "exactly the script, no temp files: {files:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&files[0]).unwrap(),
+            script.replace("\r\n", "\n")
+        );
+        let file_name = files[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(script_path.ends_with(&file_name));
+        let typed = std::fs::read_to_string(typed_log.path()).unwrap();
+        assert!(typed.contains(&format!("bash '{script_path}'")), "{typed}");
+        assert!(
+            !typed.contains("for i in"),
+            "script text must never be typed: {typed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_script_rejects_syntax_errors_and_busy_panes_before_typing() {
+        let mut stub = TmuxStub::new();
+        let home = tempfile::tempdir().unwrap();
+        stub.set_var("HOME", home.path());
+        stub.remove_var("TMUX_MCP_SSH");
+        let typed_log = tempfile::NamedTempFile::new().unwrap();
+        stub.set_var("TMUX_STUB_SEND_KEYS_LOG", typed_log.path());
+        let server = server_default();
+
+        let broken: ExecuteCommandInput = serde_json::from_value(serde_json::json!({
+            "paneId": "%1", "script": "if true; then\n  echo 'unterminated\nfi\n"
+        }))
+        .unwrap();
+        let result = server.execute_command(Parameters(broken)).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            first_text(&result).contains("bash -n"),
+            "{}",
+            first_text(&result)
+        );
+        assert!(
+            uploaded_scripts(home.path()).is_empty(),
+            "rejected script removed"
+        );
+
+        server
+            .tracker
+            .insert_test_occupant(CommandExecution {
+                target: None,
+                id: "busy-1".into(),
+                pane_id: "%1".into(),
+                socket: None,
+                command: "training".into(),
+                status: CommandStatus::Running,
+                exit_code: None,
+                output: None,
+                output_truncated: true,
+                result_ready: false,
+                reason: None,
+                started_at: std::time::Instant::now(),
+                completed_at: None,
+                raw_mode: false,
+                tracking_disabled: false,
+            })
+            .await;
+        let busy: ExecuteCommandInput = serde_json::from_value(serde_json::json!({
+            "paneId": "%1", "script": "echo hi\n"
+        }))
+        .unwrap();
+        let result = server.execute_command(Parameters(busy)).await.unwrap();
+        assert!(
+            first_text(&result).contains("busy"),
+            "{}",
+            first_text(&result)
+        );
+        assert!(
+            uploaded_scripts(home.path()).is_empty(),
+            "nothing uploaded for a busy pane"
+        );
+        assert!(std::fs::read_to_string(typed_log.path())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_is_core_modifying_and_follows_execute_policy() {
+        let server = server_default();
+        let tool = server
+            .get_tool("write-file")
+            .expect("write-file in default surface");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        for field in ["target", "paneId", "path", "content"] {
+            assert!(
+                required.contains(&serde_json::json!(field)),
+                "{field} required"
+            );
+        }
+        // Not read-only: Gate approval and AI-pause preflight apply.
+        assert!(!server.tool_is_read_only("write-file"));
+        let restricted = server_with_policy("[security]\nallow_execute_command = false\n");
+        assert!(restricted.get_tool("write-file").is_none());
+    }
+
+    #[tokio::test]
     async fn test_snapshot_tools_are_read_only_and_target_is_required() {
         let server = server_default();
         for name in ["file-stat", "gpu-snapshot", "create-window"] {
@@ -6124,12 +6687,14 @@ mod tests {
             false,
         );
         let core_names = tool_names(&core);
-        assert_eq!(core_names.len(), 21);
+        // 22 core tools + 3 GPU watch tools enabled by the Claude channel.
+        assert_eq!(core_names.len(), 25);
         for name in [
             "get-tmux-state",
             "press-special-key",
             "execute-command",
             "read-file",
+            "write-file",
             "git-status",
             "watch-gpu-idle",
         ] {
@@ -6153,7 +6718,7 @@ mod tests {
             true,
         );
         let full_names = tool_names(&full);
-        assert_eq!(full_names.len(), 47);
+        assert_eq!(full_names.len(), 51);
         for name in ["kill-target", "rename-target", "select-layout", "send-hex"] {
             assert!(full_names.contains(name));
         }
@@ -6245,7 +6810,7 @@ mod tests {
     async fn read_resource_text(server: &TmuxMcpServer, uri: &str) -> String {
         let (context, _client_transport, _running) = context_for_server(server);
         let result = server
-            .read_resource(
+            .read_resource_inner(
                 read_resource_request!(uri: uri.to_string(), meta: None),
                 context,
             )
@@ -6656,10 +7221,13 @@ mod tests {
             Some(control),
         );
         let (context, _client_transport, _running) = context_for_server(&server);
-        let arguments = serde_json::json!({"paneId": "%8", "command": "ls"})
-            .as_object()
-            .cloned()
-            .unwrap();
+        // An explicit target keeps this test independent of TMUX_MCP_SSH set by other tests;
+        // without one the call fails before Gate and the wait loop below never ends.
+        let arguments =
+            serde_json::json!({"target": "test-target", "paneId": "%8", "command": "ls"})
+                .as_object()
+                .cloned()
+                .unwrap();
         let call = crate::targets::spawn({
             let server = server.clone();
             async move {
@@ -7258,6 +7826,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_web_recovery_unblocks_preflight_without_claiming_command_success() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::new(dir.path());
+        let control = ControlClient::new("http://127.0.0.1:9", "test", paths.clone()).unwrap();
+        let server = TmuxMcpServer::new_with_control(
+            CommandTracker::new(ShellType::Bash),
+            SecurityPolicy::default(),
+            SearchConfig::default(),
+            Some(control),
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::targets::scope("seven-intern".into(), async {
+            server
+                .tracker
+                .insert_test_occupant(CommandExecution {
+                    target: Some("seven-intern".into()),
+                    id: id.clone(),
+                    pane_id: "%5".into(),
+                    socket: None,
+                    command: "training".into(),
+                    status: CommandStatus::TrackingError,
+                    exit_code: None,
+                    output: None,
+                    output_truncated: true,
+                    result_ready: true,
+                    reason: Some("missing exit buffer".into()),
+                    started_at: Instant::now(),
+                    completed_at: Some(Instant::now()),
+                    raw_mode: false,
+                    tracking_disabled: false,
+                })
+                .await;
+            assert!(server.safety_preflight("create-window").await.is_some());
+            assert!(server.safety_preflight("capture-pane").await.is_none());
+            let pause = crate::control::tracking_pauses(&paths)
+                .unwrap()
+                .pop()
+                .unwrap();
+            pause.request_resume(&paths).unwrap();
+            // A paused agent may make no further tool calls: its background listener must recover.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while pause.recovery(&paths).unwrap() != "resumed" {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("background recovery acknowledgement");
+            assert!(server.safety_preflight("create-window").await.is_none());
+            assert!(server.tracker.pane_command_id("%5", None).await.is_none());
+            let snapshot = server.tracker.get_command(&id).await.unwrap();
+            assert_eq!(snapshot.status, CommandStatus::TrackingError);
+            assert_eq!(snapshot.exit_code, None);
+            assert_eq!(pause.recovery(&paths).unwrap(), "resumed");
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn input_delivery_failure_pauses_changes_without_blocking_inspection() {
         let server = server_default();
         let error = crate::errors::Error::InvalidArgument {
@@ -7490,26 +8116,13 @@ mod tests {
         assert_eq!(result.resource_templates.len(), 9);
 
         let server = server_with_policy("[security]\nallow_capture = false\nallow_list = false\n");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let result = server
-            .list_resource_templates(None, context)
-            .await
-            .expect("list resource templates");
-        let templates = result
-            .resource_templates
-            .iter()
-            .map(|template| template.uri_template.as_str())
-            .collect::<BTreeSet<_>>();
-
-        assert!(templates.contains("tmux://server/info"));
-        assert!(templates.contains("tmux://command/{commandId}/result"));
-        assert!(!templates.contains("tmux://pane/{paneId}"));
-        assert!(!templates.contains("tmux://pane/{paneId}/info"));
-        assert!(!templates.contains("tmux://pane/{paneId}/tail/{lines}"));
-        assert!(!templates.contains("tmux://pane/{paneId}/tail/{lines}/ansi"));
-        assert!(!templates.contains("tmux://window/{windowId}/info"));
-        assert!(!templates.contains("tmux://session/{sessionId}/tree"));
-        assert!(!templates.contains("tmux://clients"));
+        assert_eq!(
+            resource_template_uris(&server),
+            BTreeSet::from([
+                "tmux://{target}/server/info".to_string(),
+                "tmux://{target}/command/{commandId}/result".to_string(),
+            ])
+        );
 
         let server =
             server_with_policy("[security]\nallowed_sockets = [\"/tmp/not-default.sock\"]\n");
@@ -7527,25 +8140,27 @@ mod tests {
         let deny_topology =
             server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
         let templates = resource_template_uris(&deny_topology);
-        assert!(!templates.contains("tmux://window/{windowId}/info"));
-        assert!(!templates.contains("tmux://session/{sessionId}/tree"));
-        assert!(templates.contains("tmux://pane/{paneId}"));
-        assert!(templates.contains("tmux://clients"));
-        assert!(templates.contains("tmux://command/{commandId}/result"));
+        assert!(!templates.contains("tmux://{target}/window/{windowId}/info"));
+        assert!(!templates.contains("tmux://{target}/session/{sessionId}/tree"));
+        assert!(templates.contains("tmux://{target}/pane/{paneId}"));
+        assert!(templates.contains("tmux://{target}/clients"));
+        assert!(templates.contains("tmux://{target}/command/{commandId}/result"));
 
         let deny_capture =
             server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
         let templates = resource_template_uris(&deny_capture);
-        assert!(!templates.iter().any(|uri| uri.starts_with("tmux://pane/")));
-        assert!(templates.contains("tmux://window/{windowId}/info"));
-        assert!(templates.contains("tmux://session/{sessionId}/tree"));
+        assert!(!templates
+            .iter()
+            .any(|uri| uri.starts_with("tmux://{target}/pane/")));
+        assert!(templates.contains("tmux://{target}/window/{windowId}/info"));
+        assert!(templates.contains("tmux://{target}/session/{sessionId}/tree"));
 
         let deny_clients_and_commands = server_with_policy(
             "[security.tools]\nmode = \"deny\"\nitems = [\"list-clients\", \"get-command-result\"]\n",
         );
         let templates = resource_template_uris(&deny_clients_and_commands);
-        assert!(!templates.contains("tmux://clients"));
-        assert!(!templates.contains("tmux://command/{commandId}/result"));
+        assert!(!templates.contains("tmux://{target}/clients"));
+        assert!(!templates.contains("tmux://{target}/command/{commandId}/result"));
 
         let topology_only = server_with_policy(
             "[security.tools]\nmode = \"allow\"\nitems = [\"get-tmux-state\"]\n",
@@ -7554,9 +8169,9 @@ mod tests {
         assert_eq!(
             templates,
             BTreeSet::from([
-                "tmux://server/info".to_string(),
-                "tmux://session/{sessionId}/tree".to_string(),
-                "tmux://window/{windowId}/info".to_string(),
+                "tmux://{target}/server/info".to_string(),
+                "tmux://{target}/session/{sessionId}/tree".to_string(),
+                "tmux://{target}/window/{windowId}/info".to_string(),
             ])
         );
     }
@@ -7573,7 +8188,7 @@ mod tests {
         let (context, _client_transport, _running) = context_for_server(&server);
 
         let result = server
-            .read_resource(
+            .read_resource_inner(
                 read_resource_request!(uri: "tmux://window/@2/info".to_string(), meta: None),
                 context,
             )
@@ -7641,33 +8256,10 @@ mod tests {
         assert!(!text.contains("%99"));
         assert!(!text.contains("disallowed"));
 
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let resources = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris = resource_uris(&resources.resources);
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://window/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://session/")));
-        assert!(uris.contains("tmux://pane/%1"));
-        assert!(!uris.contains("tmux://pane/%99"));
-
         let no_allowed_sessions = server_with_policy("[security]\nallowed_sessions = []\n");
         let clients = read_resource_text(&no_allowed_sessions, "tmux://clients").await;
         let payload: Value = serde_json::from_str(&clients).expect("clients JSON");
         assert_eq!(payload, Value::Array(Vec::new()));
-    }
-
-    #[test]
-    fn first_text_resource_handles_non_text() {
-        let contents = vec![ResourceContents::BlobResourceContents {
-            uri: "tmux://blob".into(),
-            mime_type: None,
-            blob: "AA==".into(),
-            meta: None,
-        }];
-
-        assert_eq!(first_text_resource(&contents), "");
     }
 
     #[tokio::test]
@@ -8321,6 +8913,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -8353,6 +8947,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -8376,6 +8972,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -8400,6 +8998,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -8408,41 +9008,13 @@ mod tests {
             .await
             .expect("execute command");
         assert_eq!(result.is_error, Some(true));
-        assert!(first_text(&result).contains("Error executing command"));
-    }
-
-    #[tokio::test]
-    async fn get_command_result_tmux_error() {
-        let _stub = TmuxStub::new();
-        let server = server_default();
-
-        let result = server
-            .execute_command(Parameters(ExecuteCommandInput {
-                detach: false,
-                verbose: false,
-                pane_id: "%1".into(),
-                command: "echo hi".into(),
-                raw_mode: None,
-                no_enter: None,
-                delay_ms: None,
-                socket: None,
-                wait_ms: None,
-            }))
-            .await
-            .expect("execute command");
-        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
-        let command_id = payload["commandId"].as_str().unwrap();
-        let result = server
-            .get_command_result(Parameters(GetCommandResultInput {
-                verbose: false,
-                command_id: command_id.to_string(),
-                socket: None,
-                wait_ms: Some(5_000),
-            }))
-            .await
-            .expect("get command result");
-        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
-        assert_eq!(payload["status"], "completed");
+        // A failed send may still have typed part of the command: never invite a retry.
+        let text = first_text(&result);
+        assert!(
+            text.contains("may have been partially or fully delivered"),
+            "{text}"
+        );
+        assert!(text.contains("do not retry"), "{text}");
     }
 
     #[tokio::test]
@@ -8458,6 +9030,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -8479,7 +9053,8 @@ mod tests {
             .expect("get command result");
 
         assert_eq!(result.is_error, Some(true));
-        assert!(first_text(&result).contains("Socket override does not match"));
+        let text = first_text(&result);
+        assert!(text.contains("Socket override is not allowed"), "{text}");
     }
 
     #[tokio::test]
@@ -8495,6 +9070,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -8516,7 +9093,8 @@ mod tests {
             .expect("get command result");
 
         assert_eq!(result.is_error, Some(true));
-        assert!(first_text(&result).contains("Socket override does not match"));
+        let text = first_text(&result);
+        assert!(text.contains("Socket override does not match"), "{text}");
     }
 
     #[tokio::test]
@@ -8790,192 +9368,64 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
-    #[tokio::test]
-    async fn list_resources_policy_skips() {
-        let _stub = TmuxStub::new();
-
-        let server = server_with_policy("[security]\nallow_list = false\n");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let result = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        assert_eq!(result.resources.len(), 1);
-        assert_eq!(result.resources[0].uri, "tmux://server/info");
-
-        let server = server_with_policy("[security]\nallowed_sessions = []\n");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let result = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        assert_eq!(
-            resource_uris(&result.resources),
-            BTreeSet::from([
-                "tmux://clients".to_string(),
-                "tmux://server/info".to_string(),
-            ])
-        );
-
-        let server = server_with_policy("[security]\nallowed_panes = []\n");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let result = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        assert_eq!(
-            resource_uris(&result.resources),
-            BTreeSet::from([
-                "tmux://clients".to_string(),
-                "tmux://server/info".to_string(),
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn list_resources_enforces_composite_capability_matrix() {
-        let _stub = TmuxStub::new();
-
-        let deny_topology =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
-        let (context, _client_transport, _running) = context_for_server(&deny_topology);
-        let resources = deny_topology
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris = resource_uris(&resources.resources);
-        assert_eq!(
-            uris,
-            BTreeSet::from([
-                "tmux://clients".to_string(),
-                "tmux://server/info".to_string(),
-            ])
-        );
-
-        let deny_capture =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"capture-pane\"]\n");
-        let (context, _client_transport, _running) = context_for_server(&deny_capture);
-        let resources = deny_capture
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris = resource_uris(&resources.resources);
-        assert!(uris.iter().any(|uri| uri.starts_with("tmux://window/")));
-        assert!(uris.iter().any(|uri| uri.starts_with("tmux://session/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
-
-        let topology_only = server_with_policy(
-            "[security.tools]\nmode = \"allow\"\nitems = [\"get-tmux-state\"]\n",
-        );
-        let (context, _client_transport, _running) = context_for_server(&topology_only);
-        let resources = topology_only
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris = resource_uris(&resources.resources);
-        assert!(uris.iter().any(|uri| uri.starts_with("tmux://window/")));
-        assert!(uris.iter().any(|uri| uri.starts_with("tmux://session/")));
-        assert!(!uris.contains("tmux://clients"));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://command/")));
-    }
-
-    #[tokio::test]
-    async fn list_resources_keeps_clients_and_commands_independent_from_topology() {
-        let _stub = TmuxStub::new();
-        let server =
-            server_with_policy("[security.tools]\nmode = \"deny\"\nitems = [\"get-tmux-state\"]\n");
-        let result = server
-            .execute_command(Parameters(ExecuteCommandInput {
-                detach: false,
-                verbose: false,
-                pane_id: "%1".into(),
-                command: "echo hi".into(),
-                raw_mode: None,
-                no_enter: None,
-                delay_ms: None,
-                wait_ms: None,
-                socket: None,
-            }))
-            .await
-            .expect("execute command");
-        let payload: Value = serde_json::from_str(&first_text(&result)).expect("command payload");
-        let command_uri = payload["resourceUri"]
-            .as_str()
-            .expect("command resource URI");
-
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let resources = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris = resource_uris(&resources.resources);
-        assert!(uris.contains("tmux://server/info"));
-        assert!(uris.contains("tmux://clients"));
-        assert!(uris.contains(command_uri));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://pane/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://window/")));
-        assert!(!uris.iter().any(|uri| uri.starts_with("tmux://session/")));
-
-        let deny_command = server_with_policy(
-            "[security.tools]\nmode = \"deny\"\nitems = [\"get-command-result\"]\n",
-        );
-        deny_command
-            .tracker
-            .execute_command("%1", "echo hi", false, false, None, None)
-            .await
-            .expect("track command");
-        let (context, _client_transport, _running) = context_for_server(&deny_command);
-        let resources = deny_command
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        assert!(!resource_uris(&resources.resources)
+    /// Point target resolution at a private targets file (tests must not read the repo's).
+    fn use_targets(stub: &mut TmuxStub, names: &[&str]) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("targets file");
+        let body: String = names
             .iter()
-            .any(|uri| uri.starts_with("tmux://command/")));
+            .map(|name| format!("[targets.{name}]\n"))
+            .collect();
+        std::fs::write(file.path(), body).expect("write targets");
+        stub.set_var("TMUX_MCP_TARGETS", file.path());
+        file
     }
 
     #[tokio::test]
-    async fn list_resources_returns_error_when_sessions_fail() {
+    async fn list_resources_lists_only_target_qualified_readable_uris() {
         let mut stub = TmuxStub::new();
-        stub.set_var("TMUX_STUB_ERROR_CMD", "list-sessions");
-        stub.set_var("TMUX_STUB_ERROR_MSG", "sessions-fail");
+        let _targets = use_targets(&mut stub, &["alpha", "beta"]);
         let server = server_default();
+        let input: ExecuteCommandInput =
+            serde_json::from_value(serde_json::json!({"paneId": "%1", "command": "echo hi"}))
+                .unwrap();
+        let result =
+            crate::targets::scope("alpha".into(), server.execute_command(Parameters(input)))
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_uri = payload["resourceUri"].as_str().unwrap().to_string();
+
         let (context, _client_transport, _running) = context_for_server(&server);
+        let resources = server.list_resources(None, context).await.unwrap();
+        assert_eq!(
+            resource_uris(&resources.resources),
+            BTreeSet::from([
+                "tmux://alpha/server/info".to_string(),
+                "tmux://alpha/clients".to_string(),
+                "tmux://beta/server/info".to_string(),
+                "tmux://beta/clients".to_string(),
+                command_uri.clone(),
+            ])
+        );
+        // Each listed URI routes to a configured target (the reader rejects anything else).
+        for uri in resource_uris(&resources.resources) {
+            let (target, _) = target_uri(&uri).expect("qualified");
+            assert!(["alpha", "beta"].contains(&target.as_str()), "{uri}");
+        }
+        assert!(command_uri.starts_with("tmux://alpha/command/"));
 
-        let error = server
-            .list_resources(None, context)
-            .await
-            .expect_err("list resources should fail");
-
-        assert!(error.message.contains("Error listing tmux sessions"));
-        assert!(error.message.contains("sessions-fail"));
-    }
-
-    #[tokio::test]
-    async fn list_resources_returns_error_when_nested_windows_or_panes_fail() {
-        let mut stub = TmuxStub::new();
-        let server = server_default();
-
-        stub.set_var("TMUX_STUB_ERROR_CMD", "list-windows");
-        stub.set_var("TMUX_STUB_ERROR_MSG", "windows-fail");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let error = server
-            .list_resources(None, context)
-            .await
-            .expect_err("list resources should fail");
-        assert!(error.message.contains("Error listing tmux windows"));
-        assert!(error.message.contains("windows-fail"));
-
-        stub.set_var("TMUX_STUB_ERROR_CMD", "list-panes");
-        stub.set_var("TMUX_STUB_ERROR_MSG", "panes-fail");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let error = server
-            .list_resources(None, context)
-            .await
-            .expect_err("list resources should fail");
-        assert!(error.message.contains("Error listing tmux panes"));
-        assert!(error.message.contains("panes-fail"));
+        let denied = server_with_policy(
+            "[security.tools]\nmode = \"deny\"\nitems = [\"list-clients\", \"get-command-result\"]\n",
+        );
+        let (context, _client_transport, _running) = context_for_server(&denied);
+        let resources = denied.list_resources(None, context).await.unwrap();
+        assert_eq!(
+            resource_uris(&resources.resources),
+            BTreeSet::from([
+                "tmux://alpha/server/info".to_string(),
+                "tmux://beta/server/info".to_string(),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -8990,24 +9440,6 @@ mod tests {
             .await
             .expect("list resources");
         assert!(result.resources.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_resources_hides_pane_uris_when_capture_denied() {
-        let _stub = TmuxStub::new();
-
-        let server =
-            server_with_policy("[security]\nallow_capture = false\nallowed_panes = [\"%1\"]\n");
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let result = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-
-        assert!(!result
-            .resources
-            .iter()
-            .any(|res| res.uri.starts_with("tmux://pane/")));
     }
 
     #[tokio::test]
@@ -9052,61 +9484,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_resources_lists_command_catalog_from_memory() {
-        let _stub = TmuxStub::new();
-        let server = server_default();
-        let command_id = server
-            .tracker
-            .execute_command("%1", "echo hi", false, false, None, None)
-            .await
-            .expect("execute command");
-        let _ = server.tracker.wait_for(&command_id, 5_000).await;
-        let (context, _client_transport, _running) = context_for_server(&server);
-
-        let result = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-
-        let resource = result
-            .resources
-            .iter()
-            .find(|res| res.uri == format!("tmux://command/{command_id}/result"))
-            .expect("command resource");
-        assert_eq!(
-            resource.description.as_deref(),
-            Some("Tracked command status: completed. Subscribe for updates; read for snapshot.")
-        );
-        assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
-        let command = server
-            .tracker
-            .get_command(&command_id)
-            .await
-            .expect("stored command");
-        assert!(matches!(command.status, CommandStatus::Completed));
-    }
-
-    #[tokio::test]
-    async fn read_resource_pane_error() {
-        let mut stub = TmuxStub::new();
-        stub.set_var("TMUX_STUB_ERROR_CMD", "capture-pane");
-        stub.set_var("TMUX_STUB_ERROR_MSG", "capture-fail");
-        let server = server_default();
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let request = read_resource_request! {
-            uri: "tmux://pane/%1".into(),
-            meta: None,
-        };
-
-        let result = server
-            .read_resource(request, context)
-            .await
-            .expect("read resource");
-        let text = first_text_resource(&result.contents);
-        assert!(text.contains("Error:"));
-    }
-
-    #[tokio::test]
     async fn read_resource_denied_by_socket_policy() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_MCP_SOCKET", "/tmp/disallowed.sock");
@@ -9118,7 +9495,7 @@ mod tests {
         };
 
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -9137,7 +9514,7 @@ mod tests {
         };
 
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -9147,38 +9524,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_resource_command_pending_and_error() {
+    async fn read_resource_command_returns_tracked_result() {
         let _stub = TmuxStub::new();
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-        let context2 = context.clone();
-        let context3 = context.clone();
-
-        let execute = Parameters(ExecuteCommandInput {
-            detach: false,
-            verbose: false,
-            pane_id: "%1".into(),
-            command: "echo hi".into(),
-            raw_mode: Some(true),
-            no_enter: None,
-            delay_ms: None,
-            socket: None,
-            wait_ms: None,
-        });
-        let result = server.execute_command(execute).await.unwrap();
-        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
-        let command_id = payload["commandId"].as_str().unwrap();
-
-        let request = read_resource_request! {
-            uri: format!("tmux://command/{command_id}/result"),
-            meta: None,
-        };
-        let result = server
-            .read_resource(request, context2)
-            .await
-            .expect("read resource");
-        let payload: Value = serde_json::from_str(first_text_resource(&result.contents)).unwrap();
-        assert_eq!(payload["status"], "running");
 
         let execute = Parameters(ExecuteCommandInput {
             detach: false,
@@ -9186,6 +9535,8 @@ mod tests {
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: None,
+            script: None,
+            notify: false,
             no_enter: None,
             delay_ms: None,
             socket: None,
@@ -9200,11 +9551,12 @@ mod tests {
             meta: None,
         };
         let result = server
-            .read_resource(request, context3)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let payload: Value = serde_json::from_str(first_text_resource(&result.contents)).unwrap();
         assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["exitCode"], 0);
     }
 
     #[tokio::test]
@@ -9581,22 +9933,60 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
-    #[cfg(feature = "interactive")]
+    #[cfg(all(feature = "interactive", feature = "special-keys"))]
     #[tokio::test]
-    async fn paste_text_happy_path() {
-        let _stub = TmuxStub::new();
+    async fn unsubmitted_paste_is_never_joined_with_the_next_command() {
+        let mut stub = TmuxStub::new();
+        let typed = NamedTempFile::new().unwrap();
+        stub.set_var("TMUX_STUB_SEND_KEYS_LOG", typed.path());
         let server = server_default();
-        let result = server
-            .paste_text(Parameters(PasteTextInput {
+        let paste = |content: &str| {
+            Parameters(PasteTextInput {
                 pane_id: "%1".into(),
-                content: "line1\nline2\n".into(),
+                content: content.into(),
                 for_command_id: None,
                 socket: None,
-            }))
-            .await
-            .expect("paste text");
-        assert_eq!(result.is_error, Some(false));
-        assert!(first_text(&result).contains("Pasted text"));
+            })
+        };
+        let execute = || -> Parameters<ExecuteCommandInput> {
+            Parameters(
+                serde_json::from_value(serde_json::json!({"paneId": "%1", "command": "echo next"}))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            server
+                .paste_text(paste("cat > a <<'EOF'\nx\nEOF\n"))
+                .await
+                .unwrap()
+                .is_error,
+            Some(false)
+        );
+
+        let refused = server.execute_command(execute()).await.unwrap();
+        assert!(
+            first_text(&refused).contains("unsubmitted input"),
+            "{}",
+            first_text(&refused)
+        );
+        let second = server.paste_text(paste("echo other\n")).await.unwrap();
+        assert_eq!(second.is_error, Some(true));
+        assert!(
+            !std::fs::read_to_string(typed.path())
+                .unwrap()
+                .contains("echo next"),
+            "nothing may be typed onto the pending line"
+        );
+
+        // Enter submits the pasted text; the pane accepts commands again.
+        let enter = Parameters(SpecialKeyInput {
+            pane_id: "%1".into(),
+            for_command_id: None,
+            socket: None,
+        });
+        server.send_enter(enter).await.unwrap();
+        let accepted = server.execute_command(execute()).await.unwrap();
+        assert_ne!(accepted.is_error, Some(true), "{}", first_text(&accepted));
     }
 
     #[cfg(feature = "interactive")]
@@ -9704,6 +10094,8 @@ mod tests {
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: None,
+            script: None,
+            notify: false,
             no_enter: None,
             delay_ms: None,
             socket: None,
@@ -9748,6 +10140,8 @@ mod tests {
             pane_id: "%1".into(),
             command: "false".into(),
             raw_mode: None,
+            script: None,
+            notify: false,
             no_enter: None,
             delay_ms: None,
             socket: None,
@@ -9775,7 +10169,6 @@ mod tests {
         let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
         assert_eq!(payload["status"], "failed");
         assert_eq!(payload["exitCode"], 7);
-        assert_eq!(payload["command"], "false");
         assert_eq!(result.structured_content, Some(payload));
     }
 
@@ -9789,6 +10182,8 @@ mod tests {
             pane_id: "%1".into(),
             command: "echo hi".into(),
             raw_mode: Some(true),
+            script: None,
+            notify: false,
             no_enter: None,
             delay_ms: None,
             socket: None,
@@ -9818,144 +10213,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_resources_includes_panes_and_commands() {
-        let _stub = TmuxStub::new();
+    async fn read_resource_never_routes_an_unqualified_uri_to_a_default_target() {
+        let mut stub = TmuxStub::new();
+        let _targets = use_targets(&mut stub, &["alpha"]);
         let server = server_default();
         let (context, _client_transport, _running) = context_for_server(&server);
-
-        let execute = Parameters(ExecuteCommandInput {
-            detach: false,
-            verbose: false,
-            pane_id: "%1".into(),
-            command: "echo hi".into(),
-            raw_mode: None,
-            no_enter: None,
-            delay_ms: None,
-            socket: None,
-            wait_ms: None,
-        });
-        let result = server.execute_command(execute).await.unwrap();
-        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
-        let command_id = payload["commandId"].as_str().unwrap();
-
-        let resources = server
-            .list_resources(None, context)
-            .await
-            .expect("list resources");
-        let uris: Vec<String> = resources
-            .resources
-            .iter()
-            .map(|res| res.uri.clone())
-            .collect();
-
-        assert!(uris.iter().any(|uri| uri == "tmux://pane/%1"));
-        assert!(uris
-            .iter()
-            .any(|uri| uri == &format!("tmux://command/{command_id}/result")));
-    }
-
-    #[tokio::test]
-    async fn read_resource_pane_happy_path() {
-        let _stub = TmuxStub::new();
-        let server = server_default();
-        let (context, _client_transport, _running) = context_for_server(&server);
+        // Pre-v0.6.1 form: "pane" must be read as an unknown target, not as the current host.
         let request = read_resource_request! {
             uri: "tmux://pane/%1".into(),
             meta: None,
         };
-
-        let result = server
+        let error = server
             .read_resource(request, context)
             .await
-            .expect("read resource");
-        let text = first_text_resource(&result.contents);
-        assert!(text.contains("stub-output"));
-    }
-
-    #[tokio::test]
-    async fn read_resource_command_happy_path() {
-        let _stub = TmuxStub::new();
-        let server = server_default();
-        let (context, _client_transport, _running) = context_for_server(&server);
-
-        let execute = Parameters(ExecuteCommandInput {
-            detach: false,
-            verbose: false,
-            pane_id: "%1".into(),
-            command: "echo hi".into(),
-            raw_mode: None,
-            no_enter: None,
-            delay_ms: None,
-            socket: None,
-            wait_ms: Some(5_000),
-        });
-        let result = server.execute_command(execute).await.unwrap();
-        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
-        let command_id = payload["commandId"].as_str().unwrap();
-
-        let request = read_resource_request! {
-            uri: format!("tmux://command/{command_id}/result"),
-            meta: None,
-        };
-        let result = server
-            .read_resource(request, context)
-            .await
-            .expect("read resource");
-        let text = first_text_resource(&result.contents);
-        let payload: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(payload["status"], "completed");
-        assert_eq!(payload["exitCode"], 0);
-    }
-
-    #[tokio::test]
-    async fn read_resource_unknown_uri() {
-        let server = server_default();
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let request = read_resource_request! {
-            uri: "tmux://unknown".into(),
-            meta: None,
-        };
-
-        let result = server
-            .read_resource(request, context)
-            .await
-            .expect("read resource");
-        let text = first_text_resource(&result.contents);
-        assert_eq!(text, "Unknown resource");
-    }
-
-    #[tokio::test]
-    async fn read_resource_invalid_command_uri() {
-        let server = server_default();
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let request = read_resource_request! {
-            uri: "tmux://command/abc".into(),
-            meta: None,
-        };
-
-        let result = server
-            .read_resource(request, context)
-            .await
-            .expect("read resource");
-        let text = first_text_resource(&result.contents);
-        assert_eq!(text, "Invalid command resource URI");
-    }
-
-    #[tokio::test]
-    async fn read_resource_command_not_found() {
-        let server = server_default();
-        let (context, _client_transport, _running) = context_for_server(&server);
-        let request = read_resource_request! {
-            uri: "tmux://command/abc/result".into(),
-            meta: None,
-        };
-
-        let result = server
-            .read_resource(request, context)
-            .await
-            .expect("read resource");
-        let text = first_text_resource(&result.contents);
-        assert_eq!(text, "Command not found: abc");
+            .expect_err("unqualified URI");
+        assert!(error.message.contains("unknown target: pane"), "{error:?}");
     }
 
     #[tokio::test]
@@ -9968,7 +10240,7 @@ mod tests {
         };
 
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -10045,6 +10317,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -10085,7 +10359,7 @@ mod tests {
         };
 
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -10111,7 +10385,7 @@ mod tests {
             meta: None,
         };
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -10140,7 +10414,7 @@ mod tests {
             meta: None,
         };
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -10165,6 +10439,8 @@ mod tests {
                 pane_id: "%1".into(),
                 command: "echo hi".into(),
                 raw_mode: None,
+                script: None,
+                notify: false,
                 no_enter: None,
                 delay_ms: None,
                 socket: None,
@@ -10185,7 +10461,7 @@ mod tests {
             meta: None,
         };
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);
@@ -10211,7 +10487,7 @@ mod tests {
             meta: None,
         };
         let result = server
-            .read_resource(request, context)
+            .read_resource_inner(request, context)
             .await
             .expect("read resource");
         let text = first_text_resource(&result.contents);

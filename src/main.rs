@@ -10,6 +10,7 @@ mod errors;
 mod gpu_monitor;
 mod security;
 mod server;
+mod ssh_pool;
 mod targets;
 #[cfg(test)]
 mod test_support;

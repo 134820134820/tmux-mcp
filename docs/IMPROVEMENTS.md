@@ -1,3 +1,82 @@
+# 2026-10-02 unsubmitted-input guard, system OpenSSH, readable resource list
+
+- **Unsubmitted-input guard.** The action log (2026-09-02 → 10-01) has 46 `paste-text` calls,
+  each one complete command (mostly heredoc file writes); none was meant to be joined with a
+  later paste. Some shells submit a pasted trailing newline, others (bracketed paste) keep the
+  text on the line, where the next typed command is appended (reproduced on a real host).
+  Now, after input that can leave text on an idle pane's command line (`paste-text`, Enter-less
+  `send-keys`/`send-hex`, keys other than Enter/Ctrl-C), `execute-command` and another
+  `paste-text` on that pane are refused until Enter or Ctrl-C — both harmless on an empty line.
+  Input to a running tracked command is not tracked. Only input from this MCP process is known.
+- **System OpenSSH on Windows.** All ssh spawns use `C:\Windows\System32\OpenSSH\ssh.exe` when
+  present (Git's MSYS ssh hangs under this process even when first on PATH);
+  `TMUX_MCP_SSH_PROGRAM` overrides. Verified with Git's ssh first on PATH.
+- **Resource list.** `resources/list` emitted URIs without a target (unreadable since v0.6.1)
+  and enumerated topology via local tmux. It now lists only target-qualified, readable entries:
+  per-target `server/info` and `clients`, plus tracked command results. The clients template is
+  `tmux://{target}/clients`.
+
+# 2026-10-01 SSH sessions, transport resilience, write-file, scripts
+
+Built and verified with `--target-dir target/test-build`, then installed as the root
+`tmux-mcp.exe` on 2026-10-02 (previous binary in `target/deployment-backups/`). Connected clients
+load it after reconnecting. Evidence and measurements: `.planning/2026-10-01-ssh-efficiency/`.
+
+- **Measurements that drove this.** In the 2026-09 action log, a fresh SSH per subprocess cost
+  p50 4.9–7.0 s; `read-file` used 2 SSH processes and `execute-command` 3–5. A live `ssh -vv`
+  showed ~5.8 s of handshake for ~0.5 s of work, and a lighter key exchange gave no consistent
+  gain. 40 of 44 `tracking_error` pauses were `wait-for failed: Connection reset`.
+- **Persistent SSH sessions (`src/ssh_pool.rs`).** Up to 4 idle sessions per ssh argv (so
+  targets/accounts never share one) run a bash dispatcher: one base64 line in, one line out.
+  Requests run through the login shell like one-shot ssh, with stdin/stdout/stderr redirected to
+  private temp files. A missing bash/base64/mktemp marks the host unsupported for 10 min and falls
+  back to one-shot ssh. A session that died while idle is retried only for read-only requests; a
+  modifying request first pings a session idle > 20 s and is never resent. Request budgets now
+  measure remote work; connection setup has its own 30 s budget (one-shot ssh gets +20 s).
+  `TMUX_MCP_SSH_POOL=0` disables sessions. Timing records use transports `ssh-pool`/`ssh-pool-new`.
+  Real-server read-only check: capture-pane/read-file 0.3–0.9 s vs 4–11.5 s.
+- **Watcher resilience.** When the `wait-for` watcher's connection drops, tracking continues by
+  polling the durable exit buffer (2→30 s backoff). Only a vanished pane/tmux server is a
+  tracking error. Exit-buffer reads after the signal retry transport failures.
+- **`write-file`.** Atomic temp + `ln` (create, never clobbers) or `mv -f` (overwrite, keeps
+  mode); refuses symlinks and non-regular files; ≤ 512 KiB; modifying (Gate) and gated by
+  `allow_execute_command`.
+- **`execute-command` `script`.** Exactly one of command/script; no detach/delayMs; ≤ 64 KiB;
+  CRLF normalized, NUL/lone CR rejected; checked by the command policy (fails closed under a
+  filter). Uploaded out of band (umask 077) and `bash -n` checked before anything is typed; the
+  pane receives only the tracked line `bash '<file>'`. Scripts run in a child bash and are kept
+  7 days.
+- **`notify`.** With `--claude-channel`, a command finishing after the call returns is announced
+  once on the channel (missed broadcast events are reconciled). `call_tool` now records the
+  client peer; before, channel messages (GPU watches too) only worked after a resource request.
+- **Real-server modifying E2E (throwaway session on milab-seven-intern, cleaned up):** atomic
+  create/refuse/overwrite/read-back, script exit code 3 with heredoc/`&`/comments, `cd` and `exit`
+  not leaking into the pane, `bash -n` rejection before typing, channel completion notice.
+- **press-special-key aliases** such as `ctrl-c`, `C-c`, `^c`, `esc`, `pgdn`.
+- **Truncation guards.** A dropped one-shot connection can end stdin early. `write-file` and
+  script upload compare the received size with the sent length before installing anything;
+  `paste-text` compares the staged tmux buffer byte-for-byte before pasting, so a cut heredoc or
+  command is never typed. Pooled requests run only as complete lines.
+- **Overwrite scope.** No ownership rule (user decision 2026-10-02: a personal tool must not
+  limit its own writes): with `overwrite`, any regular file in a writable directory is replaced,
+  keeping its mode. Script-cache pruning still touches only the account's own uuid-named files
+  in a real, owned directory.
+- **Review fixes (2026-10-02).** Relative `write-file` paths get a `./` prefix, so a name such
+  as `-tother` is created literally instead of being parsed as `ln -t other`. A lost or garbled
+  reply is reported as "Write result uncertain … check before retrying"; "File not written" is
+  reserved for refusals the remote script reported before touching the target. After a
+  `wait-for` drop, polling finishes a command once its exit buffer exists and START is no longer
+  in the capture (long output), instead of keeping the pane leased forever; START visible
+  without DONE still waits. Command allowlists do not restrict `write-file` (by decision).
+- **Test harness.** Stub scripts run through `sh` in test builds; `call_tool` tests default to a
+  test target instead of depending on another test's `TMUX_MCP_SSH`. The suite now passes
+  completely on Windows (lib 238, bin 385): the pane-info stub matches the escaped format,
+  resource policy tests call the target-scoped handler and expect `tmux://{target}/…` templates,
+  assertions follow the 2026-09-22 messages (uncertain delivery, no command echo), the
+  final-capture timeout test has room for slow stub spawns while still failing without the
+  bound, and the local `realpath` comparison is Unix-only. Trivial tests were removed (resource
+  happy paths, string-shape checks, alias enumeration).
+
 # 2026-09-22 implementation and decisions
 
 These changes are installed in the root `tmux-mcp.exe` as v0.6.1. Existing client processes were preserved and load the new binary when reconnected. The old executable is backed up locally under target/deployment-backups. No remote tasks or SSH configurations were changed.

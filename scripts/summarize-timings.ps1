@@ -36,6 +36,9 @@ $rows = @($measured | Group-Object { @($_.timing.target, $_.tool) | ConvertTo-Js
         beforeDispatchMs = ($calls.timing.beforeDispatchMs | Measure-Object -Sum).Sum
         subprocesses = $transports.Count
         sshProcesses = @($transports | Where-Object { $_.transport -eq 'ssh' }).Count
+        # Requests on persistent SSH sessions; `ssh-pool-new` also paid a handshake.
+        pooledRequests = @($transports | Where-Object { $_.transport -like 'ssh-pool*' }).Count
+        newSessions = @($transports | Where-Object { $_.transport -eq 'ssh-pool-new' }).Count
         subprocessTimeouts = @($transports | Where-Object { $_.outcome -eq 'timeout' }).Count
         queueMs = ($transports.queueMs | Measure-Object -Sum).Sum
         processMs = (($transports | ForEach-Object { $_.durationMs - $_.queueMs }) | Measure-Object -Sum).Sum
@@ -51,6 +54,6 @@ $report = [PSCustomObject]@{
 if ($Json) { $report | ConvertTo-Json -Depth 5 }
 else {
     "Measured calls: $($report.measuredCalls); records without timing: $($report.unmeasuredRecords); invalid lines: $invalid"
-    $rows | Format-Table target, tool, calls, errors, waitTimeouts, p50Ms, p95Ms, sshProcesses, queueMs, processMs -AutoSize
+    $rows | Format-Table target, tool, calls, errors, waitTimeouts, p50Ms, p95Ms, sshProcesses, pooledRequests, newSessions, queueMs, processMs -AutoSize
     'Process times are sums (parallel calls overlap), not SSH handshake measurements. Use -Json for all fields.'
 }

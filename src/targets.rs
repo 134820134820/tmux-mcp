@@ -74,9 +74,10 @@ where
 pub fn uri_for(target: &str, uri: &str) -> String {
     uri.strip_prefix("tmux://")
         .filter(|rest| {
-            ["command/", "pane/", "window/", "session/", "server/"]
-                .iter()
-                .any(|p| rest.starts_with(p))
+            *rest == "clients"
+                || ["command/", "pane/", "window/", "session/", "server/"]
+                    .iter()
+                    .any(|p| rest.starts_with(p))
         })
         .map_or_else(|| uri.to_string(), |rest| format!("tmux://{target}/{rest}"))
 }
